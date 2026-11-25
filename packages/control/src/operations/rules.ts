@@ -525,8 +525,18 @@ export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
   // A port choice depends on the model; any other codec is built once.
   const fixed = rule.value.kind === "port-choice" ? undefined : codecOf(rule.value);
   return handler<V>((model, target, write) => {
-    const { bus, side } = busSide(model, target, rule.known);
+    modelOf(model);
+    const own = targetOf<{ bus?: unknown; side?: unknown }>(target, ["bus", "side"]);
+    if (typeof own.bus !== "string" || !rule.known.includes(own.bus)) {
+      return refuse("invalid_input");
+    }
+    const bus = own.bus;
     const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
+    // A mono bus takes no side; every other bus requires one.
+    if (at?.sideless === true ? own.side !== undefined : !SIDES.includes(own.side as "left")) {
+      return refuse("invalid_input");
+    }
+    const side = at?.sideless === true ? "left" : (own.side as (typeof SIDES)[number]);
     if (at === undefined || (write && !at.write)) {
       return refuse("unsupported_operation");
     }

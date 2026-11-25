@@ -265,6 +265,8 @@ export interface BusSideAddress {
   readonly write: boolean;
   /** This bus's own value rule, replacing the shared one. */
   readonly value?: ValueRule;
+  /** A mono bus of a per-side setting: it takes no side, and `y.left` is its y. */
+  readonly sideless?: true;
 }
 
 /** A per-side bus setting: the target names a bus and a side. */
