@@ -19,6 +19,8 @@ pub const DEVICE_CENTER_LIST_PORT: u16 = 51770;
 
 const PHASE: Phase = Phase::Discovery;
 
+const LIST_URI: &str = "/vddp_srv/devices";
+
 /// How one discovery runs. The durations are the consumer's policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryOptions {
@@ -87,10 +89,16 @@ fn list(
     control: &Control,
 ) -> Result<Vec<(u16, String)>, Failure> {
     let mut link = Link::connect(options.list_port, budget, PHASE, control)?;
-    let request = json!({ "vddp": { "method": "get", "uri": "/vddp_srv/devices" } });
+    let request = json!({ "vddp": { "method": "get", "uri": LIST_URI } });
     link.send(&request, options.request_deadline, budget)?;
     let data = link.await_frame(options.request_deadline, budget, |message| {
-        Some(Ok(message.get("vddp")?.get("data").cloned()?))
+        let vddp = message.get("vddp")?;
+        let method = vddp.get("method").and_then(Value::as_str);
+        let uri = vddp.get("uri").and_then(Value::as_str).unwrap_or("");
+        if method != Some("get") || uri.split('?').next() != Some(LIST_URI) {
+            return None;
+        }
+        Some(vddp.get("data").cloned().ok_or_else(malformed))
     })?;
     parse_list(&data)
 }

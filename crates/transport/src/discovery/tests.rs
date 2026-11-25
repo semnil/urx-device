@@ -112,7 +112,11 @@ fn silent() -> Peer {
 
 /// The list endpoint, answering with `data` as the device list.
 fn center_data(data: Value) -> Peer {
-    Peer::serve(move |_| vec![line(json!({ "vddp": { "data": data.clone() } }))])
+    Peer::serve(move |_| vec![list_reply(data.clone())])
+}
+
+fn list_reply(data: Value) -> Vec<u8> {
+    line(json!({ "vddp": { "method": "get", "uri": "/vddp_srv/devices", "data": data } }))
 }
 
 /// `bytes` cut into pieces of `size` bytes.
@@ -555,4 +559,39 @@ fn an_expired_deadline_is_reported_over_a_later_close_or_oversized_frame() {
         });
         assert_eq!(result, fails_with(Cause::ResponseTimeout));
     }
+}
+
+#[test]
+fn a_list_reply_without_usable_data_is_invalid_at_once() {
+    let no_data = Peer::serve(|_| {
+        vec![line(
+            json!({ "vddp": { "method": "get", "uri": "/vddp_srv/devices" } }),
+        )]
+    });
+    let null_data = center_data(Value::Null);
+    let empty_data = center_data(json!({}));
+    for peer in [&no_data, &null_data, &empty_data] {
+        let started = Instant::now();
+        assert_eq!(run(&options(peer.port)), fails_with(Cause::InvalidResponse));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn only_the_list_reply_decides_the_list() {
+    let a = unit(online("<device-id-a>"), Value::Null);
+    let list = json!({ "list": [{ "model": "URX44V", "vdpport": a.port }] });
+    let center = Peer::serve(move |_| {
+        vec![
+            line(
+                json!({ "vddp": { "method": "get", "uri": "/vddp_srv", "data": { "protocol_version": 1 } } }),
+            ),
+            line(
+                json!({ "vddp": { "method": "notify", "uri": "/vddp_srv/devices", "data": { "list": [] } } }),
+            ),
+            line(json!({ "vddp": { "method": "post", "uri": "/vddp_srv/devices", "data": {} } })),
+            list_reply(list.clone()),
+        ]
+    });
+    assert_eq!(run(&options(center.port)).unwrap().len(), 1);
 }
