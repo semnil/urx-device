@@ -11,6 +11,7 @@ import {
   type ChannelIndex,
 } from "../catalog/channels.js";
 import { decodeInteger, decodeSwitch, encodeSwitch, planOnGrid } from "../catalog/codecs.js";
+import { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "../catalog/ports.js";
 import { formatI64, type I64Text } from "../catalog/i64.js";
 import type { ChannelSideTarget, ChannelTarget, FaderLevel, Polarity } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
@@ -33,17 +34,21 @@ function wholeAddress(ids: { mono: number; stereo: number }, channel: ChannelInd
   return address(channel.kind === "mono" ? ids.mono : ids.stereo, channel.index);
 }
 
-/** Polarity's address: a side is required for fixed stereo, refused for mono. */
-function polarityAddress(model: string, target: unknown): ParameterAddress {
+/** A side-specific setting's address: a side is required for fixed stereo, refused for mono. */
+function sideAddress(ids: { mono: number; left: number; right: number }, model: string, target: unknown): ParameterAddress {
   const channel = channelOf(model, target);
   const side = (target as ChannelSideTarget).side;
   if (channel.kind === "mono") {
-    return side === undefined ? address(CHANNEL_PARAMS.polarity.mono, channel.index) : refuse("invalid_input");
+    return side === undefined ? address(ids.mono, channel.index) : refuse("invalid_input");
   }
   if (side === "left" || side === "right") {
-    return address(CHANNEL_PARAMS.polarity[side], channel.index);
+    return address(ids[side], channel.index);
   }
   return refuse("invalid_input");
+}
+
+function polarityAddress(model: string, target: unknown): ParameterAddress {
+  return sideAddress(CHANNEL_PARAMS.polarity, model, target);
 }
 
 /** A whole-channel setting with its codec. */
@@ -134,6 +139,34 @@ export const channelPolarity = {
   },
   write(context: OperationContext, target: ChannelSideTarget, value: Polarity): Promise<WriteResult<Polarity>> {
     const { at, raw, requested, planned } = polarityPlan(context.model, target, value);
+    return writeRaw(context, at, raw, { requested, planned });
+  },
+};
+
+function sourcePlan(model: string, target: ChannelSideTarget, value: string) {
+  const at = sideAddress(SOURCE_PARAMS, model, target);
+  const port = typeof value === "string" && Object.hasOwn(INPUT_PORTS, value) ? INPUT_PORTS[value] : undefined;
+  if (port === undefined) {
+    return refuse("invalid_input");
+  }
+  if (!port.models.includes(modelOf(model))) {
+    return refuse("unsupported_operation");
+  }
+  return { at, requested: value, planned: value, raw: port.raw };
+}
+
+/** The input port a channel side takes its source lane from (F03-I). */
+export const channelSource = {
+  read(context: OperationContext, target: ChannelSideTarget): Promise<Reading<string>> {
+    const model = modelOf(context.model);
+    return readDecoded(context, sideAddress(SOURCE_PARAMS, context.model, target), (raw) => portOfRaw(model, raw));
+  },
+  plan(model: string, target: ChannelSideTarget, value: string): WritePlan<string> {
+    const { requested, planned } = sourcePlan(model, target, value);
+    return { requested, planned };
+  },
+  write(context: OperationContext, target: ChannelSideTarget, value: string): Promise<WriteResult<string>> {
+    const { at, raw, requested, planned } = sourcePlan(context.model, target, value);
     return writeRaw(context, at, raw, { requested, planned });
   },
 };

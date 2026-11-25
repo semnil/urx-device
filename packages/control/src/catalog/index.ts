@@ -15,6 +15,8 @@ export {
 } from "./channels.js";
 export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
+export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
+export type { InputPort } from "./ports.js";
 export type {
   ChannelSideTarget,
   ChannelTarget,
