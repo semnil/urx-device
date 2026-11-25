@@ -49,3 +49,28 @@ export function decodeSwitch(raw: I64Text): boolean | undefined {
 export function encodeSwitch(on: boolean): I64Text {
   return on ? "1" : "0";
 }
+
+/**
+ * The planned value of `requested` on a grid of `step` (a power of ten
+ * fraction such as 0.01): range checked first, then the nearest grid value
+ * with ties toward the lower one, computed in integer grid units (W2).
+ */
+export function planOnGrid(requested: number, min: number, max: number, unitsPerOne: number): number | undefined {
+  if (!Number.isFinite(requested) || requested < min || requested > max) {
+    return undefined;
+  }
+  const scaled = requested * unitsPerOne;
+  const floor = Math.floor(scaled);
+  // A tie within the float error of the scaling goes down, like an exact one.
+  const fraction = scaled - floor;
+  const up = fraction > 0.5 && Math.abs(fraction - 0.5) > 1e-9;
+  const units = up ? floor + 1 : floor;
+  const planned = units / unitsPerOne;
+  return Object.is(planned, -0) ? 0 : planned;
+}
+
+/** The integer of raw text within [min, max], or undefined. */
+export function decodeInteger(raw: I64Text, min: number, max: number): number | undefined {
+  const value = parseI64(raw);
+  return value === undefined || value < BigInt(min) || value > BigInt(max) ? undefined : Number(value);
+}

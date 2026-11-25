@@ -23,6 +23,10 @@ export const settingDefinitions = {
   "input.clip-safe": { readable: true, writable: true },
   "input.clip-safe-active": { readable: true, writable: false },
   "source.gain": { readable: true, writable: true },
+  "channel.on": { readable: true, writable: true },
+  "channel.fader": { readable: true, writable: true },
+  "channel.pan": { readable: true, writable: true },
+  "channel.polarity": { readable: true, writable: true },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */
@@ -43,6 +47,21 @@ export interface SourceTarget {
   readonly source: SourceToken;
 }
 
+/** A channel by its C12 number: mono n, or a fixed stereo pair's first number. */
+export interface ChannelTarget {
+  readonly channel: number;
+}
+
+/** A channel with a side, required for side-specific fixed stereo settings. */
+export interface ChannelSideTarget extends ChannelTarget {
+  readonly side?: "left" | "right";
+}
+
+/** A fader level: finite dB, or negative infinity. */
+export type FaderLevel = number | "-inf";
+
+export type Polarity = "normal" | "inverted";
+
 /**
  * Each setting's target, observed value and requested value types (K35:
  * switches are boolean, levels are dB numbers).
@@ -54,6 +73,10 @@ export interface SettingTypes {
   "input.clip-safe": { target: InputTarget; value: boolean };
   "input.clip-safe-active": { target: InputTarget; value: boolean };
   "source.gain": { target: SourceTarget; value: number };
+  "channel.on": { target: ChannelTarget; value: boolean };
+  "channel.fader": { target: ChannelTarget; value: FaderLevel };
+  "channel.pan": { target: ChannelTarget; value: number };
+  "channel.polarity": { target: ChannelSideTarget; value: Polarity };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

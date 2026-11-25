@@ -4,7 +4,22 @@
 export { formatI64, isI64Text, isU32, parseI64 } from "./i64.js";
 export type { I64Text } from "./i64.js";
 export { settingDefinitions, settingIds } from "./settings.js";
+export {
+  CHANNEL_PARAMS,
+  FADER_DB,
+  FADER_NEGATIVE_INFINITY_RAW,
+  MONO_CHANNELS,
+  PAN_RANGE,
+  STEREO_CHANNELS,
+  channelIndex,
+} from "./channels.js";
+export type { ChannelIndex, ChannelKind } from "./channels.js";
+export { decodeInteger, planOnGrid } from "./codecs.js";
 export type {
+  ChannelSideTarget,
+  ChannelTarget,
+  FaderLevel,
+  Polarity,
   InputTarget,
   SettingDefinitionBase,
   SettingId,
