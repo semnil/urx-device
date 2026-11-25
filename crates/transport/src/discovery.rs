@@ -127,7 +127,7 @@ fn parse_list(data: &Value) -> Result<Vec<(u16, String)>, Failure> {
 }
 
 /// The listed unit at `port` if it is online, or `None` when it reports any
-/// other link state. Once the unit has reported `online`, a
+/// other nonempty link state. Once the unit has reported `online`, a
 /// device-lost push received before its firmware reply fails the check: the
 /// unit was unplugged while it was being checked, and Device Center keeps
 /// answering `/vd/device` from its cache.
@@ -143,6 +143,7 @@ fn check(
     let status = synchronize
         .get("sync_status")
         .and_then(Value::as_str)
+        .filter(|status| !status.is_empty())
         .ok_or_else(malformed)?;
     if status != "online" {
         return Ok(None);
@@ -188,23 +189,31 @@ fn get(
     })
 }
 
-/// The System entry of `/vd/device`'s `firm_list`, matched by name without
-/// case. `None` when the response is malformed: no `firm_list` array, or a
-/// System entry whose version is not a string.
+/// The System version in `/vd/device`'s `firm_list`, whose entries are
+/// matched by name without case. `None` when the response is malformed: no
+/// `firm_list` array, an entry without a nonempty string `firm_name`, a System
+/// entry without a string `firm_version`, or System entries that disagree.
+/// Entry order does not change the result.
 fn system_firmware(device: &Value) -> Option<SystemFirmware> {
     let list = device.get("firm_list")?.as_array()?;
-    let system = list.iter().find(|entry| {
-        entry
-            .get("firm_name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case("system"))
-    });
-    let Some(system) = system else {
-        return Some(SystemFirmware::Absent);
-    };
-    match system.get("firm_version")?.as_str()? {
-        "" => Some(SystemFirmware::Absent),
-        version => Some(SystemFirmware::Version(version.to_string())),
+    let mut version: Option<&str> = None;
+    for entry in list {
+        let name = entry
+            .get("firm_name")?
+            .as_str()
+            .filter(|name| !name.is_empty())?;
+        if !name.eq_ignore_ascii_case("system") {
+            continue;
+        }
+        let this = entry.get("firm_version")?.as_str()?;
+        if version.is_some_and(|seen| seen != this) {
+            return None;
+        }
+        version = Some(this);
+    }
+    match version {
+        None | Some("") => Some(SystemFirmware::Absent),
+        Some(version) => Some(SystemFirmware::Version(version.to_string())),
     }
 }
 

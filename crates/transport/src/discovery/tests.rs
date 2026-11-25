@@ -659,3 +659,49 @@ fn an_online_push_or_a_push_before_the_status_reply_does_not_fail_the_check() {
         assert_eq!(run(&metadata(options(center.port))).unwrap().len(), 1);
     }
 }
+
+#[test]
+fn an_empty_link_state_is_invalid_rather_than_offline() {
+    let a = unit(online("<device-id-a>"), Value::Null);
+    let empty = unit(json!({ "sync_status": "" }), Value::Null);
+    let center = center(&[(a.port, "URX44V"), (empty.port, "URX22")]);
+    assert_eq!(
+        run(&options(center.port)),
+        fails_with(Cause::InvalidResponse)
+    );
+}
+
+#[test]
+fn firmware_rows_that_cannot_be_read_or_disagree_are_invalid_in_any_order() {
+    let system = |version: &str| json!({ "firm_name": "System", "firm_version": version });
+    let dsp = json!({ "firm_name": "DSP", "firm_version": "1.0" });
+    let invalid = [
+        json!([dsp, { "firm_version": "1.0" }]),
+        json!([dsp, { "firm_name": "", "firm_version": "1.0" }]),
+        json!([dsp, { "firm_name": 3, "firm_version": "1.0" }]),
+        json!([dsp, null]),
+        json!([system(""), system("9.9.9")]),
+        json!([system("9.9.9"), system("")]),
+        json!([system("9.9.9"), system("9.9.8")]),
+        json!([system("9.9.9"), { "firm_name": "system", "firm_version": 9 }]),
+        json!([system("9.9.9"), { "firm_name": "DSP" }, { "firm_name": 1 }]),
+    ];
+    for entries in invalid {
+        let a = unit(online("<device-id-a>"), firm_list(entries.clone()));
+        let center = center(&[(a.port, "URX44V")]);
+        assert_eq!(
+            run(&metadata(options(center.port))),
+            fails_with(Cause::InvalidResponse),
+            "{entries}"
+        );
+    }
+    let a = unit(
+        online("<device-id-a>"),
+        firm_list(json!([system("9.9.9"), dsp, system("9.9.9")])),
+    );
+    let center = center(&[(a.port, "URX44V")]);
+    assert_eq!(
+        run(&metadata(options(center.port))).unwrap()[0].firmware,
+        Some(SystemFirmware::Version("9.9.9".into()))
+    );
+}
