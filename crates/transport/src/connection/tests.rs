@@ -2011,6 +2011,77 @@ mod lifecycle {
     }
 
     #[test]
+    fn the_worker_stops_waiting_for_an_unregistration_at_the_budget() {
+        let peer = unit(Duration::ZERO, |uri| {
+            (!uri.contains("unregist")).then_some(200)
+        });
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert_eq!(
+            connection.close(Duration::from_millis(200)),
+            CloseOutcome::Incomplete(Failure::Cause {
+                code: Cause::TeardownTimeout,
+                phase: Phase::Teardown
+            })
+        );
+        let started = std::time::Instant::now();
+        super::wait_until(|| connection.shared.lock().teardown.is_some());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            connection.shared.lock().teardown,
+            Some(Some(Failure::Cause {
+                code: Cause::TeardownTimeout,
+                phase: Phase::Teardown
+            }))
+        );
+    }
+
+    #[test]
+    fn an_empty_teardown_budget_sends_no_unregistration() {
+        let peer = accepting();
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert!(matches!(
+            connection.close(Duration::ZERO),
+            CloseOutcome::Incomplete(_)
+        ));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(posts(&peer), [reg(1)]);
+    }
+
+    #[test]
+    fn an_unregistration_response_deadline_before_the_budget_fails_the_close() {
+        let peer = unit(Duration::ZERO, |uri| {
+            (!uri.contains("unregist")).then_some(200)
+        });
+        let connection = open(
+            peer.port,
+            ID,
+            &ConnectionOptions {
+                response_deadline: Duration::from_millis(150),
+                ..super::options()
+            },
+            &crate::lifecycle::Control::new(),
+        )
+        .unwrap();
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert_eq!(
+            connection.close(Duration::from_millis(1200)),
+            CloseOutcome::Failed(Failure::Cause {
+                code: Cause::ResponseTimeout,
+                phase: Phase::Teardown
+            })
+        );
+    }
+
+    #[test]
     fn a_close_after_the_link_ended_sends_nothing() {
         let peer = Peer::serve(|request| match uri_of(request) {
             "/vd/synchronize" => vec![get_reply("/vd/synchronize", online(ID))],

@@ -762,6 +762,16 @@ impl Teardown {
             (None, _) => {
                 CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown))
             }
+            // The budget ran out in the worker's unregistrations.
+            (
+                Some(Some(
+                    failure @ Failure::Cause {
+                        code: Cause::TeardownTimeout,
+                        ..
+                    },
+                )),
+                _,
+            ) => CloseOutcome::Incomplete(failure),
             (Some(Some(failure)), CloseOutcome::Closed) => CloseOutcome::Failed(failure),
             (Some(_), joined) => joined,
         }
@@ -986,15 +996,18 @@ fn tear_down(
     shared: &Shared,
     options: &ConnectionOptions,
 ) {
-    {
+    let end = {
         let mut state = shared.lock();
-        while state.teardown_end.is_none() {
+        loop {
+            if let Some(end) = state.teardown_end {
+                break end;
+            }
             state = shared
                 .advance
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-    }
+    };
     // An end recorded meanwhile leaves nothing to unregister on this link.
     let ended = shared.link_end().is_some();
     let failure = if ended {
@@ -1005,7 +1018,7 @@ fn tear_down(
             inbox,
             shared,
             options,
-            teardown: true,
+            teardown: Some(end),
         };
         io.unregister_remaining()
     };
@@ -1471,7 +1484,7 @@ fn run_job(
         inbox,
         shared,
         options,
-        teardown: false,
+        teardown: None,
     };
     match job {
         Job::Activate { token, owner, done } => {
@@ -1515,10 +1528,10 @@ struct Io<'a> {
     inbox: &'a Receiver<Event>,
     shared: &'a Shared,
     options: &'a ConnectionOptions,
-    /// Whether this runs a close's unregistrations: they are sent although
-    /// the close is marked. The close shuts the socket at the end of its
-    /// budget, which stops one still waiting (N2).
-    teardown: bool,
+    /// The close's teardown end, for the unregistrations it runs: they are
+    /// sent although the close is marked, and neither their send nor their
+    /// response wait outlasts it (N2).
+    teardown: Option<Instant>,
 }
 
 /// How an activation ended.
@@ -1581,10 +1594,11 @@ impl Io<'_> {
             return refused(Verdict::Rejected, RequestCause::InternalError, None);
         };
         let key = request.reply_key();
-        let teardown = self.teardown;
+        let cap = self.teardown;
         let send_end = Instant::now() + self.options.send_deadline;
+        let send_end = cap.map_or(send_end, |cap| send_end.min(cap));
         let unstarted = |state: &State| {
-            if state.closing && !teardown {
+            if state.closing && cap.is_none() {
                 Some(Stop::Closing)
             } else if stop(state) {
                 Some(Stop::Cancelled)
@@ -1596,6 +1610,7 @@ impl Io<'_> {
             frame: &frame,
             key: &key,
             send_end,
+            cap,
             unstarted: &unstarted,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
@@ -1632,6 +1647,14 @@ impl Io<'_> {
             Err(failed) => match failed.failure {
                 RequestFailure::Cancelled { .. } => Posted::Stopped,
                 RequestFailure::Cause { code, .. } => {
+                    // A send budget cut short by the teardown's end expires
+                    // as the teardown (N2, K34).
+                    let code = match (code, cap) {
+                        (RequestCause::SendTimeout, Some(cap)) if Instant::now() >= cap => {
+                            RequestCause::TeardownTimeout
+                        }
+                        (code, _) => code,
+                    };
                     let verdict = if failed.evidence == Evidence::NotSent {
                         Verdict::Rejected
                     } else {
@@ -1896,6 +1919,7 @@ fn execute(
         frame,
         key,
         send_end,
+        cap: None,
         unstarted: &unstarted,
     };
     match exchange(sock, inbox, shared, options, outbound) {
@@ -2082,6 +2106,8 @@ struct Outbound<'a> {
     frame: &'a [u8],
     key: &'a ReplyKey,
     send_end: Instant,
+    /// A teardown budget's end, which also bounds the response wait.
+    cap: Option<Instant>,
     /// Whether a frame not yet started must not start.
     unstarted: &'a dyn Fn(&State) -> Option<Stop>,
 }
@@ -2097,6 +2123,7 @@ fn exchange(
         frame,
         key,
         send_end,
+        cap,
         unstarted,
     } = outbound;
     if Instant::now() >= send_end {
@@ -2130,6 +2157,10 @@ fn exchange(
         }
     }
     let response_end = Instant::now() + options.response_deadline;
+    let (response_end, timeout) = match cap {
+        Some(cap) if cap < response_end => (cap, RequestCause::TeardownTimeout),
+        _ => (response_end, RequestCause::ResponseTimeout),
+    };
     // A response-phase failure ends the connection: the cause is recorded
     // as its end when chosen, unless an earlier end was recorded, which is
     // reported instead.
@@ -2170,9 +2201,7 @@ fn exchange(
                 ending = Some(RequestCause::NotificationOverflow);
             }
             Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
-            Err(RecvTimeoutError::Timeout) => {
-                return unconfirmed(ending.unwrap_or(RequestCause::ResponseTimeout))
-            }
+            Err(RecvTimeoutError::Timeout) => return unconfirmed(ending.unwrap_or(timeout)),
             Err(RecvTimeoutError::Disconnected) => return unconfirmed(RequestCause::InternalError),
         }
     }
@@ -2223,6 +2252,11 @@ fn write_frame<O: Outgoing>(
         let link_end = shared.link_end();
         if let Some(cause) = *link_end {
             return failed(cause);
+        }
+        // Checked again under the gate: waiting for it may have used up the
+        // budget.
+        if Instant::now() >= end {
+            return failed(RequestCause::SendTimeout);
         }
         if written == 0 {
             if let Some(stop) = unstarted(&shared.lock()) {
