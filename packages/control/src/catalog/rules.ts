@@ -110,6 +110,22 @@ export interface SelectorRule {
   readonly none: Sentinel;
   readonly known: readonly string[];
   readonly choices: readonly { readonly token: string; readonly raw: string }[];
+  /**
+   * The defined limits of `none` and of each choice, by token, for help. A
+   * definition, not a measurement; nothing reads the rate, link or slot state
+   * to check them. Undefined for a token this target does not take.
+   */
+  readonly limits?: { readonly [token: string]: SelectorLimits | undefined };
+}
+
+/** A selector choice's defined limits. */
+export interface SelectorLimits {
+  /** The highest sample rate in Hz it runs at; null when it has no ceiling. */
+  readonly maxRateHz: number | null;
+  /** True when a stereo-linked pair cannot take it. */
+  readonly monoOnly: boolean;
+  /** The device-wide processing slot it shares; null when it takes none. */
+  readonly slot: string | null;
 }
 
 export type ValueRule =

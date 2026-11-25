@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
+import { INSERT_FX_RULES } from "../src/catalog/insert-fx.js";
+import { settingDefinitions } from "../src/catalog/settings.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
@@ -51,32 +53,103 @@ describe("Insert-FX selector and on (F06-I)", () => {
     }
   });
 
-  it("read the output selectors at STEREO and the MIX representative; write STEREO only", async () => {
+  it("read the output selectors at STEREO and the MIX representative; write STEREO only, each at its own address", async () => {
     const at = { stereo: [578, 577, "0", true], "mix-1": [671, 670, "0", false], "mix-2": [671, 670, "2", false] } as const;
-    for (const [bus, [type, on, y, writable]] of Object.entries(at)) {
-      for (const [token, raw] of Object.entries(OUTPUT)) {
-        const transport = new FakeTransport().script("getNumeric", read(raw)).script("setNumeric", accepted);
-        const c = new OperationContext(transport, "URX44");
-        expect((await readAny(c, "bus.insert-fx.type", { bus })).value, `${bus} ${token}`).toBe(token);
-        const write = writeAny(c, "bus.insert-fx.type", { bus }, token);
-        if (writable) {
-          await write;
-          expect(transport.calls[1]?.value).toBe(raw);
-        } else {
-          expect((await failureOf(write))?.code, `${bus} ${token}`).toBe("unsupported_operation");
-          expect(transport.calls.length).toBe(1);
+    const sent = (transport: FakeTransport) => transport.calls.map(({ address, value }) => ({ address, value }));
+    for (const model of models) {
+      for (const [bus, [type, on, y, writable]] of Object.entries(at)) {
+        const typeAt = { paramId: type, x: "0", y };
+        const onAt = { paramId: on, x: "0", y };
+        for (const [token, raw] of Object.entries(OUTPUT)) {
+          const transport = new FakeTransport().script("getNumeric", read(raw)).script("setNumeric", accepted);
+          const c = new OperationContext(transport, model);
+          expect((await readAny(c, "bus.insert-fx.type", { bus })).value, `${model} ${bus} ${token}`).toBe(token);
+          const write = writeAny(c, "bus.insert-fx.type", { bus }, token);
+          if (writable) {
+            await write;
+            expect(sent(transport), `${model} ${bus} ${token}`).toEqual([
+              { address: typeAt, value: undefined },
+              { address: typeAt, value: raw },
+            ]);
+          } else {
+            expect((await failureOf(write))?.code, `${model} ${bus} ${token}`).toBe("unsupported_operation");
+            expect(sent(transport)).toEqual([{ address: typeAt, value: undefined }]);
+          }
         }
-        expect(transport.calls[0]?.address).toEqual({ paramId: type, x: "0", y });
+        for (const [value, raw] of [[true, "1"], [false, "0"]] as const) {
+          const transport = new FakeTransport().script("getNumeric", read(raw)).script("setNumeric", accepted);
+          const c = new OperationContext(transport, model);
+          expect((await readAny(c, "bus.insert-fx.on", { bus })).value, `${model} ${bus} on ${raw}`).toBe(value);
+          const write = writeAny(c, "bus.insert-fx.on", { bus }, value);
+          if (writable) {
+            await write;
+            expect(sent(transport), `${model} ${bus} on ${raw}`).toEqual([
+              { address: onAt, value: undefined },
+              { address: onAt, value: raw },
+            ]);
+          } else {
+            expect((await failureOf(write))?.code, `${model} ${bus} on ${raw}`).toBe("unsupported_operation");
+            expect(sent(transport)).toEqual([{ address: onAt, value: undefined }]);
+          }
+        }
       }
-      const transport = new FakeTransport().script("getNumeric", read("1"));
-      expect((await readAny(new OperationContext(transport, "URX44"), "bus.insert-fx.on", { bus })).value).toBe(true);
-      expect(transport.calls[0]?.address).toEqual({ paramId: on, x: "0", y });
+      for (const bus of ["fx-1", "fx-2", "stream"]) {
+        const none = new FakeTransport();
+        const c = new OperationContext(none, model);
+        for (const id of ["bus.insert-fx.type", "bus.insert-fx.on"]) {
+          expect((await failureOf(readAny(c, id, { bus })))?.code, `${model} ${id} ${bus}`).toBe("unsupported_operation");
+          expect((await failureOf(writeAny(c, id, { bus }, id.endsWith(".on") ? true : "none")))?.code, `${model} ${id} ${bus}`).toBe(
+            "unsupported_operation",
+          );
+        }
+        expect(none.calls).toEqual([]);
+      }
+      // MONITOR has no bus token here (F08-M names monitor-1 / monitor-2): `monitor` is an unknown name.
+      const none = new FakeTransport();
+      for (const id of ["bus.insert-fx.type", "bus.insert-fx.on"]) {
+        expect((await failureOf(readAny(new OperationContext(none, model), id, { bus: "monitor" })))?.code, id).toBe("invalid_input");
+      }
+      expect(none.calls).toEqual([]);
     }
-    for (const bus of ["fx-1", "fx-2", "stream"]) {
-      expect((await failureOf(readAny(new OperationContext(new FakeTransport(), "URX44"), "bus.insert-fx.type", { bus })))?.code, bus).toBe(
-        "unsupported_operation",
-      );
+  });
+
+  it("carry the F06-I definition limits of every token each target takes, none included", () => {
+    const amp = { maxRateHz: 96000, monoOnly: true, slot: "input-amp" };
+    const input = INSERT_FX_RULES["channel.insert-fx.type"].value;
+    const output = INSERT_FX_RULES["bus.insert-fx.type"].value;
+    const none = { maxRateHz: null, monoOnly: false, slot: null };
+    expect(input.limits).toEqual({
+      none,
+      clean: amp,
+      crunch: amp,
+      lead: amp,
+      drive: amp,
+      "pitch-fix": { maxRateHz: 48000, monoOnly: true, slot: "input-pitch" },
+      "compander-h": { maxRateHz: 96000, monoOnly: false, slot: "input-compander" },
+      "compander-s": { maxRateHz: 96000, monoOnly: false, slot: "input-compander" },
+    });
+    const dynamics = { maxRateHz: 96000, monoOnly: false, slot: "output-dynamics" };
+    expect(output.limits).toEqual({ none, "compander-h": dynamics, "compander-s": dynamics, "multi-band-comp": dynamics });
+    // The same rules through the public catalog, and a limit for exactly the tokens each target takes.
+    for (const id of ["channel.insert-fx.type", "bus.insert-fx.type"] as const) {
+      const rule = settingDefinitions[id].rule;
+      expect(rule).toBe(INSERT_FX_RULES[id]);
+      expect(Object.keys(rule.value.limits ?? {}).sort()).toEqual(["none", ...rule.value.choices.map((choice) => choice.token)].sort());
     }
+  });
+
+  it("type a known bus without an Insert-FX address as undefined, through both public paths", () => {
+    const checks = () => {
+      for (const rule of [INSERT_FX_RULES["bus.insert-fx.type"], settingDefinitions["bus.insert-fx.on"].rule]) {
+        for (const bus of rule.known) {
+          // @ts-expect-error a known bus may have no address for this setting
+          void rule.address[bus].write;
+          void rule.address[bus]?.write;
+        }
+      }
+    };
+    expect(typeof checks).toBe("function");
+    expect(INSERT_FX_RULES["bus.insert-fx.on"].address["fx-1"]).toBeUndefined();
   });
 
   it("refuse an effect on the wrong target and unknown tokens; read only listed selector values", async () => {
