@@ -1595,10 +1595,12 @@ fn exchange(
         }
     }
     let response_end = Instant::now() + options.response_deadline;
-    // A request ended by the connection's end reports the end recorded first.
+    // A response-phase failure ends the connection: the cause is recorded
+    // as its end when chosen, unless an earlier end was recorded, which is
+    // reported instead.
     let unconfirmed = |cause: RequestCause| {
         Err(Failed::new(
-            shared.link_end().unwrap_or(cause),
+            *shared.link_end().get_or_insert(cause),
             RequestPhase::Response,
             Evidence::Unconfirmed,
             true,
