@@ -27,6 +27,7 @@ export const settingDefinitions = {
   "channel.fader": { readable: true, writable: true },
   "channel.pan": { readable: true, writable: true },
   "channel.polarity": { readable: true, writable: true },
+  "channel.source": { readable: true, writable: true },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */
@@ -82,6 +83,7 @@ export interface SettingTypes {
   "channel.fader": { target: ChannelTarget; value: FaderLevel };
   "channel.pan": { target: ChannelTarget; value: number };
   "channel.polarity": { target: ChannelSideTarget; value: Polarity };
+  "channel.source": { target: ChannelSideTarget; value: string };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

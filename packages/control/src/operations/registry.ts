@@ -9,7 +9,7 @@ import {
 } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
 import { OperationFailureError } from "./failure.js";
-import { channelFader, channelOn, channelPan, channelPolarity } from "./channels.js";
+import { channelFader, channelOn, channelPan, channelPolarity, channelSource } from "./channels.js";
 import {
   inputClipSafe,
   inputClipSafeActive,
@@ -49,6 +49,7 @@ export const settingHandlers: SettingHandlers = {
   "channel.fader": channelFader,
   "channel.pan": channelPan,
   "channel.polarity": channelPolarity,
+  "channel.source": channelSource,
 };
 
 function unknownId(): Promise<never> {
