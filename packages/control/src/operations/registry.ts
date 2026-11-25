@@ -33,7 +33,12 @@ import type { Reading, WritePlan, WriteResult } from "./results.js";
 type Target<K extends SettingId> = SettingTypes[K]["target"];
 type Value<K extends SettingId> = SettingTypes[K]["value"];
 /** What a write takes: the setting's `input` type when it has one, else its value type. */
-type Input<K extends SettingId> = SettingTypes[K] extends { input: infer I } ? I : Value<K>;
+// Distributed over K, so a union of IDs keeps each ID's own write type.
+type Input<K extends SettingId> = K extends SettingId
+  ? SettingTypes[K] extends { input: infer I }
+    ? I
+    : Value<K>
+  : never;
 
 export interface ReadHandler<K extends SettingId> {
   read(context: OperationContext, target: Target<K>): Promise<Reading<Value<K>>>;
