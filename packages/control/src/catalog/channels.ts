@@ -79,6 +79,12 @@ export const CHANNEL_COLORS = [
   "off",
 ] as const;
 
+/** Rec Point stages in raw value order (F03-R), and the stages fixed stereo has. */
+export const REC_POINTS = ["pre-gate", "pre-comp", "pre-eq", "pre-insert-fx", "pre-fader"] as const;
+export const STEREO_REC_POINTS: readonly (typeof REC_POINTS)[number][] = ["pre-eq", "pre-fader"];
+/** Rec Point IDs: mono 137, fixed stereo 264. */
+export const REC_POINT_PARAMS = { mono: 137, stereo: 264 } as const;
+
 /** Names are written with at most this many Unicode scalar values. */
 export const NAME_MAX_CODE_POINTS = 8;
 
