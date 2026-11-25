@@ -9,7 +9,15 @@ import {
 } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
 import { OperationFailureError } from "./failure.js";
-import { channelFader, channelOn, channelPan, channelPolarity, channelSource } from "./channels.js";
+import {
+  channelFader,
+  channelOn,
+  channelPan,
+  channelPanMode,
+  channelPolarity,
+  channelSource,
+  channelStereoLink,
+} from "./channels.js";
 import {
   inputClipSafe,
   inputClipSafeActive,
@@ -50,6 +58,8 @@ export const settingHandlers: SettingHandlers = {
   "channel.pan": channelPan,
   "channel.polarity": channelPolarity,
   "channel.source": channelSource,
+  "channel.stereo-link": channelStereoLink,
+  "channel.pan-mode": channelPanMode,
 };
 
 function unknownId(): Promise<never> {

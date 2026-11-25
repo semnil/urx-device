@@ -28,6 +28,8 @@ export const settingDefinitions = {
   "channel.pan": { readable: true, writable: true },
   "channel.polarity": { readable: true, writable: true },
   "channel.source": { readable: true, writable: true },
+  "channel.stereo-link": { readable: true, writable: true },
+  "channel.pan-mode": { readable: true, writable: true },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */
@@ -68,6 +70,8 @@ export type FaderLevel = number | "-inf";
 
 export type Polarity = "normal" | "inverted";
 
+export type PanMode = "pan" | "balance";
+
 /**
  * Each setting's target, observed value and requested value types (K35:
  * switches are boolean, levels are dB numbers).
@@ -84,6 +88,8 @@ export interface SettingTypes {
   "channel.pan": { target: ChannelTarget; value: number };
   "channel.polarity": { target: ChannelSideTarget; value: Polarity };
   "channel.source": { target: ChannelSideTarget; value: string };
+  "channel.stereo-link": { target: ChannelTarget; value: boolean };
+  "channel.pan-mode": { target: ChannelTarget; value: PanMode };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.
