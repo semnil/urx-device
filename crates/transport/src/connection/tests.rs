@@ -929,3 +929,44 @@ fn cancelling_or_closing_after_the_end_does_not_change_how_waiting_requests_end(
     assert_eq!(outcome(&theirs), ended);
     connection.close();
 }
+
+#[test]
+fn no_write_starts_after_the_link_is_reported_lost() {
+    // The reply to the first write is followed by a device-lost push; the
+    // first write's callback holds the worker long enough for the reader to
+    // queue that push before the next write would start.
+    let peer = unit(|request| {
+        let uri = request["vdp"]["uri"].as_str().unwrap();
+        vec![
+            post_reply(uri, json!({ "response_code": 200 })),
+            line(
+                json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "lost" } } }),
+            ),
+        ]
+    });
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let (tx, first) = mpsc::channel();
+    connection.submit(
+        &operation,
+        Request::SetNumeric(address(1), 1),
+        move |outcome| {
+            thread::sleep(Duration::from_millis(100));
+            let _ = tx.send(outcome);
+        },
+    );
+    let second = submit(&connection, &operation, Request::SetNumeric(address(2), 1));
+    assert!(matches!(outcome(&first), Outcome::Success { .. }));
+    assert_eq!(
+        outcome(&second),
+        failed(
+            RequestCause::ConnectionLost,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    assert_eq!(
+        parameter_uris(&peer),
+        ["/vd/parameters/1:0:0?operation=value"]
+    );
+}

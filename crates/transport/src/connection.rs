@@ -443,6 +443,11 @@ fn serve(
     options: ConnectionOptions,
 ) {
     loop {
+        if let Some(cause) = pending_end(&inbox) {
+            let waiting = mark_ended(&shared, cause);
+            finish(&mut sock, waiting, cause);
+            return;
+        }
         let next = {
             let mut state = shared.lock();
             if state.closing && state.waiting.is_empty() {
@@ -482,6 +487,22 @@ fn serve(
             let waiting = mark_ended(&shared, cause);
             finish(&mut sock, waiting, cause);
             return;
+        }
+    }
+}
+
+/// The cause of an end the reader has already reported, if one is waiting in
+/// `inbox`. Other events are consumed: frames that answer nothing are not
+/// delivered anywhere yet.
+fn pending_end(inbox: &Receiver<Event>) -> Option<RequestCause> {
+    loop {
+        match inbox.try_recv() {
+            Ok(Event::Frame(message)) if lost_notification(&message) => {
+                return Some(RequestCause::ConnectionLost)
+            }
+            Ok(Event::ReadFailed(cause)) => return Some(cause),
+            Ok(_) => {}
+            Err(_) => return None,
         }
     }
 }
@@ -546,7 +567,7 @@ fn execute(
             None,
         );
     }
-    if let Err((cause, written)) = write_frame(sock, frame, send_end) {
+    if let Err((cause, written)) = write_frame(sock, inbox, frame, send_end) {
         let evidence = if written == 0 {
             Evidence::NotSent
         } else {
@@ -614,15 +635,20 @@ fn execute(
     }
 }
 
-/// Writes `frame` by `end`. On failure, the cause and how many bytes went out.
+/// Writes `frame` by `end`, starting no write once the reader has reported
+/// the link ended. On failure, the cause and how many bytes went out.
 fn write_frame(
     sock: &mut TcpStream,
+    inbox: &Receiver<Event>,
     frame: &[u8],
     end: Instant,
 ) -> Result<(), (RequestCause, usize)> {
     debug_assert!(frame.len() <= MAX_FRAME_BYTES + 1);
     let mut written = 0;
     while written < frame.len() {
+        if let Some(cause) = pending_end(inbox) {
+            return Err((cause, written));
+        }
         let remaining = end.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err((RequestCause::SendTimeout, written));
