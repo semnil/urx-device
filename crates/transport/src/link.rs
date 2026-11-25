@@ -68,18 +68,34 @@ struct Bound {
     expired: Cause,
 }
 
-/// Whichever of cancellation and expiry of `bound` happened first, decided
-/// from the first cancellation time and the bound's end alone (a tie is
-/// expiry); otherwise the time left in `bound`.
+/// Whichever of cancellation and expiry of `bound` happened first; otherwise
+/// the time left in `bound`.
+///
+/// The clock is read before the cancellation time. A cancellation found then
+/// is compared with the bound's end alone. A cancellation not yet made when
+/// it is read happens after the clock reading, so when that reading is past
+/// the end, any cancellation comes after the expiry.
 fn stop(control: &Control, bound: &Bound, phase: Phase) -> Result<Duration, Failure> {
-    if let Some(cancelled) = control.cancelled_at() {
+    let now = Instant::now();
+    decide(control.cancelled_at(), now, bound, phase)
+}
+
+/// [`stop`]'s decision from the first cancellation time and a clock reading
+/// taken before it was read. A tie between cancellation and the end is expiry.
+fn decide(
+    cancelled: Option<Instant>,
+    now: Instant,
+    bound: &Bound,
+    phase: Phase,
+) -> Result<Duration, Failure> {
+    if let Some(cancelled) = cancelled {
         return Err(if cancelled < bound.end {
             Failure::Cancelled { phase }
         } else {
             Failure::cause(bound.expired, phase)
         });
     }
-    let remaining = bound.end.saturating_duration_since(Instant::now());
+    let remaining = bound.end.saturating_duration_since(now);
     if remaining.is_zero() {
         return Err(Failure::cause(bound.expired, phase));
     }
@@ -228,7 +244,7 @@ impl<'a> Link<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt, stop, Bound};
+    use super::{attempt, decide, stop, Bound};
     use crate::lifecycle::{Cause, Control, Failure, Phase};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
@@ -282,6 +298,41 @@ mod tests {
             }),
             "cancelled with time left"
         );
+    }
+
+    #[test]
+    fn every_order_of_cancellation_expiry_and_clock_reading_reports_the_first() {
+        let end = Instant::now();
+        let ms = Duration::from_millis;
+        let phase = Phase::Discovery;
+        let cancelled = Err(Failure::Cancelled { phase });
+        let expired = Err(Failure::Cause {
+            code: Cause::ResponseTimeout,
+            phase,
+        });
+        // (cancellation time read, clock read before it)
+        let cases = [
+            // cancelled, then the clock read, then the end passes
+            (Some(end - ms(20)), end - ms(10), cancelled),
+            // cancelled, the end passes, then the clock read
+            (Some(end - ms(10)), end + ms(10), cancelled),
+            // the end passes, cancelled, then the clock read
+            (Some(end + ms(10)), end + ms(20), expired),
+            // the clock read before the end, the end passes, then cancelled
+            (Some(end + ms(10)), end - ms(10), expired),
+            // the clock read past the end, nothing cancelled yet
+            (None, end + ms(10), expired),
+            // cancelled exactly at the end
+            (Some(end), end + ms(10), expired),
+        ];
+        for (cancel, now, expected) in cases {
+            assert_eq!(
+                decide(cancel, now, &bound(end), phase).map(|_| ()),
+                expected,
+                "{cancel:?} {now:?}"
+            );
+        }
+        assert_eq!(decide(None, end - ms(10), &bound(end), phase), Ok(ms(10)));
     }
 
     #[test]
