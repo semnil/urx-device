@@ -401,11 +401,16 @@ fn notifications_and_other_replies_do_not_answer_a_request() {
 fn hold_worker(connection: &Connection, operation: &super::Operation) -> mpsc::Sender<()> {
     let (open, gate) = mpsc::channel::<()>();
     let (entered_tx, entered) = mpsc::channel();
-    connection.submit_adopted(operation, Request::GetNumeric(address(1)), move |_| {
-        let _ = entered_tx.send(());
-        let _ = gate.recv();
+    connection.submit_adopted(operation, Request::GetNumeric(address(1)), move |outcome| {
+        // Only a success holds: a refusal may run on the submitting thread.
+        let success = matches!(outcome, Outcome::Success { .. });
+        let _ = entered_tx.send(outcome);
+        if success {
+            let _ = gate.recv();
+        }
     });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let outcome = entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(outcome, Outcome::Success { .. }), "{outcome:?}");
     open
 }
 
@@ -2574,16 +2579,23 @@ mod notifications {
 
     /// Submits a GET whose completion callback blocks the worker until the
     /// returned sender is used.
-    fn block_worker(connection: &Connection) -> (Sender<()>, Receiver<()>) {
+    fn block_worker(connection: &Connection) -> Sender<()> {
         let operation = connection.create_operation().unwrap();
         let (release, blocked) = mpsc::channel::<()>();
         let (entered_tx, entered) = mpsc::channel();
-        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |_| {
-            let _ = entered_tx.send(());
-            let _ = blocked.recv();
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
+            // Only a success holds: a refusal may run on the submitting thread.
+            let success = matches!(outcome, Outcome::Success { .. });
+            let _ = entered_tx.send(success);
+            if success {
+                let _ = blocked.recv();
+            }
         });
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        (release, entered)
+        assert!(
+            entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "the held request succeeded"
+        );
+        release
     }
 
     #[test]
@@ -2591,7 +2603,7 @@ mod notifications {
         let (port, push) = pushing_unit(Duration::ZERO);
         let (connection, batches) = connect(port);
         let a = activate(&connection, &[p(1)]);
-        let (release, _) = block_worker(&connection);
+        let release = block_worker(&connection);
         push.send(notify_param(1, 1)).unwrap();
         let batch = next(&batches);
         assert_eq!(batch.records[0].recipients, [a.token()]);
@@ -2608,7 +2620,7 @@ mod notifications {
         let (port, push) = pushing_unit(Duration::ZERO);
         let (connection, _batches) = connect(port);
         let _token = activate(&connection, &[p(1)]);
-        let (release, _) = block_worker(&connection);
+        let release = block_worker(&connection);
         for value in 0..MAX_PENDING_NOTIFICATIONS as i64 {
             push.send(notify_param(1, value)).unwrap();
         }
@@ -2834,7 +2846,7 @@ mod notifications {
         let (port, push) = pushing_unit(Duration::ZERO);
         let (connection, batches) = connect(port);
         let _token = activate(&connection, &[p(1)]);
-        let (release, _) = block_worker(&connection);
+        let release = block_worker(&connection);
         overflow(&connection, &push);
         let mut values = Vec::new();
         while values.len() < MAX_PENDING_NOTIFICATIONS {
@@ -2911,7 +2923,7 @@ mod notifications {
             let (connection, _batches) = connect(port);
             let connection = Arc::new(connection);
             let _token = activate(&connection, &[p(1)]);
-            let (release, _) = block_worker(&connection);
+            let release = block_worker(&connection);
             let operation = connection.create_operation().unwrap();
             let (tx, done) = mpsc::channel();
             connection.submit_adopted(&operation, Request::GetNumeric(param(6)), move |outcome| {
