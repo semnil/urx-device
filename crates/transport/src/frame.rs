@@ -134,7 +134,9 @@ pub fn encode(message: &Value) -> Result<Vec<u8>, OversizedFrame> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode, Frame, FrameReader, OversizedFrame, ReadError, MAX_FRAME_BYTES};
+    use super::{
+        encode, Frame, FrameReader, OversizedFrame, ReadError, CHUNK_BYTES, MAX_FRAME_BYTES,
+    };
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::io::{Error, ErrorKind, Read};
@@ -259,8 +261,11 @@ mod tests {
             let mut bytes = line_of_len(first);
             bytes.extend_from_slice(b"{\"b\":2}\n");
             assert!(bytes.len() - 1 > MAX_FRAME_BYTES);
+            // The last read is the final CHUNK_BYTES bytes, so it holds both LFs.
+            let (head, tail) = bytes.split_at(bytes.len() - CHUNK_BYTES);
+            assert_eq!(tail.iter().filter(|&&b| b == b'\n').count(), 2);
             let mut reader = FrameReader::new();
-            let mut src = Chunks::of(&[&bytes]);
+            let mut src = Chunks::of(&[head, tail]);
             assert_eq!(
                 reader.read_frame(&mut src).unwrap().map(|f| f.len),
                 Some(first)
