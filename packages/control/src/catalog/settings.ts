@@ -2,6 +2,7 @@
 // setting ID with its definition; operations bind every ID to a handler.
 // Rows are added per K35 catalog part (stages D7–D15).
 
+import { frozen } from "./frozen.js";
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
@@ -23,7 +24,7 @@ export interface SettingDefinitionBase {
  * The catalog: setting ID to definition. It is a static literal, never
  * extended at runtime (K2: no dynamic registration).
  */
-export const settingDefinitions = {
+export const settingDefinitions = frozen({
   "input.gain": { readable: true, writable: true },
   "input.phantom": { readable: true, writable: true },
   "input.hi-z": { readable: true, writable: true },
@@ -64,7 +65,7 @@ export const settingDefinitions = {
   "channel.comp.auto-makeup": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.auto-makeup"] },
   "channel.comp.one-knob.on": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.on"] },
   "channel.comp.one-knob.level": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.level"] },
-} as const satisfies Record<string, SettingDefinitionBase>;
+} as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
 export type SettingId = keyof typeof settingDefinitions;

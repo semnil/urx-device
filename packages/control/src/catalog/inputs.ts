@@ -2,38 +2,39 @@
 // coverage, addresses and ranges. Source and router references are in the
 // design record; nothing here was measured on hardware.
 
+import { frozen } from "./frozen.js";
 import type { Model } from "./models.js";
 
 /** Physical MIC/LINE jacks per model, numbered from 1. */
-export const INPUT_JACKS: Readonly<Record<Model, readonly number[]>> = {
+export const INPUT_JACKS: Readonly<Record<Model, readonly number[]>> = frozen({
   URX22: [1, 2],
   URX44: [1, 2, 3, 4],
   URX44V: [1, 2, 3, 4],
-};
+});
 
 /** The jacks with HI-Z per model. */
-export const HI_Z_JACKS: Readonly<Record<Model, readonly number[]>> = {
+export const HI_Z_JACKS: Readonly<Record<Model, readonly number[]>> = frozen({
   URX22: [2],
   URX44: [3, 4],
   URX44V: [3, 4],
-};
+});
 
 /** Parameter IDs of the physical-input settings; address x 0, y jack − 1. */
-export const INPUT_PARAMS = {
+export const INPUT_PARAMS = frozen({
   gain: 1,
   phantom: 0,
   hiZ: 6,
   clipSafe: 5,
   clipSafeActive: 864,
-} as const;
+} as const);
 
 /** Physical input gain, dB: written in whole dB within this range. */
-export const INPUT_GAIN_DB = { min: -8, max: 70 } as const;
+export const INPUT_GAIN_DB = frozen({ min: -8, max: 70 } as const);
 
 /** Source gain, dB: written in whole dB within this range. */
-export const SOURCE_GAIN_DB = { min: -24, max: 24 } as const;
+export const SOURCE_GAIN_DB = frozen({ min: -24, max: 24 } as const);
 
-export const SOURCE_TOKENS = [
+export const SOURCE_TOKENS = frozen([
   "aux",
   "sd-playback",
   "usb-daw-1-2",
@@ -47,7 +48,7 @@ export const SOURCE_TOKENS = [
   "usb-main-c",
   "usb-sub",
   "hdmi",
-] as const;
+] as const);
 
 export type SourceToken = (typeof SOURCE_TOKENS)[number];
 
@@ -67,7 +68,7 @@ const ALL: readonly Model[] = ["URX22", "URX44", "URX44V"];
 const LARGER: readonly Model[] = ["URX44", "URX44V"];
 
 /** Source gain addresses; x is 0 throughout. */
-export const SOURCE_GAIN: Readonly<Record<SourceToken, SourceGainAddress>> = {
+export const SOURCE_GAIN: Readonly<Record<SourceToken, SourceGainAddress>> = frozen({
   aux: { models: ALL, paramId: 9, instances: [0, 1], writes: null },
   "sd-playback": { models: LARGER, paramId: 11, instances: [0, 1], writes: null },
   "usb-daw-1-2": { models: ALL, paramId: 12, instances: [0], writes: [0] },
@@ -81,7 +82,7 @@ export const SOURCE_GAIN: Readonly<Record<SourceToken, SourceGainAddress>> = {
   "usb-main-c": { models: ALL, paramId: 15, instances: [0, 1], writes: null },
   "usb-sub": { models: ALL, paramId: 16, instances: [0, 1], writes: null },
   hdmi: { models: ["URX44V"], paramId: 17, instances: [0, 1], writes: null },
-};
+});
 
 export function isSourceToken(value: unknown): value is SourceToken {
   return typeof value === "string" && (SOURCE_TOKENS as readonly string[]).includes(value);

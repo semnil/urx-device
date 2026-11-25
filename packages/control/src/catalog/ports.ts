@@ -1,6 +1,7 @@
 // Individual input-port selection (F03-I): the closed port tokens, their raw
 // values and model availability. A token names one source lane.
 
+import { frozen } from "./frozen.js";
 import type { Model } from "./models.js";
 
 const ALL: readonly Model[] = ["URX22", "URX44", "URX44V"];
@@ -36,12 +37,12 @@ function ports(): Readonly<Record<string, Port>> {
 }
 
 /** Port token to raw value and the models that have it. */
-export const INPUT_PORTS: Readonly<Record<string, Port>> = ports();
+export const INPUT_PORTS: Readonly<Record<string, Port>> = frozen(ports());
 
 export type InputPort = string;
 
 /** Parameter IDs of the channel source: mono 22, fixed stereo left 209 / right 210. */
-export const SOURCE_PARAMS = { mono: 22, left: 209, right: 210 } as const;
+export const SOURCE_PARAMS = frozen({ mono: 22, left: 209, right: 210 } as const);
 
 /** The token of a raw value valid on `model`, or undefined. */
 export function portOfRaw(model: Model, raw: string): InputPort | undefined {

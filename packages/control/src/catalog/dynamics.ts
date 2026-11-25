@@ -1,12 +1,13 @@
 // GATE and ordinary-COMP rules (F04-D, F18-P): mono only; dB settings on
 // 0.01 dB, times and ratios on the shared nonuniform stops.
 
+import { frozen } from "./frozen.js";
 import { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "./dynamics-stops.js";
 import type { ChannelSettingRule } from "./rules.js";
 
-const mono = (paramId: number) => ({ mono: paramId });
+const mono = (paramId: number) => ({ mono: paramId }) as const;
 
-export const DYNAMICS_RULES = {
+export const DYNAMICS_RULES = frozen({
   "channel.gate.threshold": {
     target: "channel",
     address: mono(29),
@@ -77,4 +78,4 @@ export const DYNAMICS_RULES = {
     address: mono(43),
     value: { kind: "grid", unit: null, min: 0, max: 100, scale: 1 },
   },
-} as const satisfies Record<string, ChannelSettingRule>;
+} as const satisfies Record<string, ChannelSettingRule>);
