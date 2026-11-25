@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
+import { DUCKER_RULES } from "../src/catalog/ducker.js";
 import { DYNAMICS_RULES } from "../src/catalog/dynamics.js";
 import { EQ_RULES } from "../src/catalog/eq.js";
 import { SSMCS_RULES } from "../src/catalog/ssmcs.js";
@@ -18,12 +19,13 @@ const ruled = Object.entries(settingDefinitions as Record<string, SettingDefinit
   definition.rule === undefined ? [] : [[id, definition.rule] as [string, SettingRule]],
 );
 
-const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES };
+const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES };
 
 /** Each (id, target, value rule) a rule defines: one per band for a band rule. */
 const valueCases = ruled.flatMap(([id, rule]): [string, object, ValueRule][] => {
   if (rule.target === "channel") {
-    return [[id, { channel: 1 }, rule.value]];
+    // URX44 channel 1 is mono, channel 5 the first fixed stereo pair.
+    return [[id, { channel: rule.address.mono === undefined ? 5 : 1 }, rule.value]];
   }
   const value = rule.value;
   return rule.bands.flatMap((band): [string, object, ValueRule][] => {
@@ -112,7 +114,7 @@ describe("setting rules (K35 definition metadata)", () => {
           expect(await observed(id, target, `${rule.choices.length}`), id).toEqual({ code: "invalid_response" });
           break;
         case "grid": {
-          const step = 1 / rule.scale;
+          const step = rule.step ?? 1 / rule.scale;
           const raw = (value: number) => `${Math.round(value * rule.scale) + (rule.offset ?? 0)}`;
           expect([plan(id, target, rule.min), plan(id, target, rule.max), plan(id, target, rule.min + step / 2)], id).toEqual([
             rule.min,
@@ -126,6 +128,31 @@ describe("setting rules (K35 definition metadata)", () => {
           expect(await observed(id, target, raw(rule.max)), id).toEqual({ value: rule.max });
           expect(await observed(id, target, `${Number(raw(rule.min)) - 1}`), id).toEqual({ code: "invalid_response" });
           expect(await observed(id, target, `${Number(raw(rule.max)) + 1}`), id).toEqual({ code: "invalid_response" });
+          // A read between write steps is kept, not snapped.
+          expect(await observed(id, target, `${Number(raw(rule.min)) + 1}`), id).toEqual({
+            value: rule.min + 1 / rule.scale,
+          });
+          break;
+        }
+        case "port-choice": {
+          const choices = rule.byModel["URX44"] ?? [];
+          for (const { token, id: port } of choices) {
+            expect(await wire(id, target, token), `${id} ${token}`).toBe(`${port}`);
+            expect(await observed(id, target, `${port}`), `${id} ${token}`).toEqual({ value: token });
+            expect(await observed(id, target, `${port + 0x80000000}`), `${id} tagged ${token}`).toEqual({ value: token });
+          }
+          expect(await wire(id, target, rule.none.value), id).toBe(rule.none.raw);
+          expect(await observed(id, target, rule.none.raw), id).toEqual({ value: rule.none.value });
+          const absent = rule.known.filter((token) => !choices.some((choice) => choice.token === token));
+          for (const token of absent) {
+            expect(() => plan(id, target, token), `${id} ${token}`).toThrow(/unsupported_operation/);
+          }
+          expect(() => plan(id, target, "channel-0"), id).toThrow(/invalid_input/);
+          const ids = new Set(choices.map((choice) => choice.id));
+          const foreign = [...Array(300).keys()].find((n) => !ids.has(n)) as number;
+          for (const raw of [`${foreign}`, "4294967296", "-1"]) {
+            expect(await observed(id, target, raw), `${id} ${raw}`).toEqual({ code: "invalid_response" });
+          }
           break;
         }
         case "stops": {

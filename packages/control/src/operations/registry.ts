@@ -66,6 +66,14 @@ import {
   ssmcsSidechainQ,
 } from "./ssmcs.js";
 import {
+  duckerAttack,
+  duckerDecay,
+  duckerKeySource,
+  duckerOn,
+  duckerRange,
+  duckerThreshold,
+} from "./ducker.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -175,6 +183,12 @@ export const settingHandlers: SettingHandlers = {
   "channel.ssmcs.eq.band.frequency": ssmcsEqBandFrequency,
   "channel.ssmcs.eq.band.gain": ssmcsEqBandGain,
   "channel.ssmcs.eq.band.q": ssmcsEqBandQ,
+  "channel.ducker.on": duckerOn,
+  "channel.ducker.key-source": duckerKeySource,
+  "channel.ducker.threshold": duckerThreshold,
+  "channel.ducker.range": duckerRange,
+  "channel.ducker.attack": duckerAttack,
+  "channel.ducker.decay": duckerDecay,
 };
 
 function unknownId(): Promise<never> {

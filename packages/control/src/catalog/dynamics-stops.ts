@@ -1,6 +1,6 @@
-// Dynamics write stops (F04-D), in wire units: the router's DYN_ATTACK_STOPS_MS,
-// DYN_HOLD_STOPS_MS, DYN_RELEASE_STOPS_MS and the finite COMP_RATIO_STEPS,
-// evaluated at urx-router ced9c7d2 and written out. Nonuniform: never replaced
+// Dynamics write stops (F04-D, F04-U), in wire units: the router's DYN_ATTACK_STOPS_MS,
+// DYN_HOLD_STOPS_MS, DYN_RELEASE_STOPS_MS, the finite COMP_RATIO_STEPS and
+// DUCKER_DECAY_STOPS_MS, evaluated at urx-router ced9c7d2 and written out. Nonuniform: never replaced
 // by a uniform increment.
 
 import { frozen } from "./frozen.js";
@@ -70,3 +70,15 @@ export const RATIO_STOPS_RAW: readonly number[] = frozen([
   1800, 1900, 2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4500, 5000, 5500,
   6000, 6500, 7000, 8000, 9000, 10000, 15000, 20000, 30000, 50000,
 ]);
+
+/** DUCKER decay stops, ms × 10: 1.3 … 5000 ms (the router's DUCKER_DECAY_STOPS_MS at ced9c7d2). */
+export const DUCKER_DECAY_STOPS_RAW: readonly number[] = frozen([
+  13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 26, 28, 30, 33, 36, 39, 42, 45, 48, 51,
+  54, 57, 60, 64, 68, 72, 76, 80, 85, 90, 95, 100, 110, 120, 130, 140, 150, 160, 170, 180,
+  190, 200, 220, 240, 260, 280, 300, 330, 360, 390, 420, 450, 480, 510, 540, 570, 600, 640, 680, 720,
+  760, 800, 850, 900, 950, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2200, 2400, 2600, 2800,
+  3000, 3300, 3600, 3900, 4200, 4500, 4800, 5100, 5400, 5700, 6000, 6400, 6800, 7200, 7600, 8000, 8500, 9000, 9500, 10000,
+  11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000, 22000, 24000, 26000, 28000, 30000, 33000, 36000, 39000, 42000, 45000,
+  48000, 50000,
+]);
+

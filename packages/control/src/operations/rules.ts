@@ -9,6 +9,7 @@ import type {
   ChannelBandSettingRule,
   ChannelSettingRule,
   GridRule,
+  PortChoiceRule,
   StopsRule,
   TextIndexRule,
   ValueRule,
@@ -19,15 +20,21 @@ import type { Reading, WritePlan, WriteResult } from "./results.js";
 import { address, modelOf, readDecoded, readTextDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
-/** A value's wire form both ways; `text` marks a string parameter. */
+/**
+ * A value's wire form both ways; `text` marks a string parameter. A plan is
+ * undefined for an invalid value and "unsupported" for a known value the
+ * model lacks.
+ */
 interface Codec {
   readonly text: boolean;
   decode(raw: string): unknown;
-  plan(value: unknown): { planned: unknown; raw: string } | undefined;
+  plan(value: unknown): { planned: unknown; raw: string } | "unsupported" | undefined;
 }
 
 function gridCodec(rule: GridRule): Codec {
   const offset = rule.offset ?? 0;
+  // Write steps per public unit: the step, or the wire resolution.
+  const perUnit = rule.step === undefined ? rule.scale : 1 / rule.step;
   return {
     text: false,
     decode: (raw) => {
@@ -35,7 +42,7 @@ function gridCodec(rule: GridRule): Codec {
       return value === undefined ? undefined : (value - offset) / rule.scale;
     },
     plan: (value) => {
-      const planned = typeof value === "number" ? planOnGrid(value, rule.min, rule.max, rule.scale) : undefined;
+      const planned = typeof value === "number" ? planOnGrid(value, rule.min, rule.max, perUnit) : undefined;
       return planned === undefined ? undefined : { planned, raw: `${Math.round(planned * rule.scale) + offset}` };
     },
   };
@@ -86,8 +93,43 @@ function textIndexCodec(rule: TextIndexRule): Codec {
   };
 }
 
-export function codecOf(rule: ValueRule): Codec {
+const PORT_TAG = 0x80000000n;
+const U32_MAX = 0xffffffffn;
+
+function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
+  const choices = Object.hasOwn(rule.byModel, model) ? (rule.byModel[model] ?? []) : [];
+  return {
+    text: false,
+    decode: (raw) => {
+      // An unsigned 32-bit integer first, then the exact sentinel, then the tag bit.
+      if (!/^(0|[1-9][0-9]*)$/.test(raw) || BigInt(raw) > U32_MAX) {
+        return undefined;
+      }
+      if (raw === rule.none.raw) {
+        return rule.none.value;
+      }
+      const value = BigInt(raw);
+      const id = Number(value & PORT_TAG ? value - PORT_TAG : value);
+      return choices.find((choice) => choice.id === id)?.token;
+    },
+    plan: (value) => {
+      if (value === rule.none.value) {
+        return { planned: value, raw: rule.none.raw };
+      }
+      const choice = choices.find((each) => each.token === value);
+      if (choice !== undefined) {
+        return { planned: value, raw: `${choice.id}` };
+      }
+      return rule.known.includes(value as string) ? "unsupported" : undefined;
+    },
+  };
+}
+
+/** The codec of `rule` on `model` (only a port choice depends on the model). */
+export function codecOf(rule: ValueRule, model = ""): Codec {
   switch (rule.kind) {
+    case "port-choice":
+      return portChoiceCodec(rule, model);
     case "switch":
       return { text: false, decode: decodeSwitch, plan: planSwitch };
     case "choice":
@@ -126,6 +168,9 @@ function handler<V>(resolve: (model: string, target: unknown) => { at: Parameter
   const planned = (model: string, target: unknown, requested: V) => {
     const { at, codec } = resolve(model, target);
     const result = codec.plan(requested);
+    if (result === "unsupported") {
+      return refuse("unsupported_operation");
+    }
     return result === undefined
       ? refuse("invalid_input")
       : { at, codec, raw: result.raw as I64Text, requested, planned: result.planned as V };
@@ -167,10 +212,11 @@ function channelAddress(
 
 /** A whole-channel setting whose handler is built from `rule`; `V` is its catalog value type. */
 export function ruleSetting<V>(rule: ChannelSettingRule) {
-  const codec = codecOf(rule.value);
+  const fixed = rule.value.kind === "port-choice" ? undefined : codecOf(rule.value);
   return handler<V>((model, target) => {
     const own = targetOf<{ channel?: unknown; side?: unknown }>(target, ["channel", "side"]);
-    return { at: channelAddress(model, own, rule.address), codec };
+    const at = channelAddress(model, own, rule.address);
+    return { at, codec: fixed ?? codecOf(rule.value, model) };
   });
 }
 
