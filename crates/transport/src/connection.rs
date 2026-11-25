@@ -12,6 +12,7 @@
 //! with its evidence, waiting requests complete unsent with the same cause,
 //! and later submissions are refused as `not_connected`. Nothing is resent.
 
+use crate::delivery::{BatchTicket, NotificationBatch, NotificationRecord, Queue};
 use crate::discovery::{get, lost_notification, system_firmware, SystemFirmware};
 use crate::frame::{self, FrameReader, ReadError, MAX_FRAME_BYTES};
 use crate::lifecycle::{
@@ -22,7 +23,7 @@ use crate::request::{
     Evidence, Outcome, ReadValue, Request, RequestCause, RequestFailure, RequestPhase,
 };
 use crate::subscription::{Ledger, StartRefusal, SubscriptionAddress, TokenId, Verdict};
-use crate::wire::{self, Inbound, PostVerdict, Reply, ReplyKey, WriteValue};
+use crate::wire::{self, Inbound, Notification, PostVerdict, Reply, ReplyKey, WriteValue};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
@@ -32,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle, ThreadId};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Waiting requests, excluding the active one (K6).
 pub const MAX_WAITING_REQUESTS: usize = 64;
@@ -127,6 +128,12 @@ struct Shared {
     link_end: Mutex<Option<RequestCause>>,
     /// Signalled when the worker settles its active request.
     settled: Condvar,
+    /// Notifications waiting for the application (K6), when it takes them.
+    notifications: Option<Mutex<Queue>>,
+    /// Signalled when a batch can be formed or delivery must stop.
+    deliverable: Condvar,
+    delivery_stop: AtomicBool,
+    generation: u64,
 }
 
 impl Shared {
@@ -145,9 +152,22 @@ impl Shared {
 
 enum Event {
     Wake,
-    Frame(Value),
+    Frame(Received),
     ReadFailed(RequestCause),
 }
+
+/// One JSON frame as the reader received it.
+struct Received {
+    message: Value,
+    /// Bytes before its LF: what a notification from it is charged (K6).
+    len: usize,
+    /// PC receipt time, milliseconds since the Unix epoch.
+    received_at_ms: i64,
+}
+
+/// Receives each notification batch; acknowledge it with
+/// [`Connection::adopt_notifications`] once its records are adopted.
+pub type NotificationHandler = Arc<dyn Fn(NotificationBatch) + Send + Sync>;
 
 /// An open connection to one unit. It is shared by reference: closing takes
 /// `&self`, and every call to [`Connection::close`] joins the same close.
@@ -160,6 +180,7 @@ pub struct Connection {
     sock: Mutex<Option<TcpStream>>,
     reader_stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    delivery: Mutex<Option<JoinHandle<()>>>,
     /// Kept apart from the handle, which a close takes.
     worker_id: ThreadId,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -213,12 +234,25 @@ pub struct Operation {
 }
 
 /// Opens the unit at `port`, which must report `online` with identity
-/// `expected_id`, and reads its System firmware.
+/// `expected_id`, and reads its System firmware. Notifications are not
+/// delivered; see [`open_with`].
 pub fn open(
     port: u16,
     expected_id: &str,
     options: &ConnectionOptions,
     control: &Control,
+) -> Result<Connection, Failure> {
+    open_with(port, expected_id, options, control, None)
+}
+
+/// Like [`open`], delivering notifications for the connection's tokens to
+/// `notifications`, which is installed before any request can be submitted.
+pub fn open_with(
+    port: u16,
+    expected_id: &str,
+    options: &ConnectionOptions,
+    control: &Control,
+    notifications: Option<NotificationHandler>,
 ) -> Result<Connection, Failure> {
     let budget = Budget::starting_now(options.connect_deadline, Cause::ConnectTimeout);
     let deadline = options.handshake_request_deadline;
@@ -259,7 +293,7 @@ pub fn open(
     )?;
     let firmware = system_firmware(&device).ok_or(invalid)?;
     let (sock, reader) = link.into_parts();
-    Connection::start(sock, reader, firmware, options)
+    Connection::start(sock, reader, firmware, options, notifications)
         .map_err(|_| Failure::cause(Cause::InternalError, Phase::Connect))
 }
 
@@ -269,11 +303,21 @@ impl Connection {
         reader: FrameReader,
         firmware: SystemFirmware,
         options: &ConnectionOptions,
+        notifications: Option<NotificationHandler>,
     ) -> std::io::Result<Connection> {
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
             settled: Condvar::new(),
+            notifications: notifications.as_ref().map(|_| Mutex::new(Queue::new())),
+            deliverable: Condvar::new(),
+            delivery_stop: AtomicBool::new(false),
+            generation,
+        });
+        let delivery_thread = notifications.map(|handler| {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || deliver_notifications(&shared, &handler))
         });
         let (events, inbox) = mpsc::channel();
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -291,7 +335,8 @@ impl Connection {
             thread::spawn(move || serve(sock, inbox, shared, options))
         };
         Ok(Connection {
-            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            generation,
+            delivery: Mutex::new(delivery_thread),
             firmware,
             shared,
             events,
@@ -392,6 +437,20 @@ impl Connection {
         let _ = self.events.send(Event::Wake);
     }
 
+    /// Acknowledges the notification batch `ticket` once its records are
+    /// adopted, releasing their budget and the next batch. A stale or
+    /// repeated ticket changes nothing and returns false.
+    pub fn adopt_notifications(&self, ticket: BatchTicket) -> bool {
+        let Some(queue) = &self.shared.notifications else {
+            return false;
+        };
+        let adopted = lock(queue).adopt(ticket);
+        if adopted {
+            self.shared.deliverable.notify_all();
+        }
+        adopted
+    }
+
     /// Admits a subscription token for `addresses` without any device
     /// traffic (K11). It receives notifications for them from now on; its
     /// registrations start with [`Subscription::activate`].
@@ -484,10 +543,13 @@ impl Connection {
         if let Some(sock) = lock(&self.sock).take() {
             let _ = sock.shutdown(Shutdown::Both);
         }
+        self.shared.delivery_stop.store(true, Ordering::SeqCst);
+        self.shared.deliverable.notify_all();
         let threads = [
             delivery,
             lock(&self.worker).take(),
             lock(&self.reader).take(),
+            lock(&self.delivery).take(),
         ];
         if self.on_worker() {
             // A completion callback cannot wait for the worker it runs on; a
@@ -517,7 +579,7 @@ impl Connection {
 /// `Incomplete`, even if the threads finish later. The joins run on their own
 /// thread, so a thread whose exit (its thread-local destructors included)
 /// does not finish cannot hold this past `end`.
-fn wait_for(threads: [Option<JoinHandle<()>>; 3], end: Instant) -> CloseOutcome {
+fn wait_for(threads: [Option<JoinHandle<()>>; 4], end: Instant) -> CloseOutcome {
     let incomplete =
         CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
     let (joined, all_joined) = mpsc::channel();
@@ -724,6 +786,73 @@ fn wire_request(request: &Request) -> wire::Request {
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Queues the notification in `received` for the tokens eligible now, when
+/// the application takes notifications and any token is eligible. A record
+/// that does not fit the budget ends the connection (K6).
+fn route(shared: &Shared, received: Received) -> Option<RequestCause> {
+    let queue = shared.notifications.as_ref()?;
+    let payload = Inbound::new(received.message).notification()?;
+    let recipients = {
+        let state = shared.lock();
+        match &payload {
+            Notification::Numeric { address, .. } | Notification::Text { address, .. } => state
+                .ledger
+                .recipients(SubscriptionAddress::Parameter(*address))
+                .to_vec(),
+            Notification::Meter { address, .. } => state
+                .ledger
+                .recipients(SubscriptionAddress::Meter(*address))
+                .to_vec(),
+            Notification::BulkChange => state.ledger.parameter_holders(),
+        }
+    };
+    if recipients.is_empty() {
+        return None;
+    }
+    let record = NotificationRecord {
+        recipients,
+        received_at_ms: received.received_at_ms,
+        payload,
+    };
+    let pushed = lock(queue).push(record, received.len);
+    shared.deliverable.notify_all();
+    pushed.err().map(|_| RequestCause::NotificationOverflow)
+}
+
+/// The delivery thread: hands one batch at a time to `handler` and waits
+/// for its acknowledgment before the next, until the connection closes.
+fn deliver_notifications(shared: &Shared, handler: &NotificationHandler) {
+    let Some(queue) = &shared.notifications else {
+        return;
+    };
+    loop {
+        let batch = {
+            let mut queue = lock(queue);
+            loop {
+                if shared.delivery_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(batch) = queue.next_batch(shared.generation) {
+                    break batch;
+                }
+                queue = shared
+                    .deliverable
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| handler(batch)));
+    }
+}
+
 /// Receives frames until told to stop or the link fails.
 fn read_frames(
     mut sock: TcpStream,
@@ -747,7 +876,12 @@ fn read_frames(
                     if lost_notification(&json) {
                         record(RequestCause::ConnectionLost);
                     }
-                    if events.send(Event::Frame(json)).is_err() {
+                    let received = Received {
+                        message: json,
+                        len: frame.len,
+                        received_at_ms: now_ms(),
+                    };
+                    if events.send(Event::Frame(received)).is_err() {
                         return;
                     }
                 }
@@ -836,8 +970,12 @@ fn serve(
             }
             None => match inbox.recv() {
                 Ok(Event::Wake) => None,
-                Ok(Event::Frame(message)) => {
-                    lost_notification(&message).then_some(RequestCause::ConnectionLost)
+                Ok(Event::Frame(received)) => {
+                    if lost_notification(&received.message) {
+                        Some(RequestCause::ConnectionLost)
+                    } else {
+                        route(&shared, received)
+                    }
                 }
                 Ok(Event::ReadFailed(cause)) => Some(cause),
                 Err(_) => return,
@@ -1399,13 +1537,16 @@ fn exchange(
             inbox.recv_timeout(remaining)
         };
         match event {
-            Ok(Event::Frame(message)) => {
-                if lost_notification(&message) {
+            Ok(Event::Frame(received)) => {
+                if lost_notification(&received.message) {
                     return unconfirmed(RequestCause::ConnectionLost);
                 }
-                let inbound = Inbound::new(message);
+                let inbound = Inbound::new(received.message.clone());
                 if inbound.reply(key).is_some() {
                     return Ok(inbound);
+                }
+                if let Some(cause) = route(shared, received) {
+                    return unconfirmed(cause);
                 }
             }
             Ok(Event::Wake) => {}

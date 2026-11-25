@@ -315,6 +315,25 @@ impl Ledger {
             .map_or(&[], |entry| entry.owners.as_slice())
     }
 
+    /// The tokens that are not releasing and hold any parameter address, in
+    /// admission order: the recipients of a whole-namespace parameter change.
+    pub fn parameter_holders(&self) -> Vec<TokenId> {
+        let mut holders: Vec<TokenId> = self
+            .tokens
+            .iter()
+            .filter(|(_, token)| {
+                token.state != TokenState::Releasing
+                    && token
+                        .addresses
+                        .iter()
+                        .any(|address| matches!(address, SubscriptionAddress::Parameter(_)))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        holders.sort();
+        holders
+    }
+
     /// Retained tokens, releasing ones included.
     pub fn token_count(&self) -> usize {
         self.tokens.len()
