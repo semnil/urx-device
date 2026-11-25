@@ -58,6 +58,30 @@ export const MONO_PAIRS: Readonly<Record<Model, readonly number[]>> = {
 /** Pair settings at the primary: x 0, y primary − 1. */
 export const PAIR_PARAMS = { stereoLink: 23, panMode: 891 } as const;
 
+/** Name and color IDs (F03-K): mono 18 / 20, fixed stereo 206 / 208. */
+export const IDENTITY_PARAMS = {
+  name: { mono: 18, stereo: 206 },
+  color: { mono: 20, stereo: 208 },
+} as const;
+
+/** Palette tokens in raw index order (F03-K). */
+export const CHANNEL_COLORS = [
+  "blue",
+  "orange",
+  "yellow",
+  "purple",
+  "cyan",
+  "magenta",
+  "red",
+  "green",
+  "light-green",
+  "white",
+  "off",
+] as const;
+
+/** Names are written with at most this many Unicode scalar values. */
+export const NAME_MAX_CODE_POINTS = 8;
+
 /** Finite fader writes and reads, dB; written in 0.01 dB steps. */
 export const FADER_DB = { min: -96, max: 10 } as const;
 /** The raw value of negative infinity, and only that. */

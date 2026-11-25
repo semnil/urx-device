@@ -3,6 +3,9 @@
 // equality reads, no readback.
 
 import {
+  CHANNEL_COLORS,
+  IDENTITY_PARAMS,
+  NAME_MAX_CODE_POINTS,
   MONO_PAIRS,
   PAIR_PARAMS,
   CHANNEL_PARAMS,
@@ -15,10 +18,19 @@ import {
 import { decodeInteger, decodeSwitch, encodeSwitch, planOnGrid } from "../catalog/codecs.js";
 import { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "../catalog/ports.js";
 import { formatI64, type I64Text } from "../catalog/i64.js";
-import type { ChannelSideTarget, ChannelTarget, FaderLevel, PanMode, Polarity } from "../catalog/settings.js";
+import type {
+  ChannelColor,
+  ChannelName,
+  ChannelSideTarget,
+  ChannelTarget,
+  FaderLevel,
+  PanMode,
+  Polarity,
+} from "../catalog/settings.js";
+import { OperationFailureError } from "./failure.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
-import { address, modelOf, readDecoded, refuse, writeRaw } from "./setting-io.js";
+import { address, modelOf, readDecoded, refuse, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
 function channelOf(model: string, target: unknown): ChannelIndex {
@@ -225,3 +237,67 @@ export const channelPanMode = {
     return writeRaw(context, at, raw, { requested, planned });
   },
 };
+
+/** Whether `name` is writable: at most 8 Unicode scalar values, no C0/C1 controls (F03-K). */
+function writableName(name: unknown): name is string {
+  if (typeof name !== "string") {
+    return false;
+  }
+  const points = Array.from(name);
+  if (points.length > NAME_MAX_CODE_POINTS) {
+    return false;
+  }
+  return points.every((point) => {
+    const code = point.codePointAt(0) as number;
+    const surrogate = code >= 0xd800 && code <= 0xdfff;
+    const control = code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    return !surrogate && !control;
+  });
+}
+
+function namePlan(model: string, target: ChannelTarget, value: string) {
+  const at = wholeAddress(IDENTITY_PARAMS.name, wholeChannel(model, target));
+  // Validated, never transformed: no trimming, normalization or deletion.
+  return writableName(value) ? { at, requested: value, planned: value } : refuse("invalid_input");
+}
+
+/** A channel's name (F03-K): text written as given; read as text or a preset index. */
+export const channelName = {
+  async read(context: OperationContext, target: ChannelTarget): Promise<Reading<ChannelName>> {
+    const at = wholeAddress(IDENTITY_PARAMS.name, wholeChannel(context.model, target));
+    const { record, observedAt } = await context.getName(at);
+    if (record.kind === "failure") {
+      throw context.failureOf(record, null);
+    }
+    if (observedAt === undefined) {
+      throw new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
+    }
+    // Received as is: not clipped, trimmed or normalized.
+    const value: ChannelName =
+      record.value.kind === "text"
+        ? { kind: "text", text: record.value.value }
+        : { kind: "preset", presetIndex: record.value.value };
+    return { value, observedAt };
+  },
+  plan(model: string, target: ChannelTarget, value: string): WritePlan<string> {
+    const { requested, planned } = namePlan(model, target, value);
+    return { requested, planned };
+  },
+  write(context: OperationContext, target: ChannelTarget, value: string): Promise<WriteResult<string>> {
+    const { at, requested, planned } = namePlan(context.model, target, value);
+    return writeText(context, at, planned, { requested, planned });
+  },
+};
+
+function decodeColor(raw: I64Text): ChannelColor | undefined {
+  const index = decodeInteger(raw, 0, CHANNEL_COLORS.length - 1);
+  return index === undefined ? undefined : CHANNEL_COLORS[index];
+}
+
+function planColor(value: unknown): { planned: ChannelColor; raw: I64Text } | undefined {
+  const index = (CHANNEL_COLORS as readonly unknown[]).indexOf(value);
+  return index < 0 ? undefined : { planned: value as ChannelColor, raw: `${index}` };
+}
+
+/** A channel's palette color (F03-K). */
+export const channelColor = channelSetting(IDENTITY_PARAMS.color, decodeColor, planColor);

@@ -25,6 +25,14 @@ describe("registry argument types", () => {
       void readSetting(context, ...pair);
       const gain: Promise<{ value: number }> = readSetting(context, "input.gain", { input: 1 });
       void gain;
+      // A queue mixing the name (string input) with the color keeps string results.
+      const edit = Math.random() > 2 ? (["channel.name", { channel: 1 }, "Lead"] as const) : (["channel.color", { channel: 1 }, "red"] as const);
+      const planned: string = previewSetting("URX44", ...edit).planned;
+      const written: Promise<{ planned: string }> = writeSetting(context, ...edit);
+      void planned;
+      void written;
+      // @ts-expect-error a read-side name object is not a write value
+      void writeSetting(context, "channel.name", { channel: 1 }, { kind: "text", text: "Lead" });
     };
     expect(typeof checks).toBe("function");
   });
