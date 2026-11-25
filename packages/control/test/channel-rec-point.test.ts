@@ -57,8 +57,10 @@ describe("target shapes", () => {
     const transport = new FakeTransport();
     const c = new OperationContext(transport, "URX44");
     const inherited = Object.create({ channel: 1 });
+    const hidden = Object.defineProperty({ channel: 1 }, "track", { value: 1 });
+    const symbol = { channel: 1, [Symbol("bus")]: 1 };
     const array = Object.assign([], { channel: 1 });
-    for (const target of [{ channel: 1, track: 1 }, { channel: 1, bus: 1 }, { channel: 1, input: 1 }, inherited, array]) {
+    for (const target of [{ channel: 1, track: 1 }, { channel: 1, bus: 1 }, { channel: 1, input: 1 }, inherited, array, hidden, symbol]) {
       for (const id of ["channel.rec-point", "channel.fader", "channel.on"] as const) {
         expect((await failureOf(readSetting(c, id, target)))?.code, `${id} ${JSON.stringify(target)}`).toBe("invalid_input");
       }

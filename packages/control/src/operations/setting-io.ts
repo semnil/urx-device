@@ -22,8 +22,20 @@ export function targetOf<T>(target: unknown, allowed: readonly string[]): T {
   if (typeof target !== "object" || target === null || Object.getPrototypeOf(target) !== Object.prototype) {
     return refuse("invalid_input");
   }
-  const keys = Object.keys(target);
-  return keys.every((key) => allowed.includes(key)) ? (target as T) : refuse("invalid_input");
+  // Every own key, non-enumerable and symbol ones included.
+  const keys = Reflect.ownKeys(target);
+  if (!keys.every((key) => typeof key === "string" && allowed.includes(key))) {
+    return refuse("invalid_input");
+  }
+  // A fresh object of the own values only: nothing inherited is read later.
+  // With no prototype, so even a polluted Object.prototype is not read.
+  const own: Record<string, unknown> = Object.create(null);
+  for (const key of allowed) {
+    if (Object.hasOwn(target, key)) {
+      own[key] = (target as Record<string, unknown>)[key];
+    }
+  }
+  return own as T;
 }
 
 export function modelOf(model: string): Model {
