@@ -26,10 +26,11 @@ export interface ChoiceRule {
 }
 
 /**
- * Numbers on a uniform grid of 1 / `scale` within [min, max]: a write is
- * range-checked first, then rounded to the grid with lower ties, raw =
- * value × scale + offset (offset 0 when absent). A read takes any integer
- * raw from min × scale + offset to max × scale + offset.
+ * Numbers on a uniform write grid within [min, max]: a write is range-checked
+ * first, then rounded to the grid with lower ties, raw = value × scale +
+ * offset (offset 0 when absent). The grid is `step` (default 1 / scale). A
+ * read takes any integer raw from min × scale + offset to max × scale +
+ * offset, kept unsnapped when it lies between write steps.
  */
 export interface GridRule {
   readonly kind: "grid";
@@ -37,6 +38,7 @@ export interface GridRule {
   readonly min: number;
   readonly max: number;
   readonly scale: number;
+  readonly step?: number;
   readonly offset?: number;
   readonly sentinel?: Sentinel;
 }
@@ -72,7 +74,22 @@ export interface TextIndexRule {
   readonly labels: readonly string[];
 }
 
-export type ValueRule = SwitchRule | ChoiceRule | GridRule | StopsRule | TextIndexRule;
+/**
+ * A routing-source choice on an unsigned 32-bit port identifier: each model's
+ * tokens with the identifier a write sends, untagged, and `none` as the exact
+ * sentinel. A read strips an optional high tag bit after the sentinel check
+ * and takes only an identifier of the model's tokens. `known` lists every
+ * token any model has: one of them absent from the model is unsupported
+ * there, anything else invalid.
+ */
+export interface PortChoiceRule {
+  readonly kind: "port-choice";
+  readonly none: Sentinel;
+  readonly known: readonly string[];
+  readonly byModel: { readonly [model: string]: readonly { readonly token: string; readonly id: number }[] };
+}
+
+export type ValueRule = SwitchRule | ChoiceRule | GridRule | StopsRule | TextIndexRule | PortChoiceRule;
 
 /** A whole-channel setting: its parameter ID per channel kind and its value rule. */
 export interface ChannelSettingRule {

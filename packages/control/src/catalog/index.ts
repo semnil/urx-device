@@ -24,6 +24,7 @@ export {
 export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
+export { DUCKER_RULES } from "./ducker.js";
 export { DYNAMICS_RULES } from "./dynamics.js";
 export type {
   ByBandRule,
@@ -31,6 +32,7 @@ export type {
   ChannelSettingRule,
   ChoiceRule,
   GridRule,
+  PortChoiceRule,
   Sentinel,
   SettingRule,
   StopsRule,
@@ -47,7 +49,13 @@ export {
   SSMCS_Q_STEPS_CENTI,
   SSMCS_RULES,
 } from "./ssmcs.js";
-export { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "./dynamics-stops.js";
+export {
+  ATTACK_STOPS_RAW,
+  DUCKER_DECAY_STOPS_RAW,
+  HOLD_STOPS_RAW,
+  RATIO_STOPS_RAW,
+  RELEASE_STOPS_RAW,
+} from "./dynamics-stops.js";
 export {
   HPF_FREQUENCY_ID,
   HPF_READ_RAW,

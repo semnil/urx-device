@@ -4,6 +4,7 @@
 
 import { frozen } from "./frozen.js";
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
+import { DUCKER_RULES } from "./ducker.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -91,6 +92,12 @@ export const settingDefinitions = frozen({
   "channel.ssmcs.eq.band.frequency": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.eq.band.frequency"] },
   "channel.ssmcs.eq.band.gain": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.eq.band.gain"] },
   "channel.ssmcs.eq.band.q": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.eq.band.q"] },
+  "channel.ducker.on": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.on"] },
+  "channel.ducker.key-source": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.key-source"] },
+  "channel.ducker.threshold": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.threshold"] },
+  "channel.ducker.range": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.range"] },
+  "channel.ducker.attack": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.attack"] },
+  "channel.ducker.decay": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.decay"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -241,6 +248,12 @@ export interface SettingTypes {
   "channel.ssmcs.eq.band.frequency": { target: ChannelSsmcsBandTarget; value: number };
   "channel.ssmcs.eq.band.gain": { target: ChannelSsmcsBandTarget; value: number };
   "channel.ssmcs.eq.band.q": { target: ChannelSsmcsBandTarget; value: number };
+  "channel.ducker.on": { target: ChannelTarget; value: boolean };
+  "channel.ducker.key-source": { target: ChannelTarget; value: string };
+  "channel.ducker.threshold": { target: ChannelTarget; value: number };
+  "channel.ducker.range": { target: ChannelTarget; value: number };
+  "channel.ducker.attack": { target: ChannelTarget; value: number };
+  "channel.ducker.decay": { target: ChannelTarget; value: number };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.
