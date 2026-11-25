@@ -1,6 +1,6 @@
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { TARGETS, canonicalVersion, cargoVersion, drift, lockVersion, setCargoVersion, write } from "./version.mjs";
@@ -8,12 +8,24 @@ import { TARGETS, canonicalVersion, cargoVersion, drift, lockVersion, setCargoVe
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const temporary = [];
 
-// Copies only the version-bearing files into a scratch root.
+// Every version in a scratch root starts here, apart from the repository's own
+// release version, so that each test creates the difference it names.
+const INITIAL = "0.0.1";
+
+// Writes the version-bearing files, all at INITIAL, into a scratch root.
 function scratchRoot() {
   const root = mkdtempSync(join(tmpdir(), "urx-device-version-"));
   temporary.push(root);
-  for (const path of ["package.json", ...TARGETS.map((target) => target.path)]) {
-    cpSync(join(repoRoot, path), join(root, path), { recursive: true });
+  const files = {
+    "package.json": `${JSON.stringify({ name: "urx-device", version: INITIAL }, null, 2)}\n`,
+    "packages/control/package.json": `${JSON.stringify({ name: "@urx/device-control", version: INITIAL }, null, 2)}\n`,
+    "crates/transport/Cargo.toml": `[package]\nname = "urx-device-transport"\nversion = "${INITIAL}"\nedition = "2021"\n`,
+    "Cargo.lock": `version = 4\n\n[[package]]\nname = "urx-device-transport"\nversion = "${INITIAL}"\n`,
+  };
+  expect(Object.keys(files).sort()).toEqual(["package.json", ...TARGETS.map((target) => target.path)].sort());
+  for (const [path, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), text);
   }
   return root;
 }
@@ -77,7 +89,7 @@ describe("generated common versions (V5)", () => {
   it("reports and regenerates a stale Cargo.lock entry alone", () => {
     const root = scratchRoot();
     const file = join(root, "Cargo.lock");
-    writeFileSync(file, readFileSync(file, "utf8").replace('version = "0.1.0"', 'version = "0.0.9"'));
+    writeFileSync(file, readFileSync(file, "utf8").replace(`version = "${INITIAL}"`, 'version = "0.0.9"'));
     expect(drift(root).map((target) => [target.path, target.current])).toEqual([["Cargo.lock", "0.0.9"]]);
     write(root, { updateLock: fakeLockUpdate });
     expect(drift(root)).toEqual([]);
