@@ -84,6 +84,23 @@ fn stop(control: &Control, bound: &Bound, phase: Phase) -> Result<Duration, Fail
     Ok(remaining)
 }
 
+/// One connection attempt that starts only if `control` is not cancelled and
+/// `end` has not passed when it starts, bounded by the time then left.
+fn attempt(
+    addr: SocketAddr,
+    end: Instant,
+    control: &Control,
+) -> Option<std::io::Result<TcpStream>> {
+    if control.is_cancelled() {
+        return None;
+    }
+    let remaining = end.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(TcpStream::connect_timeout(&addr, remaining))
+}
+
 pub(crate) struct Link<'a> {
     sock: TcpStream,
     reader: FrameReader,
@@ -94,8 +111,9 @@ pub(crate) struct Link<'a> {
 impl<'a> Link<'a> {
     /// Connects to `port` on the loopback interface within `budget`. The one
     /// connection attempt runs on its own thread so that cancellation and
-    /// expiry are seen while it is pending; an attempt still pending when the
-    /// call stops ends within the budget, and its socket is closed unused.
+    /// expiry are seen while it is pending. The thread starts the attempt only
+    /// if the call has not stopped by then, with the budget left at that time;
+    /// an attempt that completes after the call stopped is closed unused.
     pub fn connect(
         port: u16,
         budget: &Budget,
@@ -103,11 +121,15 @@ impl<'a> Link<'a> {
         control: &'a Control,
     ) -> Result<Self, Failure> {
         let bound = budget.whole();
-        let remaining = stop(control, &bound, phase)?;
+        stop(control, &bound, phase)?;
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let (tx, rx) = mpsc::channel();
+        let attempt_control = control.clone();
+        let end = bound.end;
         thread::spawn(move || {
-            let _ = tx.send(TcpStream::connect_timeout(&addr, remaining));
+            if let Some(result) = attempt(addr, end, &attempt_control) {
+                let _ = tx.send(result);
+            }
         });
         let sock = loop {
             let remaining = stop(control, &bound, phase)?;
@@ -118,7 +140,9 @@ impl<'a> Link<'a> {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(Failure::cause(Cause::InternalError, phase))
+                    // The thread found the call stopped before starting.
+                    stop(control, &bound, phase)?;
+                    return Err(Failure::cause(Cause::InternalError, phase));
                 }
             }
         };
@@ -202,8 +226,9 @@ impl<'a> Link<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{stop, Bound};
+    use super::{attempt, stop, Bound};
     use crate::lifecycle::{Cause, Control, Failure, Phase};
+    use std::net::{SocketAddr, TcpListener};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -287,5 +312,31 @@ mod tests {
         )
         .unwrap();
         assert!(left > Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_connection_attempt_does_not_start_once_the_call_has_stopped() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+
+        let cancelled = Control::new();
+        cancelled.cancel();
+        assert!(attempt(addr, Instant::now() + Duration::from_secs(5), &cancelled).is_none());
+        assert!(attempt(
+            addr,
+            Instant::now() - Duration::from_millis(1),
+            &Control::new()
+        )
+        .is_none());
+        assert!(listener.accept().is_err(), "no connection was made");
+
+        assert!(attempt(
+            addr,
+            Instant::now() + Duration::from_secs(5),
+            &Control::new()
+        )
+        .unwrap()
+        .is_ok());
     }
 }
