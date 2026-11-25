@@ -6,6 +6,7 @@ import { channelIndex } from "../catalog/channels.js";
 import { decodeInteger, decodeSwitch, nearestStopIndex, planOnGrid } from "../catalog/codecs.js";
 import type { I64Text } from "../catalog/i64.js";
 import type {
+  BusSettingRule,
   ChannelBandSettingRule,
   ChannelSettingRule,
   GridRule,
@@ -15,10 +16,10 @@ import type {
   TextIndexRule,
   ValueRule,
 } from "../catalog/rules.js";
-import { planSwitch } from "./channels.js";
+import { planSwitch, writableName } from "./channels.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
-import { address, modelOf, readDecoded, readTextDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
+import { address, modelOf, readDecoded, readName, readTextDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
 /**
@@ -28,6 +29,8 @@ import type { ParameterAddress } from "./transport.js";
  */
 interface Codec {
   readonly text: boolean;
+  /** A display name, read through the name-specific read. */
+  readonly name?: true;
   decode(raw: string): unknown;
   plan(value: unknown): { planned: unknown; raw: string } | "unsupported" | undefined;
 }
@@ -129,6 +132,14 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
 /** The codec of `rule` on `model` (only a port choice depends on the model). */
 export function codecOf(rule: ValueRule, model = ""): Codec {
   switch (rule.kind) {
+    case "name":
+      return {
+        text: true,
+        name: true,
+        decode: () => undefined,
+        // Validated, never transformed: no trimming, normalization or deletion.
+        plan: (value) => (writableName(value, rule.maxCodePoints) ? { planned: value, raw: value } : undefined),
+      };
     case "port-choice":
       return portChoiceCodec(rule, model);
     case "switch":
@@ -165,8 +176,8 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
 }
 
 /** A handler for the address and codec `resolve` gives a target, for a read or a write. */
-function handler<V>(resolve: (model: string, target: unknown, write: boolean) => { at: ParameterAddress; codec: Codec }) {
-  const planned = (model: string, target: unknown, requested: V) => {
+function handler<V, I = V>(resolve: (model: string, target: unknown, write: boolean) => { at: ParameterAddress; codec: Codec }) {
+  const planned = (model: string, target: unknown, requested: I) => {
     const { at, codec } = resolve(model, target, true);
     const result = codec.plan(requested);
     if (result === "unsupported") {
@@ -174,7 +185,7 @@ function handler<V>(resolve: (model: string, target: unknown, write: boolean) =>
     }
     return result === undefined
       ? refuse("invalid_input")
-      : { at, codec, raw: result.raw as I64Text, requested, planned: result.planned as V };
+      : { at, codec, raw: result.raw as I64Text, requested, planned: result.planned as I };
   };
   return {
     /** The target's read resolution without traffic: its refusal, if any. */
@@ -183,14 +194,17 @@ function handler<V>(resolve: (model: string, target: unknown, write: boolean) =>
     },
     read(context: OperationContext, target: unknown): Promise<Reading<V>> {
       const { at, codec } = resolve(context.model, target, false);
+      if (codec.name === true) {
+        return readName(context, at) as Promise<Reading<V>>;
+      }
       const decode = (raw: string) => codec.decode(raw) as V | undefined;
       return codec.text ? readTextDecoded(context, at, decode) : readDecoded(context, at, decode);
     },
-    plan(model: string, target: unknown, requested: V): WritePlan<V> {
+    plan(model: string, target: unknown, requested: I): WritePlan<I> {
       const { requested: r, planned: p } = planned(model, target, requested);
       return { requested: r, planned: p };
     },
-    write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+    write(context: OperationContext, target: unknown, requested: I): Promise<WriteResult<I>> {
       const { at, codec, raw, requested: r, planned: p } = planned(context.model, target, requested);
       const plan = { requested: r, planned: p };
       return codec.text ? writeText(context, at, raw, plan) : writeRaw(context, at, raw, plan);
@@ -292,6 +306,23 @@ export function sendRuleSetting<V>(rule: SendSettingRule) {
       return refuse("unsupported_operation");
     }
     return { at: address(route.base + route.stride * (Number(destination[2]) - 1), y), codec };
+  });
+}
+
+/** A bus setting whose handler is built from `rule`: the target names one bus token and nothing else. */
+export function busRuleSetting<V, I = V>(rule: BusSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V, I>((model, target, write) => {
+    modelOf(model);
+    const own = targetOf<{ bus?: unknown }>(target, ["bus"]);
+    if (typeof own.bus !== "string" || !rule.known.includes(own.bus)) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.address, own.bus) ? rule.address[own.bus] : undefined;
+    if (at === undefined || (write && !at.write)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(at.paramId, at.y), codec };
   });
 }
 

@@ -12,15 +12,14 @@ import {
   MONO_PAIRS,
   PAIR_PARAMS,
   CHANNEL_PARAMS,
-  FADER_DB,
-  FADER_NEGATIVE_INFINITY_RAW,
-  PAN_RANGE,
+  FADER_LEVEL_RULE,
+  PAN_RULE,
   channelIndex,
   type ChannelIndex,
 } from "../catalog/channels.js";
-import { decodeInteger, decodeSwitch, encodeSwitch, planOnGrid } from "../catalog/codecs.js";
+import { decodeInteger, decodeSwitch, encodeSwitch } from "../catalog/codecs.js";
 import { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "../catalog/ports.js";
-import { formatI64, type I64Text } from "../catalog/i64.js";
+import type { I64Text } from "../catalog/i64.js";
 import type {
   ChannelColor,
   ChannelName,
@@ -31,10 +30,10 @@ import type {
   Polarity,
   RecPoint,
 } from "../catalog/settings.js";
-import { OperationFailureError } from "./failure.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
-import { address, modelOf, readDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
+import { codecOf } from "./rules.js";
+import { address, modelOf, readDecoded, readName, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
 /** The channel a target names and its side, each read once from the target's own values. */
@@ -98,43 +97,24 @@ export function channelSetting<V>(
   };
 }
 
-function decodeFader(raw: I64Text): FaderLevel | undefined {
-  if (raw === FADER_NEGATIVE_INFINITY_RAW) {
-    return "-inf";
-  }
-  const value = decodeInteger(raw, FADER_DB.min * 100, FADER_DB.max * 100);
-  return value === undefined ? undefined : value / 100;
-}
-
-function planFader(value: unknown): { planned: FaderLevel; raw: I64Text } | undefined {
-  if (value === "-inf") {
-    return { planned: "-inf", raw: FADER_NEGATIVE_INFINITY_RAW };
-  }
-  if (typeof value !== "number") {
-    return undefined;
-  }
-  const planned = planOnGrid(value, FADER_DB.min, FADER_DB.max, 100);
-  return planned === undefined ? undefined : { planned, raw: formatI64(BigInt(Math.round(planned * 100))) as I64Text };
-}
-
-function planPan(value: unknown): { planned: number; raw: I64Text } | undefined {
-  if (typeof value !== "number") {
-    return undefined;
-  }
-  const planned = planOnGrid(value, PAN_RANGE.min, PAN_RANGE.max, 1);
-  return planned === undefined ? undefined : { planned, raw: `${planned}` };
-}
+/** The shared level and PAN/BAL codecs: the same rule objects the bus and send handlers use. */
+const faderCodec = codecOf(FADER_LEVEL_RULE);
+const panCodec = codecOf(PAN_RULE);
 
 export function planSwitch(value: unknown): { planned: boolean; raw: I64Text } | undefined {
   return typeof value === "boolean" ? { planned: value, raw: encodeSwitch(value) } : undefined;
 }
 
 export const channelOn = channelSetting(CHANNEL_PARAMS.on, decodeSwitch, planSwitch);
-export const channelFader = channelSetting(CHANNEL_PARAMS.fader, decodeFader, planFader);
-export const channelPan = channelSetting(
+export const channelFader = channelSetting<FaderLevel>(
+  CHANNEL_PARAMS.fader,
+  (raw) => faderCodec.decode(raw) as FaderLevel | undefined,
+  (value) => faderCodec.plan(value) as { planned: FaderLevel; raw: I64Text } | undefined,
+);
+export const channelPan = channelSetting<number>(
   CHANNEL_PARAMS.pan,
-  (raw) => decodeInteger(raw, PAN_RANGE.min, PAN_RANGE.max),
-  planPan,
+  (raw) => panCodec.decode(raw) as number | undefined,
+  (value) => panCodec.plan(value) as { planned: number; raw: I64Text } | undefined,
 );
 
 function decodePolarity(raw: I64Text): Polarity | undefined {
@@ -249,12 +229,12 @@ export const channelPanMode = {
 };
 
 /** Whether `name` is writable: at most 8 Unicode scalar values, no C0/C1 controls (F03-K). */
-function writableName(name: unknown): name is string {
+export function writableName(name: unknown, maxCodePoints: number = NAME_MAX_CODE_POINTS): name is string {
   if (typeof name !== "string") {
     return false;
   }
   const points = Array.from(name);
-  if (points.length > NAME_MAX_CODE_POINTS) {
+  if (points.length > maxCodePoints) {
     return false;
   }
   return points.every((point) => {
@@ -273,21 +253,8 @@ function namePlan(model: string, target: ChannelTarget, value: string) {
 
 /** A channel's name (F03-K): text written as given; read as text or a preset index. */
 export const channelName = {
-  async read(context: OperationContext, target: ChannelTarget): Promise<Reading<ChannelName>> {
-    const at = wholeAddress(IDENTITY_PARAMS.name, wholeChannel(context.model, target));
-    const { record, observedAt } = await context.getName(at);
-    if (record.kind === "failure") {
-      throw context.failureOf(record, null);
-    }
-    if (observedAt === undefined) {
-      throw new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
-    }
-    // Received as is: not clipped, trimmed or normalized.
-    const value: ChannelName =
-      record.value.kind === "text"
-        ? { kind: "text", text: record.value.value }
-        : { kind: "preset", presetIndex: record.value.value };
-    return { value, observedAt };
+  read(context: OperationContext, target: ChannelTarget): Promise<Reading<ChannelName>> {
+    return readName(context, wholeAddress(IDENTITY_PARAMS.name, wholeChannel(context.model, target)));
   },
   plan(model: string, target: ChannelTarget, value: string): WritePlan<string> {
     const { requested, planned } = namePlan(model, target, value);

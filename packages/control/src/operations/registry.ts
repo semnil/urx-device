@@ -75,6 +75,17 @@ import {
 } from "./ducker.js";
 import { sendLevel, sendOn, sendPan, sendTap } from "./sends.js";
 import {
+  busBalance,
+  busColor,
+  busFader,
+  busName,
+  busOn,
+  busPanLink,
+  busStereoAssign,
+  busType,
+  channelStereoAssign,
+} from "./buses.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -196,6 +207,15 @@ export const settingHandlers: SettingHandlers = {
   "send.level": sendLevel,
   "send.pan": sendPan,
   "send.tap": sendTap,
+  "bus.on": busOn,
+  "bus.fader": busFader,
+  "bus.balance": busBalance,
+  "bus.type": busType,
+  "bus.pan-link": busPanLink,
+  "bus.stereo-assign": busStereoAssign,
+  "bus.name": busName,
+  "bus.color": busColor,
+  "channel.stereo-assign": channelStereoAssign,
 };
 
 function unknownId(): Promise<never> {

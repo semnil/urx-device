@@ -26,6 +26,7 @@ export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
 export { DUCKER_RULES } from "./ducker.js";
 export { SEND_RULES } from "./sends.js";
+export { BUS_RULES, BUS_TOKENS, CHANNEL_STEREO_ASSIGN_RULE } from "./buses.js";
 export { DYNAMICS_RULES } from "./dynamics.js";
 export type {
   ByBandRule,
@@ -35,6 +36,8 @@ export type {
   GridRule,
   PortChoiceRule,
   SendRoute,
+  BusSettingRule,
+  NameRule,
   SendSettingRule,
   Sentinel,
   SettingRule,
@@ -80,6 +83,8 @@ export type {
   ChannelSsmcsBandTarget,
   SsmcsBand,
   SendTap,
+  BusTarget,
+  BusType,
   SendTarget,
   EqBand,
   EqBandType,

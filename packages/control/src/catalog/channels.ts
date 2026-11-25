@@ -95,3 +95,19 @@ export const FADER_DB = frozen({ min: -96, max: 10 } as const);
 export const FADER_NEGATIVE_INFINITY_RAW = "-32768";
 /** Pan positions; negative left, zero center. */
 export const PAN_RANGE = frozen({ min: -63, max: 63 } as const);
+
+/**
+ * The shared level rule (F03-H): finite FADER_DB on 0.01 dB over centi-dB raw,
+ * and exactly the negative-infinity raw. Channel, bus and send levels use it.
+ */
+export const FADER_LEVEL_RULE = frozen({
+  kind: "grid",
+  unit: "dB",
+  min: FADER_DB.min,
+  max: FADER_DB.max,
+  scale: 100,
+  sentinel: { value: "-inf", raw: FADER_NEGATIVE_INFINITY_RAW },
+} as const);
+
+/** The shared PAN/BAL rule: integers within PAN_RANGE. Channel pan, send pan and bus balance use it. */
+export const PAN_RULE = frozen({ kind: "grid", unit: null, min: PAN_RANGE.min, max: PAN_RANGE.max, scale: 1 } as const);

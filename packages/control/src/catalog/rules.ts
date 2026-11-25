@@ -89,7 +89,17 @@ export interface PortChoiceRule {
   readonly byModel: { readonly [model: string]: readonly { readonly token: string; readonly id: number }[] };
 }
 
-export type ValueRule = SwitchRule | ChoiceRule | GridRule | StopsRule | TextIndexRule | PortChoiceRule;
+/**
+ * A display name (F03-K): a write is exactly 0 … `maxCodePoints` Unicode
+ * scalar values without control characters, sent as given on the string
+ * parameter; a read takes the received text as is, or a numeric preset index.
+ */
+export interface NameRule {
+  readonly kind: "name";
+  readonly maxCodePoints: number;
+}
+
+export type ValueRule = SwitchRule | ChoiceRule | GridRule | StopsRule | TextIndexRule | PortChoiceRule | NameRule;
 
 /** A whole-channel setting: its parameter ID per channel kind and its value rule. */
 export interface ChannelSettingRule {
@@ -149,4 +159,17 @@ export interface SendSettingRule {
   readonly value: ValueRule;
 }
 
-export type SettingRule = ChannelSettingRule | ChannelBandSettingRule | SendSettingRule;
+/**
+ * A bus setting: the target names one bus token. A known bus without an
+ * address has no such field (unsupported); `write` is false where the design
+ * leaves the write unbound (an F03-G instance count that awaits evidence).
+ */
+export interface BusSettingRule {
+  readonly target: "bus";
+  readonly known: readonly string[];
+  /** Undefined for a known bus without the setting. */
+  readonly address: { readonly [bus: string]: { readonly paramId: number; readonly y: number; readonly write: boolean } | undefined };
+  readonly value: ValueRule;
+}
+
+export type SettingRule = ChannelSettingRule | ChannelBandSettingRule | SendSettingRule | BusSettingRule;

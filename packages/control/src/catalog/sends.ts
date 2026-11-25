@@ -5,7 +5,7 @@
 // tap at a+1/a+2/a+3/a. Level, pan and on writes with a linked-address
 // candidate (CH → MIX, FX → MIX) await F03-G evidence and stay unbound.
 
-import { MONO_CHANNELS, STEREO_CHANNELS } from "./channels.js";
+import { FADER_LEVEL_RULE, MONO_CHANNELS, PAN_RULE, STEREO_CHANNELS } from "./channels.js";
 import { frozen } from "./frozen.js";
 import { MODELS } from "./models.js";
 import type { SendRoute, SendSettingRule, ValueRule } from "./rules.js";
@@ -39,15 +39,8 @@ function send(field: Field, value: ValueRule): SendSettingRule {
 
 export const SEND_RULES = frozen({
   "send.on": send("on", { kind: "switch" }),
-  "send.level": send("level", {
-    kind: "grid",
-    unit: "dB",
-    min: -96,
-    max: 10,
-    scale: 100,
-    sentinel: { value: "-inf", raw: "-32768" },
-  }),
-  "send.pan": send("pan", { kind: "grid", unit: null, min: -63, max: 63, scale: 1 }),
+  "send.level": send("level", FADER_LEVEL_RULE),
+  "send.pan": send("pan", PAN_RULE),
   // pre 1, post 0.
   "send.tap": send("tap", { kind: "choice", choices: ["post", "pre"] }),
 } as const satisfies Record<string, SendSettingRule>);
