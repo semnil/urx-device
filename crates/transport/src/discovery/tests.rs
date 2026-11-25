@@ -439,21 +439,30 @@ fn a_reply_that_keeps_arriving_in_pieces_is_cancellable() {
     let center = center(&[(a.port, "URX44V")]);
     let control = Control::new();
     let canceller = control.clone();
+    // The latency is measured from the cancel call itself, so a slow wake of
+    // this thread on a loaded runner does not count against the read loop.
+    let (cancelled, cancelled_at) = std::sync::mpsc::channel();
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(80));
+        let at = Instant::now();
         canceller.cancel();
+        let _ = cancelled.send(at);
     });
-    let started = Instant::now();
+    // Without the cancel, both replies would arrive whole, several hundred
+    // milliseconds in, and discovery would succeed.
     assert_eq!(
         discover(&options(center.port), &control),
         Err(Failure::Cancelled {
             phase: Phase::Discovery
         })
     );
+    let returned = Instant::now();
+    let at = cancelled_at.recv().unwrap();
+    // The read loop checks cancellation at least every 50 ms poll.
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        returned.duration_since(at) < Duration::from_millis(200),
         "{:?}",
-        started.elapsed()
+        returned.duration_since(at)
     );
 }
 
