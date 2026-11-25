@@ -110,10 +110,15 @@ export class OperationContext {
   ): Promise<T> {
     // Issued by the connection, so it releases only this request's slot.
     const requestTicket = this.transport.newRequestTicket();
+    // Awaited, so the slot is handed over before the caller can finish:
+    // when the report itself fails, the connection's end takes the slot.
+    const reportUndelivered = async () => {
+      if (!(await settle(() => this.transport.failDelivery(requestTicket)))) {
+        await settle(() => this.transport.terminate());
+      }
+    };
     const undelivered = async () => {
-      // Awaited, so the slot is handed over before the caller can finish;
-      // its own failure changes nothing about this one.
-      await settle(() => this.transport.failDelivery(requestTicket));
+      await reportUndelivered();
       return new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
     };
     let raw: unknown;
@@ -134,7 +139,7 @@ export class OperationContext {
     // Established evidence could not be delivered normally: a success fails
     // at delivery keeping its evidence; a failure (a rejection included)
     // stays as received (K34).
-    await settle(() => this.transport.failDelivery(requestTicket));
+    await reportUndelivered();
     return atDelivery(record);
   }
 }
