@@ -1227,7 +1227,11 @@ fn a_waiting_request_callback_that_closes_does_not_hold_the_close_up() {
             Evidence::NotSent
         )
     );
-    assert_eq!(closed, CloseOutcome::Closed);
+    assert_eq!(
+        closed,
+        CloseOutcome::Started,
+        "it runs on a thread the close waits for"
+    );
     assert!(matches!(outcome(&active), Outcome::Success { .. }));
 }
 
@@ -1265,7 +1269,7 @@ fn a_callback_that_outlasts_the_teardown_budget_makes_the_close_incomplete() {
 }
 
 #[test]
-fn a_slow_waiting_request_callback_does_not_delay_the_close() {
+fn a_slow_waiting_request_callback_is_bounded_by_the_teardown_budget() {
     let peer = slow(Duration::from_millis(100));
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
@@ -1277,7 +1281,11 @@ fn a_slow_waiting_request_callback_does_not_delay_the_close() {
     let started = Instant::now();
     assert_eq!(
         connection.close(Duration::from_millis(300)),
-        CloseOutcome::Closed
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        }),
+        "the waiting outcome was not delivered within the budget"
     );
     assert!(
         started.elapsed() < Duration::from_millis(700),
@@ -1293,4 +1301,65 @@ fn a_closed_connection_keeps_no_socket() {
     let connection = connect(&peer);
     assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     assert!(connection.sock.lock().unwrap().is_none());
+}
+
+#[test]
+fn waiting_outcomes_are_delivered_before_closed_is_returned() {
+    let peer = slow(Duration::from_millis(100));
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
+    wait_until(|| parameter_uris(&peer).len() == 1);
+    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for id in [2, 3] {
+        let delivered = Arc::clone(&delivered);
+        connection.submit(&operation, Request::SetNumeric(address(id), 1), move |_| {
+            thread::sleep(Duration::from_millis(50));
+            delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(matches!(outcome(&active), Outcome::Success { .. }));
+}
+
+#[test]
+fn closing_is_visible_only_once_new_work_is_refused() {
+    let peer = unit(plain);
+    let connection = Arc::new(connect(&peer));
+    let operation = connection.create_operation().unwrap();
+    let (tx, seen) = mpsc::channel();
+    let probe = Arc::clone(&connection);
+    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+        let outcome = probe.close(TEARDOWN);
+        let _ = tx.send((outcome, probe.create_operation().is_err()));
+    });
+    let (outcome, refused) = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(outcome, CloseOutcome::Started);
+    assert!(refused);
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+}
+
+#[test]
+fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
+    let finished = thread::spawn(|| {});
+    while !finished.is_finished() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let past = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        super::wait_for([Some(finished), None, None], past),
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        })
+    );
+    let done = thread::spawn(|| {});
+    assert_eq!(
+        super::wait_for(
+            [Some(done), None, None],
+            Instant::now() + Duration::from_secs(1)
+        ),
+        CloseOutcome::Closed
+    );
 }

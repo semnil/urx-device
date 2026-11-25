@@ -133,8 +133,8 @@ pub struct Connection {
 struct CloseCell {
     state: Mutex<CloseState>,
     done: Condvar,
-    /// The thread running the close, whose own callbacks must not wait for it.
-    closer: Mutex<Option<ThreadId>>,
+    /// Threads the close waits for, which must not wait for the close.
+    exempt: Mutex<Vec<ThreadId>>,
 }
 
 impl CloseCell {
@@ -265,7 +265,7 @@ impl Connection {
             close: Arc::new(CloseCell {
                 state: Mutex::new(CloseState::Open),
                 done: Condvar::new(),
-                closer: Mutex::new(None),
+                exempt: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -363,19 +363,14 @@ impl Connection {
     /// share the first call's close and its outcome; none starts a second
     /// shutdown or sends anything.
     pub fn close(&self, teardown: Duration) -> CloseOutcome {
-        {
+        let waiting = {
             let mut close = lock(&self.close.state);
             loop {
                 match *close {
-                    CloseState::Open => {
-                        *close = CloseState::Closing;
-                        *lock(&self.close.closer) = Some(thread::current().id());
-                        break;
-                    }
+                    CloseState::Open => break,
                     CloseState::Done(outcome) => return outcome,
                     CloseState::Closing => {
-                        let me = thread::current().id();
-                        if self.on_worker() || *lock(&self.close.closer) == Some(me) {
+                        if self.must_not_wait() {
                             return CloseOutcome::Started;
                         }
                         close = self
@@ -386,19 +381,25 @@ impl Connection {
                     }
                 }
             }
-        }
-        // Taken with the send gate held: a write not yet started cannot start
-        // after this, and no request is admitted from here on.
-        let waiting = {
+            // The close becomes visible to other callers only together with
+            // the refusal of new work and of unstarted writes: the send gate
+            // and the state are updated before the close lock is released.
             let _gate = self.shared.link_end();
             let mut state = self.shared.lock();
             state.closing = true;
             state.waiting_bytes = 0;
+            *close = CloseState::Closing;
+            lock(&self.close.exempt).push(thread::current().id());
             std::mem::take(&mut state.waiting)
         };
         let _ = self.events.send(Event::Wake);
-        if !waiting.is_empty() {
-            thread::spawn(move || {
+        // Waiting requests complete on their own thread, which the close
+        // waits for within the budget; a close called from one of their
+        // callbacks returns `Started` instead of waiting for itself.
+        let delivery = (!waiting.is_empty()).then(|| {
+            let (go, ready) = mpsc::channel::<()>();
+            let handle = thread::spawn(move || {
+                let _ = ready.recv();
                 for item in waiting {
                     deliver(
                         item.done,
@@ -410,7 +411,10 @@ impl Connection {
                     );
                 }
             });
-        }
+            lock(&self.close.exempt).push(handle.thread().id());
+            let _ = go.send(());
+            handle
+        });
         {
             let mut state = self.shared.lock();
             while state.active {
@@ -426,10 +430,14 @@ impl Connection {
         if let Some(sock) = lock(&self.sock).take() {
             let _ = sock.shutdown(Shutdown::Both);
         }
-        let threads = [lock(&self.worker).take(), lock(&self.reader).take()];
+        let threads = [
+            delivery,
+            lock(&self.worker).take(),
+            lock(&self.reader).take(),
+        ];
         if self.on_worker() {
             // A completion callback cannot wait for the worker it runs on; a
-            // helper waits for both threads within the same budget.
+            // helper waits for the threads within the same budget.
             let cell = Arc::clone(&self.close);
             thread::spawn(move || cell.record(wait_for(threads, end)));
             return CloseOutcome::Started;
@@ -439,22 +447,36 @@ impl Connection {
         outcome
     }
 
+    /// Whether this thread is one the close waits for: the worker, the
+    /// thread running the close, or the one delivering waiting outcomes.
+    fn must_not_wait(&self) -> bool {
+        let me = thread::current().id();
+        self.on_worker() || lock(&self.close.exempt).contains(&me)
+    }
+
     fn on_worker(&self) -> bool {
         self.worker_id == thread::current().id()
     }
 }
 
-/// `Closed` once every thread has finished by `end`; otherwise `Incomplete`.
-fn wait_for(threads: [Option<JoinHandle<()>>; 2], end: Instant) -> CloseOutcome {
+/// `Closed` only when every thread is seen finished at a time before `end`;
+/// otherwise `Incomplete`, even if a thread finishes later.
+fn wait_for(threads: [Option<JoinHandle<()>>; 3], end: Instant) -> CloseOutcome {
+    let incomplete =
+        CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
     for thread in threads.into_iter().flatten() {
-        while !thread.is_finished() {
-            if Instant::now() >= end {
-                return CloseOutcome::Incomplete(Failure::cause(
-                    Cause::TeardownTimeout,
-                    Phase::Teardown,
-                ));
+        loop {
+            let finished = thread.is_finished();
+            // Read after the check: a thread seen finished before this
+            // reading finished no later than it.
+            let now = Instant::now();
+            if now >= end {
+                return incomplete;
             }
-            thread::sleep(Duration::from_millis(1));
+            if finished {
+                break;
+            }
+            thread::sleep((end - now).min(Duration::from_millis(1)));
         }
         let _ = thread.join();
     }
