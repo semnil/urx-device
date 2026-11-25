@@ -2586,15 +2586,13 @@ mod notifications {
         connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
             // Only a success holds: a refusal may run on the submitting thread.
             let success = matches!(outcome, Outcome::Success { .. });
-            let _ = entered_tx.send(success);
+            let _ = entered_tx.send(outcome);
             if success {
                 let _ = blocked.recv();
             }
         });
-        assert!(
-            entered.recv_timeout(Duration::from_secs(5)).unwrap(),
-            "the held request succeeded"
-        );
+        let outcome = entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }), "{outcome:?}");
         release
     }
 
