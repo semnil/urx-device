@@ -189,20 +189,12 @@ function pairAddress(paramId: number, model: string, target: unknown): Parameter
 
 /**
  * The mono-pair link (F03-J): read at the primary only. Its write sequence
- * (one write, or both members) needs evidence first, so writes are refused.
+ * (one write, or both members) needs evidence first, so it is read-only
+ * until then.
  */
 export const channelStereoLink = {
   read(context: OperationContext, target: ChannelTarget): Promise<Reading<boolean>> {
     return readDecoded(context, pairAddress(PAIR_PARAMS.stereoLink, context.model, target), decodeSwitch);
-  },
-  plan(model: string, target: ChannelTarget, _value: boolean): WritePlan<boolean> {
-    pairAddress(PAIR_PARAMS.stereoLink, model, target);
-    return refuse("unsupported_operation");
-  },
-  async write(context: OperationContext, target: ChannelTarget, value: boolean): Promise<WriteResult<boolean>> {
-    // Refused before any traffic, like the plan.
-    channelStereoLink.plan(context.model, target, value);
-    throw new Error("unreachable");
   },
 };
 

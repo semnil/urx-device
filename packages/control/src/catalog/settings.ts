@@ -28,7 +28,8 @@ export const settingDefinitions = {
   "channel.pan": { readable: true, writable: true },
   "channel.polarity": { readable: true, writable: true },
   "channel.source": { readable: true, writable: true },
-  "channel.stereo-link": { readable: true, writable: true },
+  // Its write sequence needs evidence first (F03-J); readable until then.
+  "channel.stereo-link": { readable: true, writable: false },
   "channel.pan-mode": { readable: true, writable: true },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
