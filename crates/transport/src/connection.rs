@@ -588,8 +588,9 @@ impl Connection {
     ///
     /// 1. New submissions and any request not yet started on the wire are
     ///    refused. Waiting requests and lifecycle calls not yet started
-    ///    complete unsent as `not_connected` (on a separate thread, so their
-    ///    callbacks never hold the close up).
+    ///    complete unsent as `not_connected`. Their callbacks run on a
+    ///    separate thread, so they do not delay the steps below; the close
+    ///    waits for that thread within `teardown`, like the others.
     /// 2. The request already being sent settles under its own deadlines. A
     ///    lifecycle call already running goes on to its end: its remaining
     ///    registrations stop, but its owned cleanup (a release, or the
@@ -602,10 +603,15 @@ impl Connection {
     ///    must finish.
     ///
     /// So a close may take longer than `teardown` by the cleanup running when
-    /// it was called. A cleanup unregistration that fails after the close is
-    /// called makes the outcome `Failed`. Repeated and concurrent calls share
-    /// the first call's close and its outcome; none starts a second shutdown
-    /// or sends anything more.
+    /// it was called. The outcome is `Closed` when every unregistration was
+    /// accepted (or none was needed) and every thread finished within
+    /// `teardown`; `Failed` when an unregistration failed (the teardown's or
+    /// a cleanup's after this call) and every thread still finished within
+    /// it; and `Incomplete(teardown_timeout)` whenever the budget ran out,
+    /// in the unregistrations or waiting for a thread (a callback that has
+    /// not returned included), whether or not an unregistration failed.
+    /// Repeated and concurrent calls share the first call's close and its
+    /// outcome; none starts a second shutdown or sends anything more.
     pub fn close(&self, teardown: Duration) -> CloseOutcome {
         let waiting = {
             let mut close = lock(&self.close.state);
