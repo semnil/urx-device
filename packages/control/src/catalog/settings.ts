@@ -1,6 +1,8 @@
 // The closed setting catalog (K2, K35). Each entry is one stable semantic
 // setting ID with its definition; operations bind every ID to a handler.
-// Rows are added per K35 catalog part (stages D6–D15); none are bound yet.
+// Rows are added per K35 catalog part (stages D7–D15).
+
+import type { SourceToken } from "./inputs.js";
 
 /** What every setting definition states, independent of its value types. */
 export interface SettingDefinitionBase {
@@ -14,10 +16,50 @@ export interface SettingDefinitionBase {
  * The catalog: setting ID to definition. It is a static literal, never
  * extended at runtime (K2: no dynamic registration).
  */
-export const settingDefinitions = {} as const satisfies Record<string, SettingDefinitionBase>;
+export const settingDefinitions = {
+  "input.gain": { readable: true, writable: true },
+  "input.phantom": { readable: true, writable: true },
+  "input.hi-z": { readable: true, writable: true },
+  "input.clip-safe": { readable: true, writable: true },
+  "input.clip-safe-active": { readable: true, writable: false },
+  "source.gain": { readable: true, writable: true },
+} as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */
 export type SettingId = keyof typeof settingDefinitions;
+
+/** A setting ID that can be written. */
+export type WritableSettingId = {
+  [K in SettingId]: (typeof settingDefinitions)[K]["writable"] extends true ? K : never;
+}[SettingId];
+
+/** A physical MIC/LINE jack, numbered from 1 (F02-B). */
+export interface InputTarget {
+  readonly input: number;
+}
+
+/** A digital input source (F03-G). */
+export interface SourceTarget {
+  readonly source: SourceToken;
+}
+
+/**
+ * Each setting's target, observed value and requested value types (K35:
+ * switches are boolean, levels are dB numbers).
+ */
+export interface SettingTypes {
+  "input.gain": { target: InputTarget; value: number };
+  "input.phantom": { target: InputTarget; value: boolean };
+  "input.hi-z": { target: InputTarget; value: boolean };
+  "input.clip-safe": { target: InputTarget; value: boolean };
+  "input.clip-safe-active": { target: InputTarget; value: boolean };
+  "source.gain": { target: SourceTarget; value: number };
+}
+
+// Every catalog ID has its types, and every typed ID is in the catalog.
+type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+const typesMatchCatalog: Exact<keyof SettingTypes, SettingId> = true;
+void typesMatchCatalog;
 
 /** The setting IDs, in catalog order. */
 export function settingIds(): SettingId[] {

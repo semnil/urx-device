@@ -40,7 +40,7 @@ A local verification names every one of these commands; a command left out is na
 - **Requested values are sent as requested.** No GUI defaulting, state prediction, corrective writes, automatic restoration of related values, retries, rollback or replay. Device-driven changes to related values are accepted and observed
 - **A request acknowledgment is not readback evidence**, and progress already accepted is kept when a later step fails
 - **A single send is the baseline.** A second write for one setting needs measured evidence; stereo presentation alone is not that evidence
-- **Write only confirmed parameters** — verified on the unit by writing a value and reading the result back from the hardware. A mapping whose evidence is missing stays unbound; never add a speculative address
+- **Bind the mappings the design selects, and only those.** A setting, model and address enters the catalog when the design record selects it, including a mapping that design records as not yet verified on that model. A mapping the design makes depend on evidence (for example F03-G write multiplicity, or D15 firmware facts) stays unbound until that evidence exists; never add an address the design does not select
 
 ## Primary sources
 

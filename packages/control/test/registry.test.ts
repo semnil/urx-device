@@ -14,7 +14,7 @@ describe("setting registry (K2)", () => {
   it("refuses an ID outside the catalog without traffic", async () => {
     const transport = new FakeTransport();
     const context = new OperationContext(transport, "URX44");
-    const error = await readSetting(context, "no.such.setting" as SettingId, {}).catch((caught: unknown) => caught);
+    const error = await readSetting(context, "no.such.setting" as SettingId, {} as never).catch((caught: unknown) => caught);
     expect(operationFailureOf(error)).toEqual({ code: "invalid_input", phase: "preparation", progress: null });
     expect(transport.calls).toEqual([]);
   });
