@@ -11,6 +11,8 @@ import type {
   ChannelSettingRule,
   BusBandSettingRule,
   BusSideSettingRule,
+  DeviceSettingRule,
+  OutputSettingRule,
   OutputSideSettingRule,
   ContextStopsRule,
   FxParameterRule,
@@ -499,11 +501,11 @@ export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
   const fixed = rule.value.kind === "port-choice" ? undefined : codecOf(rule.value);
   return handler<V>((model, target, write) => {
     const { bus, side } = busSide(model, target, rule.known);
-    const codec = fixed ?? codecOf(rule.value, model);
     const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
     if (at === undefined || (write && !at.write)) {
       return refuse("unsupported_operation");
     }
+    const codec = at.value === undefined ? (fixed ?? codecOf(rule.value, model)) : codecOf(at.value, model);
     const paramId = typeof at.paramId === "number" ? at.paramId : at.paramId[side];
     return { at: address(paramId, at.y[side]), codec };
   });
@@ -626,6 +628,30 @@ export function outputSideRuleSetting<V>(rule: OutputSideSettingRule) {
       return refuse("unsupported_operation");
     }
     return { at: address(at.paramId, at.y[own.side as "left" | "right"]), codec: codecOf(at.value ?? rule.value, known) };
+  });
+}
+
+/** An output setting whose handler is built from `rule`: the target names an output only. */
+export function outputRuleSetting<V>(rule: OutputSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target) => {
+    modelOf(model);
+    const own = targetOf<{ output?: unknown }>(target, ["output"]);
+    if (typeof own.output !== "string" || !rule.known.includes(own.output)) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.address, own.output) ? rule.address[own.output] : undefined;
+    return at === undefined ? refuse("unsupported_operation") : { at: address(at.paramId, at.y), codec };
+  });
+}
+
+/** A device-wide setting whose handler is built from `rule`: the target has no keys. */
+export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target) => {
+    modelOf(model);
+    targetOf<object>(target, []);
+    return { at: address(rule.address.paramId, rule.address.y), codec };
   });
 }
 

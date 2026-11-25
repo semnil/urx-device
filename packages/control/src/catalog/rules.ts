@@ -263,6 +263,8 @@ export interface BusSideAddress {
   readonly paramId: number | { readonly left: number; readonly right: number };
   readonly y: { readonly left: number; readonly right: number };
   readonly write: boolean;
+  /** This bus's own value rule, replacing the shared one. */
+  readonly value?: ValueRule;
 }
 
 /** A per-side bus setting: the target names a bus and a side. */
@@ -341,7 +343,24 @@ export interface OutputSideSettingRule {
   readonly value: ValueRule;
 }
 
+/** An output destination's whole setting (F08-M): the target names an output only. */
+export interface OutputSettingRule {
+  readonly target: "output";
+  readonly known: readonly string[];
+  readonly address: { readonly [output: string]: { readonly paramId: number; readonly y: number } | undefined };
+  readonly value: ValueRule;
+}
+
+/** A device-wide setting (F08-C): the target is empty. */
+export interface DeviceSettingRule {
+  readonly target: "device";
+  readonly address: { readonly paramId: number; readonly y: number };
+  readonly value: ValueRule;
+}
+
 export type SettingRule =
+  | DeviceSettingRule
+  | OutputSettingRule
   | OutputSideSettingRule
   | BusBandSettingRule
   | ChannelSettingRule

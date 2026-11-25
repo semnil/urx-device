@@ -6,7 +6,7 @@ import { INSERT_FX_RULES } from "../src/catalog/insert-fx.js";
 import { FX_RETURN_RULES } from "../src/catalog/fx-return.js";
 import { OUTPUT_EQ_RULES } from "../src/catalog/output-eq.js";
 import { OUTPUT_PEQ_RULES } from "../src/catalog/output-peq.js";
-import { OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES } from "../src/catalog/output-routing.js";
+import { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES } from "../src/catalog/output-routing.js";
 import { SEND_RULES } from "../src/catalog/sends.js";
 import { DYNAMICS_RULES } from "../src/catalog/dynamics.js";
 import { EQ_RULES } from "../src/catalog/eq.js";
@@ -26,10 +26,10 @@ const ruled = Object.entries(settingDefinitions as Record<string, SettingDefinit
   definition.rule === undefined ? [] : [[id, definition.rule] as [string, SettingRule]],
 );
 
-const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES, ...BUS_RULES, "channel.stereo-assign": CHANNEL_STEREO_ASSIGN_RULE, ...INSERT_FX_RULES, ...FX_RETURN_RULES, ...OUTPUT_EQ_RULES, ...OUTPUT_PEQ_RULES, ...STREAM_DELAY_RULES, ...OUTPUT_SOURCE_RULES };
+const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES, ...BUS_RULES, "channel.stereo-assign": CHANNEL_STEREO_ASSIGN_RULE, ...INSERT_FX_RULES, ...FX_RETURN_RULES, ...OUTPUT_EQ_RULES, ...OUTPUT_PEQ_RULES, ...STREAM_DELAY_RULES, ...OUTPUT_SOURCE_RULES, ...MONITOR_RULES, ...CUE_RULES };
 
 /** The channel and band rules; send and bus rules, addressed per route or bus, have their own tests. */
-const addressed = ruled.flatMap(([id, rule]) => (rule.target === "send" || rule.target === "bus" || rule.target === "fx-parameter" || rule.target === "bus-side" || rule.target === "bus-side-band" || rule.target === "bus-band" || rule.target === "output-side" ? [] : [[id, rule] as const]));
+const addressed = ruled.flatMap(([id, rule]) => (rule.target === "send" || rule.target === "bus" || rule.target === "fx-parameter" || rule.target === "bus-side" || rule.target === "bus-side-band" || rule.target === "bus-band" || rule.target === "output-side" || rule.target === "output" || rule.target === "device" ? [] : [[id, rule] as const]));
 
 /** Each (id, target, value rule) a rule defines: one per band for a band rule. */
 const valueCases = addressed.flatMap(([id, rule]): [string, object, ValueRule][] => {

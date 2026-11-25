@@ -8,7 +8,7 @@ import { CHANNEL_COLORS, FADER_LEVEL_RULE, NAME_MAX_CODE_POINTS, PAN_RULE } from
 import { frozen } from "./frozen.js";
 import type { BusSettingRule, ChannelSettingRule, ValueRule } from "./rules.js";
 
-export const BUS_TOKENS = frozen(["stereo", "mix-1", "mix-2", "fx-1", "fx-2", "stream"] as const);
+export const BUS_TOKENS = frozen(["stereo", "mix-1", "mix-2", "fx-1", "fx-2", "stream", "monitor-1", "monitor-2"] as const);
 
 type Bus = (typeof BUS_TOKENS)[number];
 type At = { paramId: number; y: number; write: boolean };
@@ -24,6 +24,12 @@ function master(stereo: number, mix: number, fx: number, mixWrite: boolean): { [
   };
 }
 
+/** MONITOR 1/2 (F08-M): y m − 1, one write each. */
+const monitor = (paramId: number): { [B in Bus]?: At } => ({
+  "monitor-1": { paramId, y: 0, write: true },
+  "monitor-2": { paramId, y: 1, write: true },
+});
+
 const mixOnly = (paramId: number, write: boolean): { [B in Bus]?: At } => ({
   "mix-1": { paramId, y: 0, write },
   "mix-2": { paramId, y: 2, write },
@@ -37,8 +43,8 @@ const bus = (address: { [B in Bus]?: At }, value: ValueRule): BusSettingRule => 
 });
 
 export const BUS_RULES = frozen({
-  "bus.on": bus(master(582, 675, 338, false), { kind: "switch" }),
-  "bus.fader": bus(master(581, 674, 337, false), FADER_LEVEL_RULE),
+  "bus.on": bus({ ...master(582, 675, 338, false), ...monitor(723) }, { kind: "switch" }),
+  "bus.fader": bus({ ...master(581, 674, 337, false), ...monitor(724) }, FADER_LEVEL_RULE),
   "bus.balance": bus(master(583, 676, 339, false), PAN_RULE),
   "bus.type": bus(mixOnly(587, false), { kind: "choice", choices: ["vari", "fixed"] }),
   "bus.pan-link": bus(mixOnly(589, true), { kind: "switch" }),

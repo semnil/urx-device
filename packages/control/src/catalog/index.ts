@@ -31,7 +31,7 @@ export { INSERT_FX_EFFECTS, INSERT_FX_RULES } from "./insert-fx.js";
 export { FX_RETURN_EFFECTS, FX_RETURN_RULES } from "./fx-return.js";
 export { GEQ_BANDS, OUTPUT_EQ_RULES } from "./output-eq.js";
 export { OUTPUT_PEQ_RULES } from "./output-peq.js";
-export { OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES } from "./output-routing.js";
+export { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, OUTPUT_TOKENS, STREAM_DELAY_RULES } from "./output-routing.js";
 export {
   FX2_FREQUENCY_DECIHZ,
   INITIAL_DELAY_DECIMS,
@@ -56,6 +56,8 @@ export type {
   FxParameterRule,
   BusBandSettingRule,
   OutputSideSettingRule,
+  OutputSettingRule,
+  DeviceSettingRule,
   BusSideAddress,
   BusSideSettingRule,
   GeqGainRule,
@@ -112,6 +114,9 @@ export type {
   FxReturnType,
   BusBandTarget,
   OutputSideTarget,
+  OutputTarget,
+  DeviceTarget,
+  CueMode,
   BusSideBandTarget,
   BusSideTarget,
   GeqLimit,

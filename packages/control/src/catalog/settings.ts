@@ -11,7 +11,7 @@ import { INSERT_FX_RULES, type INSERT_FX_EFFECTS } from "./insert-fx.js";
 import { FX_RETURN_RULES, type FX_RETURN_EFFECTS } from "./fx-return.js";
 import { OUTPUT_EQ_RULES, type GEQ_BANDS } from "./output-eq.js";
 import { OUTPUT_PEQ_RULES } from "./output-peq.js";
-import { OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES } from "./output-routing.js";
+import { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES, type OUTPUT_TOKENS } from "./output-routing.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -143,6 +143,12 @@ export const settingDefinitions = frozen({
   "bus.delay.frame-rate": { readable: true, writable: true, rule: STREAM_DELAY_RULES["bus.delay.frame-rate"] },
   "output.source": { readable: true, writable: true, rule: OUTPUT_SOURCE_RULES["output.source"] },
   "bus.source": { readable: true, writable: true, rule: OUTPUT_SOURCE_RULES["bus.source"] },
+  "bus.mono": { readable: true, writable: true, rule: MONITOR_RULES["bus.mono"] },
+  "bus.cue-interrupt": { readable: true, writable: true, rule: MONITOR_RULES["bus.cue-interrupt"] },
+  "output.level": { readable: true, writable: true, rule: MONITOR_RULES["output.level"] },
+  "channel.cue": { readable: true, writable: true, rule: CUE_RULES["channel.cue"] },
+  "bus.cue": { readable: true, writable: true, rule: CUE_RULES["bus.cue"] },
+  "cue.mode": { readable: true, writable: true, rule: CUE_RULES["cue.mode"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -204,6 +210,21 @@ export interface BusSideTarget {
   readonly side: "left" | "right";
   readonly band?: never;
 }
+
+/** A whole output destination (F08-M: the PHONES levels). */
+export interface OutputTarget {
+  readonly output: (typeof OUTPUT_TOKENS)[number];
+  readonly side?: undefined;
+  readonly band?: never;
+}
+
+/** A device-wide setting's target: no keys (F08-C). */
+export interface DeviceTarget {
+  readonly band?: never;
+}
+
+/** The device-wide CUE Mode (F08-C). */
+export type CueMode = "mix" | "last";
 
 /** One side of a physical or USB output destination (F07-R). */
 export interface OutputSideTarget {
@@ -409,6 +430,12 @@ export interface SettingTypes {
   "bus.delay.frame-rate": { target: BusTarget; value: string };
   "output.source": { target: OutputSideTarget; value: string };
   "bus.source": { target: BusSideTarget; value: string };
+  "bus.mono": { target: BusTarget; value: boolean };
+  "bus.cue-interrupt": { target: BusTarget; value: boolean };
+  "output.level": { target: OutputTarget; value: number };
+  "channel.cue": { target: ChannelTarget; value: boolean };
+  "bus.cue": { target: BusTarget; value: boolean };
+  "cue.mode": { target: DeviceTarget; value: CueMode };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

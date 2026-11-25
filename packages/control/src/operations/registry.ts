@@ -98,7 +98,19 @@ import {
   busPeqOneKnobOn,
   busPeqOneKnobType,
 } from "./output-peq.js";
-import { busDelayFrameRate, busDelayOn, busDelayTime, busSource, outputSource } from "./output-routing.js";
+import {
+  busCue,
+  busCueInterrupt,
+  busDelayFrameRate,
+  busDelayOn,
+  busDelayTime,
+  busMono,
+  busSource,
+  channelCue,
+  cueMode,
+  outputLevel,
+  outputSource,
+} from "./output-routing.js";
 import {
   compOn,
   eqOn,
@@ -265,6 +277,12 @@ export const settingHandlers: SettingHandlers = {
   "bus.delay.frame-rate": busDelayFrameRate,
   "output.source": outputSource,
   "bus.source": busSource,
+  "bus.mono": busMono,
+  "bus.cue-interrupt": busCueInterrupt,
+  "output.level": outputLevel,
+  "channel.cue": channelCue,
+  "bus.cue": busCue,
+  "cue.mode": cueMode,
 };
 
 function unknownId(): Promise<never> {
