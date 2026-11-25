@@ -78,28 +78,56 @@ impl FrameReader {
     /// Retained bytes never exceed [`MAX_FRAME_BYTES`] plus one read.
     pub fn read_frame<R: Read>(&mut self, src: &mut R) -> Result<Option<Frame>, ReadError> {
         loop {
-            if let Some(nl) = self.pending.iter().position(|&b| b == b'\n') {
-                if nl > MAX_FRAME_BYTES {
-                    return Err(ReadError::Oversized { bytes: nl });
-                }
-                let json = serde_json::from_slice::<Value>(&self.pending[..nl]).ok();
-                self.pending.drain(..=nl);
-                return Ok(Some(Frame { len: nl, json }));
+            if let Some(frame) = self.take_buffered()? {
+                return Ok(Some(frame));
             }
-            if self.pending.len() > MAX_FRAME_BYTES {
-                return Err(ReadError::Oversized {
-                    bytes: self.pending.len(),
-                });
+            if !self.read_chunk(src)? {
+                return Ok(None);
             }
-            match src.read(&mut self.chunk) {
-                Ok(0) => return Err(ReadError::Closed),
-                Ok(n) => self.pending.extend_from_slice(&self.chunk[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    return Ok(None)
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(ReadError::Io(e.kind())),
+        }
+    }
+
+    /// A frame already buffered, or else the frame completed by at most one
+    /// read of `src`; `None` when that read timed out or left the frame
+    /// incomplete. A caller that keeps receiving data regains control after
+    /// every read.
+    pub fn read_once<R: Read>(&mut self, src: &mut R) -> Result<Option<Frame>, ReadError> {
+        if let Some(frame) = self.take_buffered()? {
+            return Ok(Some(frame));
+        }
+        self.read_chunk(src)?;
+        self.take_buffered()
+    }
+
+    fn take_buffered(&mut self) -> Result<Option<Frame>, ReadError> {
+        if let Some(nl) = self.pending.iter().position(|&b| b == b'\n') {
+            if nl > MAX_FRAME_BYTES {
+                return Err(ReadError::Oversized { bytes: nl });
             }
+            let json = serde_json::from_slice::<Value>(&self.pending[..nl]).ok();
+            self.pending.drain(..=nl);
+            return Ok(Some(Frame { len: nl, json }));
+        }
+        if self.pending.len() > MAX_FRAME_BYTES {
+            return Err(ReadError::Oversized {
+                bytes: self.pending.len(),
+            });
+        }
+        Ok(None)
+    }
+
+    /// One read into the buffer. `false` when the stream reported a read
+    /// timeout; an interrupted read counts as a read with no data.
+    fn read_chunk<R: Read>(&mut self, src: &mut R) -> Result<bool, ReadError> {
+        match src.read(&mut self.chunk) {
+            Ok(0) => Err(ReadError::Closed),
+            Ok(n) => {
+                self.pending.extend_from_slice(&self.chunk[..n]);
+                Ok(true)
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(false),
+            Err(e) if e.kind() == ErrorKind::Interrupted => Ok(true),
+            Err(e) => Err(ReadError::Io(e.kind())),
         }
     }
 }
@@ -203,6 +231,24 @@ mod tests {
             Some(json!({"b": 2}))
         );
         assert_eq!(reader.read_frame(&mut src).unwrap(), None, "then quiet");
+    }
+
+    #[test]
+    fn read_once_returns_after_each_read_of_a_line_still_arriving() {
+        let mut reader = FrameReader::new();
+        let mut src = Chunks::of(&[b"{\"a\"", b":1", b"}\n{\"b\":2}\n"]);
+        assert_eq!(reader.read_once(&mut src).unwrap(), None);
+        assert_eq!(reader.read_once(&mut src).unwrap(), None);
+        assert_eq!(
+            json_of(reader.read_once(&mut src).unwrap()),
+            Some(json!({"a": 1}))
+        );
+        assert_eq!(
+            json_of(reader.read_once(&mut src).unwrap()),
+            Some(json!({"b": 2})),
+            "buffered, no read"
+        );
+        assert_eq!(reader.read_once(&mut src).unwrap(), None, "then quiet");
     }
 
     #[test]
