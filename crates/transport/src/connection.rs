@@ -124,6 +124,9 @@ struct State {
     closing: bool,
     /// Whether the worker holds a request it has not yet settled.
     active: bool,
+    /// Whether the worker runs a lifecycle job: a close lets it finish, its
+    /// started cleanup included, before the teardown budget starts.
+    job: bool,
     terminal: Option<RequestCause>,
     cancelled_owners: Vec<u64>,
     next_owner: u64,
@@ -138,6 +141,15 @@ struct State {
     /// Notification records acknowledged when the end was recorded: a held
     /// reply whose cutoff they reach was released before the end (K12).
     ended_adopted: u64,
+    /// When the close's teardown budget ends; set once the request being sent
+    /// has settled, which starts the worker's unregistrations (N2).
+    teardown_end: Option<Instant>,
+    /// The worker's unregistration of the remaining ownership, once done:
+    /// its failure, if any.
+    teardown: Option<Option<Failure>>,
+    /// The first failure of an owned cleanup's unregistration determined
+    /// after the close was marked: the close reports it (K37).
+    close_cleanup_failure: Option<Failure>,
     /// The app-issued completion holding the wire slot.
     result: Option<HeldResult>,
     next_result: u64,
@@ -268,16 +280,21 @@ impl CloseCell {
 /// How a close ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseOutcome {
-    /// Both threads finished and the socket is closed.
+    /// The remaining ownership was unregistered, every thread finished and
+    /// the socket is closed.
     Closed,
     /// Called on a thread the close cannot wait for: the worker, from a
     /// completion callback, or the closing thread itself. Closing has started
     /// and finishes without this call; callers on other threads wait for and
     /// receive the final outcome.
     Started,
-    /// The worker or the reader did not finish within the teardown budget.
-    /// The connection
-    /// is unusable; its socket is shut down and its threads are left to end.
+    /// Every thread finished and the socket is closed, but a required
+    /// unregistration of the remaining ownership failed (K37's
+    /// `connection_closed` cleanup with its failure).
+    Failed(Failure),
+    /// The teardown did not finish within its budget: its unregistrations
+    /// or a thread. The connection is unusable; its socket is shut down and
+    /// its threads are left to end.
     Incomplete(Failure),
 }
 
@@ -567,14 +584,34 @@ impl Connection {
         })
     }
 
-    /// Closes the connection. In order: new submissions and any request not
-    /// yet started on the wire are refused, waiting requests complete unsent
-    /// as `not_connected` (on a separate thread, so their callbacks never hold
-    /// the close up), the request already being sent settles under its own
-    /// deadlines, and then, within `teardown`, the socket is shut down and
-    /// released and both threads must finish. Repeated and concurrent calls
-    /// share the first call's close and its outcome; none starts a second
-    /// shutdown or sends anything.
+    /// Closes the connection. In order:
+    ///
+    /// 1. New submissions and any request not yet started on the wire are
+    ///    refused. Waiting requests and lifecycle calls not yet started
+    ///    complete unsent as `not_connected`. Their callbacks run on a
+    ///    separate thread, so they do not delay the steps below; the close
+    ///    waits for that thread within `teardown`, like the others.
+    /// 2. The request already being sent settles under its own deadlines. A
+    ///    lifecycle call already running goes on to its end: its remaining
+    ///    registrations stop, but its owned cleanup (a release, or the
+    ///    cleanup of a failed or cancelled activation) sends its
+    ///    unregistrations under their own deadlines, not `teardown`.
+    /// 3. Only then does `teardown` start. Within it, the worker unregisters
+    ///    every address the connection may still have registered (once
+    ///    each, stopping at the first failure; nothing once the link has
+    ///    ended), and the socket is shut down and released and the threads
+    ///    must finish.
+    ///
+    /// So a close may take longer than `teardown` by the cleanup running when
+    /// it was called. The outcome is `Closed` when every unregistration was
+    /// accepted (or none was needed) and every thread finished within
+    /// `teardown`; `Failed` when an unregistration failed (the teardown's or
+    /// a cleanup's after this call) and every thread still finished within
+    /// it; and `Incomplete(teardown_timeout)` whenever the budget ran out,
+    /// in the unregistrations or waiting for a thread (a callback that has
+    /// not returned included), whether or not an unregistration failed.
+    /// Repeated and concurrent calls share the first call's close and its
+    /// outcome; none starts a second shutdown or sends anything more.
     pub fn close(&self, teardown: Duration) -> CloseOutcome {
         let waiting = {
             let mut close = lock(&self.close.state);
@@ -627,7 +664,7 @@ impl Connection {
         });
         {
             let mut state = self.shared.lock();
-            while state.active {
+            while state.active || state.job {
                 state = self
                     .shared
                     .settled
@@ -635,36 +672,32 @@ impl Connection {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         }
+        // The teardown budget starts now (N2): the worker unregisters the
+        // remaining ownership within it.
         let end = Instant::now() + teardown;
-        self.reader_stop.store(true, Ordering::SeqCst);
-        if let Some(sock) = lock(&self.sock).take() {
-            let _ = sock.shutdown(Shutdown::Both);
-        }
-        // Under the queue lock, so the delivery thread cannot miss it
-        // between checking it and waiting.
-        match &self.shared.notifications {
-            Some(queue) => {
-                let _queue = lock(queue);
-                self.shared.delivery_stop.store(true, Ordering::SeqCst);
-            }
-            None => self.shared.delivery_stop.store(true, Ordering::SeqCst),
-        }
-        self.shared.deliverable.notify_all();
-        let threads = [
-            delivery,
-            lock(&self.worker).take(),
-            lock(&self.reader).take(),
-            lock(&self.delivery).take(),
-        ];
+        self.shared.lock().teardown_end = Some(end);
+        self.shared.advance.notify_all();
+        let _ = self.events.send(Event::Wake);
+        let rest = Teardown {
+            shared: Arc::clone(&self.shared),
+            reader_stop: Arc::clone(&self.reader_stop),
+            sock: lock(&self.sock).take(),
+            threads: [
+                delivery,
+                lock(&self.worker).take(),
+                lock(&self.reader).take(),
+                lock(&self.delivery).take(),
+            ],
+            end,
+        };
         if self.on_own_thread() {
             // A completion or delivery callback cannot wait for the thread it
-            // runs on; a helper waits for the threads within the same budget.
+            // runs on; a helper finishes the close within the same budget.
             let cell = Arc::clone(&self.close);
-            let expiry = Arc::clone(&self.shared.expiry);
-            thread::spawn(move || cell.record(wait_for(threads, &expiry, end)));
+            thread::spawn(move || cell.record(rest.finish()));
             return CloseOutcome::Started;
         }
-        let outcome = wait_for(threads, &self.shared.expiry, end);
+        let outcome = rest.finish();
         self.close.record(outcome);
         outcome
     }
@@ -684,6 +717,78 @@ impl Connection {
         self.worker_id == me
             || self.delivery_id == Some(me)
             || lock(&self.shared.expiry.pool).ids.contains(&me)
+    }
+}
+
+/// The rest of a close once the worker has the teardown budget.
+struct Teardown {
+    shared: Arc<Shared>,
+    reader_stop: Arc<AtomicBool>,
+    sock: Option<TcpStream>,
+    threads: [Option<JoinHandle<()>>; 4],
+    end: Instant,
+}
+
+impl Teardown {
+    /// Waits, within the budget, for the worker's unregistrations (or the
+    /// connection's end), then shuts the socket down and waits for the
+    /// threads.
+    fn finish(self) -> CloseOutcome {
+        let unregistered = {
+            let mut state = self.shared.lock();
+            loop {
+                // A cleanup that failed after the close was marked comes
+                // first: the worker's teardown follows it.
+                if let Some(failure) = state.teardown {
+                    break Some(state.close_cleanup_failure.or(failure));
+                }
+                if state.terminal.is_some() {
+                    break Some(state.close_cleanup_failure);
+                }
+                let remaining = self.end.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break None;
+                }
+                state = self
+                    .shared
+                    .settled
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
+            }
+        };
+        self.reader_stop.store(true, Ordering::SeqCst);
+        if let Some(sock) = self.sock {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+        // Under the queue lock, so the delivery thread cannot miss it
+        // between checking it and waiting.
+        match &self.shared.notifications {
+            Some(queue) => {
+                let _queue = lock(queue);
+                self.shared.delivery_stop.store(true, Ordering::SeqCst);
+            }
+            None => self.shared.delivery_stop.store(true, Ordering::SeqCst),
+        }
+        self.shared.deliverable.notify_all();
+        let joined = wait_for(self.threads, &self.shared.expiry, self.end);
+        match (unregistered, joined) {
+            (None, _) => {
+                CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown))
+            }
+            // The budget ran out in the worker's unregistrations.
+            (
+                Some(Some(
+                    failure @ Failure::Cause {
+                        code: Cause::TeardownTimeout,
+                        ..
+                    },
+                )),
+                _,
+            ) => CloseOutcome::Incomplete(failure),
+            (Some(Some(failure)), CloseOutcome::Closed) => CloseOutcome::Failed(failure),
+            (Some(_), joined) => joined,
+        }
     }
 }
 
@@ -906,6 +1011,45 @@ impl Connection {
             adoption.adopt();
         });
     }
+}
+
+/// The worker's part of a close: once the close gives the teardown budget,
+/// unregister the remaining ownership unless the connection already ended,
+/// and report the result to the close.
+fn tear_down(
+    sock: &mut TcpStream,
+    inbox: &Receiver<Event>,
+    shared: &Shared,
+    options: &ConnectionOptions,
+) {
+    let end = {
+        let mut state = shared.lock();
+        loop {
+            if let Some(end) = state.teardown_end {
+                break end;
+            }
+            state = shared
+                .advance
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    };
+    // An end recorded meanwhile leaves nothing to unregister on this link.
+    let ended = shared.link_end().is_some();
+    let failure = if ended {
+        None
+    } else {
+        let mut io = Io {
+            sock,
+            inbox,
+            shared,
+            options,
+            teardown: Some(end),
+        };
+        io.unregister_remaining()
+    };
+    shared.lock().teardown = Some(failure);
+    shared.settled.notify_all();
 }
 
 /// Requests that expired during a hold, waiting for a completing thread,
@@ -1213,13 +1357,17 @@ fn serve(
             let mut state = shared.lock();
             let job = state.jobs.pop_front();
             state.active |= job.is_some();
+            state.job = job.is_some();
             job
         };
         if let Some(job) = job {
             let (deliveries, fatal) = run_job(&mut sock, &inbox, &shared, &options, job);
             let ended = fatal.map(|cause| mark_ended(&shared, cause));
             {
-                shared.lock().active = false;
+                let mut state = shared.lock();
+                state.active = false;
+                state.job = false;
+                drop(state);
                 shared.settled.notify_all();
             }
             for (done, outcome) in deliveries {
@@ -1234,6 +1382,8 @@ fn serve(
         let next = {
             let mut state = shared.lock();
             if state.closing && state.waiting.is_empty() {
+                drop(state);
+                tear_down(&mut sock, &inbox, &shared, &options);
                 return;
             }
             state.waiting.pop_front().map(|item| {
@@ -1352,6 +1502,8 @@ fn mark_ended(shared: &Shared, cause: RequestCause) -> Ended {
     drop(state);
     drop(link_end);
     shared.advance.notify_all();
+    // A close waiting for the teardown stops waiting: there is none.
+    shared.settled.notify_all();
     // No hold follows the end: the expiry threads end once nothing is
     // queued, without waiting for the completions the end still runs.
     shared.expiry.stop();
@@ -1439,6 +1591,7 @@ fn run_job(
         inbox,
         shared,
         options,
+        teardown: None,
     };
     match job {
         Job::Activate { token, owner, done } => {
@@ -1482,6 +1635,10 @@ struct Io<'a> {
     inbox: &'a Receiver<Event>,
     shared: &'a Shared,
     options: &'a ConnectionOptions,
+    /// The close's teardown end, for the unregistrations it runs: they are
+    /// sent although the close is marked, and neither their send nor their
+    /// response wait outlasts it (N2).
+    teardown: Option<Instant>,
 }
 
 /// How an activation ended.
@@ -1535,6 +1692,21 @@ impl Io<'_> {
     /// One registration or unregistration POST. With `stop`, it does not
     /// start once `stop` holds for the state.
     fn post(&mut self, request: wire::Request, stop: &dyn Fn(&State) -> bool) -> Posted {
+        self.post_with(request, stop, false)
+    }
+
+    /// An unregistration of owned cleanup: once started, the cleanup goes on
+    /// although a close is marked; the close waits for its job (K10, K37).
+    fn post_cleanup(&mut self, request: wire::Request) -> Posted {
+        self.post_with(request, &|_| false, true)
+    }
+
+    fn post_with(
+        &mut self,
+        request: wire::Request,
+        stop: &dyn Fn(&State) -> bool,
+        cleanup: bool,
+    ) -> Posted {
         let refused = |verdict, cause, ends| Posted::Refused {
             verdict,
             cause,
@@ -1544,9 +1716,11 @@ impl Io<'_> {
             return refused(Verdict::Rejected, RequestCause::InternalError, None);
         };
         let key = request.reply_key();
+        let cap = self.teardown;
         let send_end = Instant::now() + self.options.send_deadline;
+        let send_end = cap.map_or(send_end, |cap| send_end.min(cap));
         let unstarted = |state: &State| {
-            if state.closing {
+            if state.closing && cap.is_none() && !cleanup {
                 Some(Stop::Closing)
             } else if stop(state) {
                 Some(Stop::Cancelled)
@@ -1558,6 +1732,7 @@ impl Io<'_> {
             frame: &frame,
             key: &key,
             send_end,
+            cap,
             unstarted: &unstarted,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
@@ -1594,6 +1769,14 @@ impl Io<'_> {
             Err(failed) => match failed.failure {
                 RequestFailure::Cancelled { .. } => Posted::Stopped,
                 RequestFailure::Cause { code, .. } => {
+                    // A send budget cut short by the teardown's end expires
+                    // as the teardown (N2, K34).
+                    let code = match (code, cap) {
+                        (RequestCause::SendTimeout, Some(cap)) if Instant::now() >= cap => {
+                            RequestCause::TeardownTimeout
+                        }
+                        (code, _) => code,
+                    };
                     let verdict = if failed.evidence == Evidence::NotSent {
                         Verdict::Rejected
                     } else {
@@ -1751,12 +1934,32 @@ impl Io<'_> {
         }
     }
 
+    /// Unregisters every address the connection may still have registered,
+    /// once each, within the teardown budget (K8, N2). The first failure
+    /// stops the rest.
+    fn unregister_remaining(&mut self) -> Option<Failure> {
+        let addresses = self.shared.lock().ledger.remaining_registrations();
+        for address in addresses {
+            let posted = self.post_cleanup(unregister(address));
+            let (verdict, cause) = match posted {
+                Posted::Accepted => (Verdict::Accepted, None),
+                Posted::Refused { verdict, cause, .. } => (verdict, Some(cause)),
+                Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected)),
+            };
+            self.shared.lock().ledger.unregistered(address, verdict);
+            if let Some(cause) = cause {
+                return Some(Failure::cause(lifecycle_cause(cause), Phase::Teardown));
+            }
+        }
+        None
+    }
+
     /// Ends `token`'s ownership and unregisters what it was the last holder
     /// of, once each. A failure stops the rest and ends the connection (K10).
     fn unregister_owned(&mut self, token: TokenId) -> (Cleanup, Option<RequestCause>) {
         let addresses = self.shared.lock().ledger.begin_release(token);
         for address in addresses {
-            let posted = self.post(unregister(address), &|_| false);
+            let posted = self.post_cleanup(unregister(address));
             let (verdict, cause, ends) = match posted {
                 Posted::Accepted => (Verdict::Accepted, None, None),
                 Posted::Refused {
@@ -1768,7 +1971,13 @@ impl Io<'_> {
             };
             self.shared.lock().ledger.unregistered(address, verdict);
             if let Some(cause) = cause {
-                self.shared.lock().ledger.finish(token);
+                let mut state = self.shared.lock();
+                state.ledger.finish(token);
+                if state.closing {
+                    let teardown = Failure::cause(lifecycle_cause(cause), Phase::Teardown);
+                    state.close_cleanup_failure.get_or_insert(teardown);
+                }
+                drop(state);
                 let failure = Failure::cause(lifecycle_cause(cause), Phase::Subscription);
                 let cleanup = Cleanup {
                     state: CleanupState::ConnectionClosed,
@@ -1838,6 +2047,7 @@ fn execute(
         frame,
         key,
         send_end,
+        cap: None,
         unstarted: &unstarted,
     };
     match exchange(sock, inbox, shared, options, outbound) {
@@ -2018,6 +2228,8 @@ struct Outbound<'a> {
     frame: &'a [u8],
     key: &'a ReplyKey,
     send_end: Instant,
+    /// A teardown budget's end, which also bounds the response wait.
+    cap: Option<Instant>,
     /// Whether a frame not yet started must not start.
     unstarted: &'a dyn Fn(&State) -> Option<Stop>,
 }
@@ -2033,6 +2245,7 @@ fn exchange(
         frame,
         key,
         send_end,
+        cap,
         unstarted,
     } = outbound;
     if Instant::now() >= send_end {
@@ -2066,6 +2279,10 @@ fn exchange(
         }
     }
     let response_end = Instant::now() + options.response_deadline;
+    let (response_end, timeout) = match cap {
+        Some(cap) if cap < response_end => (cap, RequestCause::TeardownTimeout),
+        _ => (response_end, RequestCause::ResponseTimeout),
+    };
     // A response-phase failure ends the connection: the cause is recorded
     // as its end when chosen, unless an earlier end was recorded, which is
     // reported instead.
@@ -2106,9 +2323,7 @@ fn exchange(
                 ending = Some(RequestCause::NotificationOverflow);
             }
             Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
-            Err(RecvTimeoutError::Timeout) => {
-                return unconfirmed(ending.unwrap_or(RequestCause::ResponseTimeout))
-            }
+            Err(RecvTimeoutError::Timeout) => return unconfirmed(ending.unwrap_or(timeout)),
             Err(RecvTimeoutError::Disconnected) => return unconfirmed(RequestCause::InternalError),
         }
     }
@@ -2160,9 +2375,20 @@ fn write_frame<O: Outgoing>(
         if let Some(cause) = *link_end {
             return failed(cause);
         }
+        // Checked again under the gate: waiting for it may have used up the
+        // budget.
+        if Instant::now() >= end {
+            return failed(RequestCause::SendTimeout);
+        }
         if written == 0 {
-            if let Some(stop) = unstarted(&shared.lock()) {
+            let state = shared.lock();
+            if let Some(stop) = unstarted(&state) {
                 return Err(WriteError::Stopped(stop));
+            }
+            drop(state);
+            // And after the state lock, the last wait before the write.
+            if Instant::now() >= end {
+                return failed(RequestCause::SendTimeout);
             }
         }
         let outcome = sock.write(&frame[written..]);
