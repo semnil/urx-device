@@ -27,6 +27,12 @@ pub enum Cause {
     TeardownTimeout,
     /// Identity was missing or ambiguous after otherwise successful queries.
     IdentityError,
+    /// Device Center explicitly refused a registration or unregistration.
+    DeviceRejected,
+    /// The connection is closing or has ended.
+    NotConnected,
+    /// A local limit refused the call before anything was sent.
+    PreconditionFailed,
     /// An unexpected internal failure.
     InternalError,
 }
@@ -82,3 +88,37 @@ impl Control {
         self.cancelled_at.get().copied()
     }
 }
+
+/// How far cleanup got after a lifecycle call failed (K37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupState {
+    /// Everything the call owned was released, or it owned nothing.
+    Complete,
+    /// The connection was ended, which releases everything it owned.
+    ConnectionClosed,
+    /// Neither is established.
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cleanup {
+    pub state: CleanupState,
+    /// The first cleanup failure, if cleanup failed.
+    pub failure: Option<Failure>,
+}
+
+impl Cleanup {
+    pub const COMPLETE: Cleanup = Cleanup {
+        state: CleanupState::Complete,
+        failure: None,
+    };
+}
+
+/// A failed lifecycle call: its first cause and how far cleanup got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleFailure {
+    pub failure: Failure,
+    pub cleanup: Cleanup,
+}
+
+pub type LifecycleOutcome = Result<(), LifecycleFailure>;

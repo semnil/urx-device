@@ -54,6 +54,9 @@ pub enum StartRefusal {
     /// An unregistration was rejected, left unconfirmed or never completed:
     /// the connection's registrations are no longer known, and K10 ends it.
     Unusable,
+    /// The token is no longer retained, or is being released: it cannot
+    /// become active.
+    Gone,
 }
 
 /// What a registration or unregistration reply established.
@@ -166,8 +169,9 @@ impl Ledger {
     /// Starts `token`'s activation and returns the addresses it needs
     /// registered: those of its addresses no registration covers yet, in the
     /// token's order. Addresses registered or possibly registered for another
-    /// activating or active token are not sent again. Only a provisional token
-    /// starts; any other returns nothing.
+    /// activating or active token are not sent again. An active token needs
+    /// nothing; a token no longer retained, releasing or already activating
+    /// refuses with `Gone`.
     ///
     /// A release or cleanup that has not finished refuses with `Busy`: its
     /// unregistrations decide what is still registered, so an activation can
@@ -185,10 +189,12 @@ impl Ledger {
             return Err(StartRefusal::Busy);
         }
         let Some(token) = self.tokens.get_mut(&token) else {
-            return Ok(Vec::new());
+            return Err(StartRefusal::Gone);
         };
-        if token.state != TokenState::Provisional {
-            return Ok(Vec::new());
+        match token.state {
+            TokenState::Provisional => {}
+            TokenState::Active => return Ok(Vec::new()),
+            TokenState::Registering | TokenState::Releasing => return Err(StartRefusal::Gone),
         }
         token.state = TokenState::Registering;
         let mut needed = Vec::new();
