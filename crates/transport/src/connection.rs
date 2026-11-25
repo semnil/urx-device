@@ -641,10 +641,26 @@ fn execute(
     }
 }
 
+/// The two socket calls a write makes, so tests can stand in for the socket.
+trait Outgoing {
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize>;
+}
+
+impl Outgoing for TcpStream {
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        Write::write(self, bytes)
+    }
+}
+
 /// Writes `frame` by `end`, starting no write once the reader has recorded
 /// the link's end. On failure, the cause and how many bytes went out.
-fn write_frame(
-    sock: &mut TcpStream,
+fn write_frame<O: Outgoing>(
+    sock: &mut O,
     shared: &Shared,
     frame: &[u8],
     end: Instant,

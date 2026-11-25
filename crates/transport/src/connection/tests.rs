@@ -970,3 +970,88 @@ fn no_write_starts_after_the_link_is_reported_lost() {
         ["/vd/parameters/1:0:0?operation=value"]
     );
 }
+
+/// A socket stand-in that takes at most 8 bytes per write and lets a test act
+/// as the reader at chosen points.
+struct Scripted {
+    shared: Arc<super::Shared>,
+    written: Vec<u8>,
+    /// Record the link's end when the n-th write is being prepared.
+    end_before_write: Option<usize>,
+    writes: usize,
+    /// Whether the reader could record an end while a write was running.
+    recordable_during_write: bool,
+}
+
+impl super::Outgoing for Scripted {
+    fn set_write_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+        if self.end_before_write == Some(self.writes) {
+            self.shared
+                .link_end()
+                .get_or_insert(RequestCause::ConnectionLost);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.shared.link_end.try_lock().is_ok() {
+            self.recordable_during_write = true;
+        }
+        self.writes += 1;
+        let n = bytes.len().min(8);
+        self.written.extend_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+}
+
+fn scripted(end_before_write: Option<usize>) -> Scripted {
+    Scripted {
+        shared: Arc::new(super::Shared {
+            state: std::sync::Mutex::new(super::State::default()),
+            link_end: std::sync::Mutex::new(None),
+        }),
+        written: Vec::new(),
+        end_before_write,
+        writes: 0,
+        recordable_during_write: false,
+    }
+}
+
+#[test]
+fn a_write_never_starts_after_the_reader_records_the_end() {
+    let frame = vec![b'x'; 30];
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    // Recorded while the first write is being prepared: nothing goes out.
+    let mut sock = scripted(Some(0));
+    let shared = Arc::clone(&sock.shared);
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline),
+        Err((RequestCause::ConnectionLost, 0))
+    );
+    assert!(sock.written.is_empty());
+
+    // Recorded after the first 8 bytes, while the next part is being
+    // prepared: no more bytes go out, and the count says how many did.
+    let mut sock = scripted(Some(1));
+    let shared = Arc::clone(&sock.shared);
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline),
+        Err((RequestCause::ConnectionLost, 8))
+    );
+    assert_eq!(sock.written.len(), 8);
+
+    // Without an end the whole frame goes out, and no write ran while the
+    // reader could have recorded one.
+    let mut sock = scripted(None);
+    let shared = Arc::clone(&sock.shared);
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline),
+        Ok(())
+    );
+    assert_eq!(sock.written, frame);
+    assert!(
+        !sock.recordable_during_write,
+        "the end lock is held across each write"
+    );
+}
