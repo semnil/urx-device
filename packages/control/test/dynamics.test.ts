@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "../src/catalog/dynamics-stops.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { previewSetting, readSetting, writeSetting } from "../src/operations/registry.js";
+import { previewSetting, readSetting, writeSetting, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -136,4 +136,57 @@ describe("GATE and COMP (F04-D)", () => {
       );
     }
   });
+
+  it("refuse a side on the mono channels before any request", async () => {
+    const transport = new FakeTransport();
+    const c = new OperationContext(transport, "URX44");
+    for (const [id] of table) {
+      for (const target of [{ channel: 1, side: "left" }, { channel: 1, side: "both" }]) {
+        expect((await failureOf(readSetting(c, id, target as never)))?.code, id).toBe("invalid_input");
+      }
+    }
+    expect(transport.calls).toEqual([]);
+  });
+
+  it("carry every 0.01 dB value of each dB range unchanged through write and read (F18-P)", async () => {
+    const ranges = [
+      ["channel.gate.threshold", -7200, 0],
+      ["channel.gate.range", -7200, 0],
+      ["channel.comp.threshold", -5400, 0],
+      ["channel.comp.gain", 0, 1800],
+    ] as const;
+    for (const [id, low, high] of ranges) {
+      const raws: string[] = [];
+      const writes = new FakeTransport();
+      const values: number[] = [];
+      for (let centi = low; centi <= high; centi += 1) {
+        values.push(centi / 100);
+        raws.push(`${centi}`);
+      }
+      writes.timers = false;
+      writes.script("setNumeric", ...values.map(() => accepted));
+      const w = new OperationContext(writes, "URX44");
+      for (const value of values) {
+        const result = await writeSetting(w, ...([id, { channel: 1 }, value] as unknown as WriteArgs));
+        if (result.planned !== value) {
+          expect(result.planned, `${id} ${value}`).toBe(value);
+        }
+      }
+      expect(writes.calls.map((call) => call.value), id).toEqual(raws);
+      const reads = new FakeTransport().script("getNumeric", ...raws.map(read));
+      reads.timers = false;
+      const r = new OperationContext(reads, "URX44");
+      const observed: unknown[] = [];
+      for (let i = 0; i < raws.length; i += 1) {
+        observed.push((await readSetting(r, id, { channel: 1 })).value);
+      }
+      expect(observed, id).toEqual(values);
+    }
+    expect(plan("channel.comp.gain", 7.06)).toBe(7.06);
+    expect(plan("channel.comp.gain", 7.065)).toBe(7.06);
+    expect(plan("channel.comp.gain", 7.0651)).toBe(7.07);
+    expect(plan("channel.gate.threshold", -2.375)).toBe(-2.38);
+    expect(plan("channel.gate.range", -0.005)).toBe(-0.01);
+  });
 });
+
