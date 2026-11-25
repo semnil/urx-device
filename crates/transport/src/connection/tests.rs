@@ -1218,9 +1218,9 @@ fn a_waiting_request_callback_that_closes_does_not_hold_the_close_up() {
     let started = Instant::now();
     assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     assert!(started.elapsed() < Duration::from_secs(1));
-    let (outcome, closed) = inner.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (waiting, closed) = inner.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(
-        outcome,
+        waiting,
         failed(
             RequestCause::NotConnected,
             RequestPhase::Admission,
