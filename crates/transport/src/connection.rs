@@ -510,13 +510,16 @@ impl Connection {
             // The close becomes visible to other callers only together with
             // the refusal of new work and of unstarted writes: the send gate
             // and the state are updated before the close lock is released.
-            let _gate = self.shared.link_end();
+            let gate = self.shared.link_end();
             let mut state = self.shared.lock();
             state.closing = true;
             *close = CloseState::Closing;
             lock(&self.close.exempt).push(thread::current().id());
-            take_pending(&mut state)
+            // An end already recorded is how the waiting requests end.
+            let cause = gate.unwrap_or(RequestCause::NotConnected);
+            (take_pending(&mut state), cause)
         };
+        let (waiting, cause) = waiting;
         let _ = self.events.send(Event::Wake);
         // Waiting requests complete on their own thread, which the close
         // waits for within the budget; a close called from one of their
@@ -525,7 +528,7 @@ impl Connection {
             let (go, ready) = mpsc::channel::<()>();
             let handle = thread::spawn(move || {
                 let _ = ready.recv();
-                waiting.complete(RequestCause::NotConnected);
+                waiting.complete(cause);
             });
             lock(&self.close.exempt).push(handle.thread().id());
             let _ = go.send(());
@@ -741,9 +744,9 @@ impl Operation {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        let cancelled = {
+        let (cancelled, ended) = {
             // Ordered with the start of every write (see write_frame).
-            let _gate = shared.link_end();
+            let gate = shared.link_end();
             let mut state = shared.lock();
             if !state.cancelled_owners.contains(&self.id) {
                 state.cancelled_owners.push(self.id);
@@ -754,18 +757,20 @@ impl Operation {
                     .partition(|item| item.owner == self.id);
             state.waiting = others;
             state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
-            mine
+            (mine, *gate)
         };
         for item in cancelled {
-            deliver(
-                item.done,
-                Outcome::Failure {
+            // Once the end is recorded, the waiting requests end with it.
+            let outcome = match ended {
+                Some(cause) => Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
+                None => Outcome::Failure {
                     failure: RequestFailure::Cancelled {
                         phase: RequestPhase::Admission,
                     },
                     evidence: Evidence::NotSent,
                 },
-            );
+            };
+            deliver(item.done, outcome);
         }
     }
 }
@@ -819,12 +824,13 @@ enum Routed {
 }
 
 /// Decides, at receipt, which tokens a notification frame is for, and
-/// queues it for them within the budget (K6).
-fn route(shared: &Shared, received: &Received) -> Routed {
+/// queues it for them within the budget (K6). Once `accepting` is false
+/// (after an overflow), notifications are no longer queued.
+fn route(shared: &Shared, received: &Received, accepting: bool) -> Routed {
     let Some(payload) = Inbound::new(received.message.clone()).notification() else {
         return Routed::NotNotification;
     };
-    let Some(queue) = shared.notifications.as_ref() else {
+    let Some(queue) = shared.notifications.as_ref().filter(|_| accepting) else {
         return Routed::Dropped;
     };
     let recipients = {
@@ -901,7 +907,7 @@ fn read_frames(
         shared.link_end().get_or_insert(cause);
     };
     // After an overflow, replies to a request already sent still arrive;
-    // further notifications are not queued.
+    // further notifications are not queued, even once budget is released.
     let mut overflowed = false;
     if sock.set_read_timeout(Some(READ_POLL)).is_err() {
         record(RequestCause::ConnectionLost);
@@ -921,7 +927,7 @@ fn read_frames(
                         received_at_ms: now_ms(),
                     };
                     // Recipients and budget are decided here, at receipt.
-                    match route(&shared, &received) {
+                    match route(&shared, &received, !overflowed) {
                         Routed::NotNotification => {}
                         Routed::Queued | Routed::Dropped => continue,
                         Routed::Overflow => {
@@ -966,8 +972,7 @@ fn serve(
     loop {
         let reported = *shared.link_end();
         if let Some(cause) = reported {
-            let waiting = mark_ended(&shared, cause);
-            finish(&mut sock, waiting, cause);
+            finish(&mut sock, mark_ended(&shared, cause));
             return;
         }
         let job = {
@@ -986,8 +991,8 @@ fn serve(
             for (done, outcome) in deliveries {
                 deliver_lifecycle(done, outcome);
             }
-            if let (Some(cause), Some(ended)) = (fatal, ended) {
-                finish(&mut sock, ended, cause);
+            if let Some(ended) = ended {
+                finish(&mut sock, ended);
                 return;
             }
             continue;
@@ -1015,8 +1020,8 @@ fn serve(
                 // waiting requests end.
                 let waiting = fatal.map(|cause| mark_ended(&shared, cause));
                 deliver(item.done, outcome);
-                if let (Some(cause), Some(waiting)) = (fatal, waiting) {
-                    finish(&mut sock, waiting, cause);
+                if let Some(ended) = waiting {
+                    finish(&mut sock, ended);
                     return;
                 }
                 None
@@ -1031,8 +1036,7 @@ fn serve(
             },
         };
         if let Some(cause) = fatal {
-            let waiting = mark_ended(&shared, cause);
-            finish(&mut sock, waiting, cause);
+            finish(&mut sock, mark_ended(&shared, cause));
             return;
         }
     }
@@ -1041,10 +1045,23 @@ fn serve(
 /// Records `cause` as the end of the connection and takes the waiting
 /// requests in the same step, so that no later cancellation or close changes
 /// how they end.
-fn mark_ended(shared: &Shared, cause: RequestCause) -> Taken {
+fn mark_ended(shared: &Shared, cause: RequestCause) -> Ended {
+    // The first recorded end is the connection's cause: a later failure the
+    // worker meets (or reports) does not replace it.
+    let mut link_end = shared.link_end();
+    let cause = *link_end.get_or_insert(cause);
     let mut state = shared.lock();
     state.terminal.get_or_insert(cause);
-    take_pending(&mut state)
+    let taken = take_pending(&mut state);
+    drop(state);
+    drop(link_end);
+    Ended { taken, cause }
+}
+
+/// What an end took, and the connection's cause it completes them with.
+struct Ended {
+    taken: Taken,
+    cause: RequestCause,
 }
 
 /// What an end or a close takes from the state: waiting requests, pending
@@ -1097,10 +1114,10 @@ impl Taken {
     }
 }
 
-/// Closes the socket and completes what was taken with `cause`.
-fn finish(sock: &mut TcpStream, taken: Taken, cause: RequestCause) {
+/// Closes the socket and completes what the end took with its cause.
+fn finish(sock: &mut TcpStream, ended: Ended) {
     let _ = sock.shutdown(Shutdown::Both);
-    taken.complete(cause);
+    ended.taken.complete(ended.cause);
 }
 
 /// The outcomes a lifecycle job settled, to deliver once the end (if any) is
@@ -1578,9 +1595,10 @@ fn exchange(
         }
     }
     let response_end = Instant::now() + options.response_deadline;
-    let unconfirmed = |cause| {
+    // A request ended by the connection's end reports the end recorded first.
+    let unconfirmed = |cause: RequestCause| {
         Err(Failed::new(
-            cause,
+            shared.link_end().unwrap_or(cause),
             RequestPhase::Response,
             Evidence::Unconfirmed,
             true,

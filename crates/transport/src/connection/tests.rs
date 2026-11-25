@@ -2390,4 +2390,139 @@ mod notifications {
             assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
         }
     }
+
+    fn lost() -> Vec<u8> {
+        line(
+            json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "lost" } } }),
+        )
+    }
+
+    /// Pushes one notification beyond the budget and waits until the reader
+    /// has recorded the overflow.
+    fn overflow(connection: &Connection, push: &Sender<Vec<u8>>) {
+        for value in 0..=(MAX_PENDING_NOTIFICATIONS as i64) {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        super::wait_until(|| connection.shared.link_end().is_some());
+        assert_eq!(
+            *connection.shared.link_end(),
+            Some(RequestCause::NotificationOverflow)
+        );
+    }
+
+    fn unsent_with(cause: RequestCause) -> Outcome {
+        Outcome::failed(
+            cause,
+            crate::request::RequestPhase::Admission,
+            crate::request::Evidence::NotSent,
+        )
+    }
+
+    #[test]
+    fn budget_released_after_an_overflow_does_not_resume_delivery() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let (release, _) = block_worker(&connection);
+        overflow(&connection, &push);
+        let mut values = Vec::new();
+        while values.len() < MAX_PENDING_NOTIFICATIONS {
+            let batch = next(&batches);
+            values.extend(batch.records.iter().map(|record| numeric(record).1));
+            assert!(connection.adopt_notifications(batch.ticket));
+        }
+        push.send(notify_param(1, -2)).unwrap();
+        assert!(
+            batches.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing after the overflow"
+        );
+        assert_eq!(
+            values,
+            (0..MAX_PENDING_NOTIFICATIONS as i64).collect::<Vec<_>>(),
+            "everything accepted before the overflow, in order"
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn a_later_failure_does_not_replace_an_overflow() {
+        let (port, push) = pushing_unit(Duration::from_millis(500));
+        let (connection, _batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let (tx, done) = mpsc::channel();
+        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        overflow(&connection, &push);
+        push.send(lost()).unwrap();
+        assert!(matches!(
+            done.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Outcome::Failure {
+                failure: crate::request::RequestFailure::Cause {
+                    code: RequestCause::NotificationOverflow,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            connection.terminal(),
+            Some(RequestCause::NotificationOverflow)
+        );
+    }
+
+    #[test]
+    fn a_failed_delivery_callback_does_not_replace_an_overflow() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (go_tx, go) = mpsc::channel::<()>();
+        let go = Mutex::new(go);
+        let connection = connect_calling(port, move |_, _| {
+            let _ = go.lock().unwrap().recv();
+            panic!("the application failed");
+        });
+        let _token = activate(&connection, &[p(1)]);
+        overflow(&connection, &push);
+        go_tx.send(()).unwrap();
+        super::wait_until(|| connection.terminal().is_some());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            connection.terminal(),
+            Some(RequestCause::NotificationOverflow)
+        );
+    }
+
+    #[test]
+    fn requests_waiting_at_an_overflow_end_with_it_on_close_or_cancel() {
+        for close in [true, false] {
+            let (port, push) = pushing_unit(Duration::ZERO);
+            let (connection, _batches) = connect(port);
+            let connection = Arc::new(connection);
+            let _token = activate(&connection, &[p(1)]);
+            let (release, _) = block_worker(&connection);
+            let operation = connection.create_operation().unwrap();
+            let (tx, done) = mpsc::channel();
+            connection.submit(&operation, Request::GetNumeric(param(6)), move |outcome| {
+                let _ = tx.send(outcome);
+            });
+            overflow(&connection, &push);
+            let closer = if close {
+                let connection = Arc::clone(&connection);
+                Some(thread::spawn(move || connection.close(TEARDOWN)))
+            } else {
+                operation.cancel();
+                None
+            };
+            assert_eq!(
+                done.recv_timeout(Duration::from_secs(5)).unwrap(),
+                unsent_with(RequestCause::NotificationOverflow),
+                "close: {close}"
+            );
+            release.send(()).unwrap();
+            if let Some(closer) = closer {
+                assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+            }
+        }
+    }
 }
