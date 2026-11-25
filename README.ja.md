@@ -32,6 +32,14 @@ cargo test --workspace --locked
 
 手で書き換える版はルートの `package.json` の `version` だけ。`pnpm version:write` がパッケージとクレートの版をそこから作り直し、`pnpm version:check` は両者が違うと失敗する。
 
+## 協力
+
+[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) を参照。セキュリティ上の問題は [SECURITY.ja.md](SECURITY.ja.md) の手順で報告する。
+
+## 免責
+
+このライブラリは、公式の資料ではなく独自の解析で割り出した制御プロトコルで機器と通信する。機器へデータを送ることには常に危険が伴う。ソフトウェアは「現状のまま」提供され、いかなる保証も無い。作者は、使用によって生じた機器の損傷・設定の消失・その他の損害について責任を負わない。
+
 ## ライセンス
 
 [MIT](LICENSE)。

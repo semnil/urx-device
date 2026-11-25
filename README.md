@@ -32,6 +32,14 @@ cargo test --workspace --locked
 
 The root `package.json` `version` is the only hand-edited version. `pnpm version:write` regenerates the package and crate versions from it, and `pnpm version:check` fails when they differ.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security problems go through [SECURITY.md](SECURITY.md).
+
+## Disclaimer
+
+This library talks to the hardware using a control protocol determined by independent analysis, not from official documentation. Sending data to hardware always carries some risk. The software is provided "as is", without warranty of any kind, and the authors are not liable for any damage to hardware, loss of settings, or other loss arising from its use.
+
 ## License
 
 [MIT](LICENSE).

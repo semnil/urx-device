@@ -50,3 +50,22 @@ jobs:
         timeout-minutes: 10
       - run: cargo test --workspace --locked
         timeout-minutes: 10
+
+  # The one context the main ruleset requires (.github/required-checks.json).
+  # `if: always()` keeps it from being skipped when a job it needs fails: a
+  # skipped required check reports success.
+  ci-required:
+    needs: [typescript, rust]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every job passed
+        if: needs.typescript.result != 'success' || needs.rust.result != 'success'
+        env:
+          TYPESCRIPT: ${{ needs.typescript.result }}
+          RUST: ${{ needs.rust.result }}
+        run: |
+          echo "::error::CI did not pass — typescript=${TYPESCRIPT} rust=${RUST}"
+          exit 1

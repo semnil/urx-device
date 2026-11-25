@@ -1,0 +1,41 @@
+name: Bug report
+description: A definition, codec or transport behavior in urx-device is wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        English or Japanese are both fine — 日本語で構いません。
+
+        **Security problems** go through the [security policy](https://github.com/semnil/urx-device/security/policy)
+        instead, not this form.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: urx-device release or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Device model
+      options:
+        - URX44V
+        - URX44
+        - URX22
+        - Not model-specific
+    validations:
+      required: true

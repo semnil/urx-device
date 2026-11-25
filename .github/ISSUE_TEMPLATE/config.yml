@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: URX Router issues
+    url: https://github.com/semnil/urx-router/issues
+    about: Problems seen in the URX Router app belong there unless they are traced to this library.

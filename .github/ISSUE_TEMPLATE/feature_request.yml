@@ -1,0 +1,19 @@
+name: Feature request
+description: A device function the library should define or operate
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: English or Japanese are both fine — 日本語で構いません。
+  - type: textarea
+    id: summary
+    attributes:
+      label: What the library should do
+      description: The device function, as the unit's screen or user guide names it.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Hardware evidence
+      description: What you observed on the unit, if anything. Do not paste real device identifiers.
