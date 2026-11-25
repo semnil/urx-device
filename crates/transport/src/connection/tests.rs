@@ -458,7 +458,9 @@ fn the_waiting_queue_admits_exactly_its_count_limit() {
 
 #[test]
 fn the_waiting_queue_admits_exactly_its_byte_limit() {
-    let peer = slow(Duration::from_millis(300));
+    // The active request is answered only after every admission below, so
+    // the worker frees no queue room meanwhile, however slow the machine.
+    let peer = slow(Duration::from_secs(2));
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
     let active = submit(&connection, &operation, Request::GetNumeric(address(1)));
