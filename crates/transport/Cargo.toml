@@ -1,0 +1,11 @@
+[package]
+name = "urx-device-transport"
+# Generated from the root package.json version by scripts/version.mjs (V5).
+version = "0.1.0"
+description = "Device Center transport for YAMAHA URX series audio interfaces"
+license = "MIT"
+edition = "2021"
+publish = false
+
+[lib]
+name = "urx_device_transport"
