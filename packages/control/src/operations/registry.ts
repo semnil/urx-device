@@ -121,6 +121,21 @@ import {
   oscillatorOn,
 } from "./oscillator.js";
 import {
+  deviceAutoPowerOff,
+  deviceAutoPowerOffTime,
+  deviceBrightness,
+  deviceConsoleLock,
+  deviceDateFormat,
+  deviceFollowUsb,
+  deviceHdmiHdcp,
+  deviceHdmiInputChannels,
+  deviceLanguage,
+  deviceSampleRate,
+  deviceTimeFormat,
+  deviceTimeZoneIndex,
+  deviceUsbSuppression,
+} from "./device.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -299,6 +314,19 @@ export const settingHandlers: SettingHandlers = {
   "oscillator.burst-width": oscillatorBurstWidth,
   "oscillator.burst-interval": oscillatorBurstInterval,
   "oscillator.assign": oscillatorAssign,
+  "device.brightness": deviceBrightness,
+  "device.auto-power-off": deviceAutoPowerOff,
+  "device.auto-power-off-time": deviceAutoPowerOffTime,
+  "device.language": deviceLanguage,
+  "device.usb-suppression": deviceUsbSuppression,
+  "device.date-format": deviceDateFormat,
+  "device.time-format": deviceTimeFormat,
+  "device.time-zone-index": deviceTimeZoneIndex,
+  "device.hdmi-hdcp": deviceHdmiHdcp,
+  "device.hdmi-input-channels": deviceHdmiInputChannels,
+  "device.sample-rate": deviceSampleRate,
+  "device.follow-usb": deviceFollowUsb,
+  "device.console-lock": deviceConsoleLock,
 };
 
 function unknownId(): Promise<never> {

@@ -153,6 +153,16 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
 /** The codec of `rule` on `model` (only a port choice depends on the model). */
 export function codecOf(rule: ValueRule, model = ""): Codec {
   switch (rule.kind) {
+    case "numeric-set":
+      return {
+        text: false,
+        decode: (raw) => {
+          const value = /^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : undefined;
+          return value !== undefined && rule.values.includes(value) ? value : undefined;
+        },
+        // Exact membership: no rounding to the nearest member.
+        plan: (value) => (typeof value === "number" && rule.values.includes(value) ? { planned: value, raw: `${value}` } : undefined),
+      };
     case "selector":
       return {
         text: false,
@@ -752,13 +762,63 @@ export function outputRuleSetting<V>(rule: OutputSettingRule) {
   });
 }
 
-/** A device-wide setting whose handler is built from `rule`: the target has no keys. */
+/**
+ * A device-wide setting whose handler is built from `rule`: the target has no
+ * keys. A model without it is unsupported. With write prerequisites, a write
+ * or dry-run reads each applicable one in order first, stopping at the first
+ * that does not allow it; the connection-free preview refuses such a setting.
+ */
 export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
   const codec = codecOf(rule.value);
-  return handler<V>((model, target) => {
-    modelOf(model);
+  const resolve = (model: string, target: unknown) => {
+    const known = modelOf(model);
     targetOf<object>(target, []);
-    return { at: address(rule.address.paramId, rule.address.y), codec };
-  });
+    return rule.models === undefined || rule.models.includes(known)
+      ? { at: address(rule.address.paramId, rule.address.y), codec }
+      : refuse("unsupported_operation");
+  };
+  const base = handler<V>(resolve);
+  const checks = rule.writePrerequisites;
+  if (checks === undefined) {
+    return base;
+  }
+  const prepare = async (context: OperationContext) => {
+    for (const check of checks) {
+      if (!check.models.includes(context.model)) {
+        continue;
+      }
+      const { raw } = await readRawValue(context, address(check.paramId, check.y));
+      if (check.refused.includes(raw)) {
+        failed("precondition_failed");
+      }
+      if (!check.allowed.includes(raw)) {
+        failed("invalid_response");
+      }
+    }
+  };
+  const planned = (model: string, target: unknown, requested: V) => {
+    const { at } = resolve(model, target);
+    const result = codec.plan(requested);
+    return result === undefined || result === "unsupported"
+      ? refuse(result === "unsupported" ? "unsupported_operation" : "invalid_input")
+      : { at, raw: result.raw as I64Text, planned: result.planned as V };
+  };
+  return {
+    read: base.read,
+    plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      planned(model, target, requested);
+      return refuse("invalid_input");
+    },
+    async dryRun(context: OperationContext, target: unknown, requested: V): Promise<WritePlan<V>> {
+      const { planned: p } = planned(context.model, target, requested);
+      await prepare(context);
+      return { requested, planned: p };
+    },
+    async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      const { at, raw, planned: p } = planned(context.model, target, requested);
+      await prepare(context);
+      return writeRaw(context, at, raw, { requested, planned: p });
+    },
+  };
 }
 
