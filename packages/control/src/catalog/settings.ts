@@ -10,6 +10,7 @@ import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
 import type { SourceToken } from "./inputs.js";
 import type { PROCESSING_MODES } from "./processing.js";
 import type { SettingRule } from "./rules.js";
+import { SSMCS_RULES, type SSMCS_BANDS } from "./ssmcs.js";
 
 /** What every setting definition states, independent of its value types. */
 export interface SettingDefinitionBase {
@@ -74,6 +75,22 @@ export const settingDefinitions = frozen({
   "channel.eq.one-knob.on": { readable: true, writable: true, rule: EQ_RULES["channel.eq.one-knob.on"] },
   "channel.eq.one-knob.type": { readable: true, writable: true, rule: EQ_RULES["channel.eq.one-knob.type"] },
   "channel.eq.one-knob.level": { readable: true, writable: true, rule: EQ_RULES["channel.eq.one-knob.level"] },
+  "channel.ssmcs.preset": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.preset"] },
+  "channel.ssmcs.comp-drive": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp-drive"] },
+  "channel.ssmcs.morphing": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.morphing"] },
+  "channel.ssmcs.output-gain": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.output-gain"] },
+  "channel.ssmcs.comp.attack": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp.attack"] },
+  "channel.ssmcs.comp.release": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp.release"] },
+  "channel.ssmcs.comp.ratio": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp.ratio"] },
+  "channel.ssmcs.comp.knee": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp.knee"] },
+  "channel.ssmcs.sidechain.on": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.sidechain.on"] },
+  "channel.ssmcs.sidechain.q": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.sidechain.q"] },
+  "channel.ssmcs.sidechain.frequency": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.sidechain.frequency"] },
+  "channel.ssmcs.sidechain.gain": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.sidechain.gain"] },
+  "channel.ssmcs.eq.band.on": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.eq.band.on"] },
+  "channel.ssmcs.eq.band.frequency": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.eq.band.frequency"] },
+  "channel.ssmcs.eq.band.gain": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.eq.band.gain"] },
+  "channel.ssmcs.eq.band.q": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.eq.band.q"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -114,6 +131,13 @@ export interface ChannelBandTarget {
   readonly side?: undefined;
 }
 
+/** A mono channel and one SSMCS EQ band (F04-M). It takes no side. */
+export interface ChannelSsmcsBandTarget {
+  readonly channel: number;
+  readonly band: SsmcsBand;
+  readonly side?: undefined;
+}
+
 /** A channel with a side, required for side-specific fixed stereo settings. */
 export interface ChannelSideTarget {
   readonly channel: number;
@@ -147,6 +171,7 @@ export type EqBand = (typeof EQ_BANDS)[number];
 /** A band filter type; low takes `hpf`, high `lpf` (F04-E). */
 export type EqBandType = "peaking" | "shelving" | "hpf" | "lpf";
 export type EqOneKnobType = (typeof EQ_ONE_KNOB_TYPES)[number];
+export type SsmcsBand = (typeof SSMCS_BANDS)[number];
 
 /**
  * Each setting's target, observed value and requested value types (K35:
@@ -200,6 +225,22 @@ export interface SettingTypes {
   "channel.eq.one-knob.on": { target: ChannelTarget; value: boolean };
   "channel.eq.one-knob.type": { target: ChannelTarget; value: EqOneKnobType };
   "channel.eq.one-knob.level": { target: ChannelTarget; value: number };
+  "channel.ssmcs.preset": { target: ChannelTarget; value: number };
+  "channel.ssmcs.comp-drive": { target: ChannelTarget; value: number };
+  "channel.ssmcs.morphing": { target: ChannelTarget; value: number };
+  "channel.ssmcs.output-gain": { target: ChannelTarget; value: number };
+  "channel.ssmcs.comp.attack": { target: ChannelTarget; value: number };
+  "channel.ssmcs.comp.release": { target: ChannelTarget; value: number };
+  "channel.ssmcs.comp.ratio": { target: ChannelTarget; value: CompRatio };
+  "channel.ssmcs.comp.knee": { target: ChannelTarget; value: CompKnee };
+  "channel.ssmcs.sidechain.on": { target: ChannelTarget; value: boolean };
+  "channel.ssmcs.sidechain.q": { target: ChannelTarget; value: number };
+  "channel.ssmcs.sidechain.frequency": { target: ChannelTarget; value: number };
+  "channel.ssmcs.sidechain.gain": { target: ChannelTarget; value: number };
+  "channel.ssmcs.eq.band.on": { target: ChannelSsmcsBandTarget; value: boolean };
+  "channel.ssmcs.eq.band.frequency": { target: ChannelSsmcsBandTarget; value: number };
+  "channel.ssmcs.eq.band.gain": { target: ChannelSsmcsBandTarget; value: number };
+  "channel.ssmcs.eq.band.q": { target: ChannelSsmcsBandTarget; value: number };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

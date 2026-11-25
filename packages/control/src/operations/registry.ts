@@ -48,6 +48,24 @@ import {
   eqOneKnobType,
 } from "./eq.js";
 import {
+  ssmcsCompAttack,
+  ssmcsCompDrive,
+  ssmcsCompKnee,
+  ssmcsCompRatio,
+  ssmcsCompRelease,
+  ssmcsEqBandFrequency,
+  ssmcsEqBandGain,
+  ssmcsEqBandOn,
+  ssmcsEqBandQ,
+  ssmcsMorphing,
+  ssmcsOutputGain,
+  ssmcsPreset,
+  ssmcsSidechainFrequency,
+  ssmcsSidechainGain,
+  ssmcsSidechainOn,
+  ssmcsSidechainQ,
+} from "./ssmcs.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -141,6 +159,22 @@ export const settingHandlers: SettingHandlers = {
   "channel.eq.one-knob.on": eqOneKnobOn,
   "channel.eq.one-knob.type": eqOneKnobType,
   "channel.eq.one-knob.level": eqOneKnobLevel,
+  "channel.ssmcs.preset": ssmcsPreset,
+  "channel.ssmcs.comp-drive": ssmcsCompDrive,
+  "channel.ssmcs.morphing": ssmcsMorphing,
+  "channel.ssmcs.output-gain": ssmcsOutputGain,
+  "channel.ssmcs.comp.attack": ssmcsCompAttack,
+  "channel.ssmcs.comp.release": ssmcsCompRelease,
+  "channel.ssmcs.comp.ratio": ssmcsCompRatio,
+  "channel.ssmcs.comp.knee": ssmcsCompKnee,
+  "channel.ssmcs.sidechain.on": ssmcsSidechainOn,
+  "channel.ssmcs.sidechain.q": ssmcsSidechainQ,
+  "channel.ssmcs.sidechain.frequency": ssmcsSidechainFrequency,
+  "channel.ssmcs.sidechain.gain": ssmcsSidechainGain,
+  "channel.ssmcs.eq.band.on": ssmcsEqBandOn,
+  "channel.ssmcs.eq.band.frequency": ssmcsEqBandFrequency,
+  "channel.ssmcs.eq.band.gain": ssmcsEqBandGain,
+  "channel.ssmcs.eq.band.q": ssmcsEqBandQ,
 };
 
 function unknownId(): Promise<never> {

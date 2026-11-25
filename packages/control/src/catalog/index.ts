@@ -35,10 +35,18 @@ export type {
   SettingRule,
   StopsRule,
   SwitchRule,
+  TextIndexRule,
   ValueRule,
   ValueUnit,
 } from "./rules.js";
 export { EQ_BANDS, EQ_ONE_KNOB_TYPES, EQ_RULES } from "./eq.js";
+export {
+  SSMCS_BANDS,
+  SSMCS_FREQUENCY_STEPS_DECIHZ,
+  SSMCS_PRESET_LABELS,
+  SSMCS_Q_STEPS_CENTI,
+  SSMCS_RULES,
+} from "./ssmcs.js";
 export { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "./dynamics-stops.js";
 export {
   HPF_FREQUENCY_ID,
@@ -58,6 +66,8 @@ export type {
   CompKnee,
   CompRatio,
   ChannelBandTarget,
+  ChannelSsmcsBandTarget,
+  SsmcsBand,
   EqBand,
   EqBandType,
   EqOneKnobType,
