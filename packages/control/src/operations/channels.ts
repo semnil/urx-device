@@ -6,6 +6,9 @@ import {
   CHANNEL_COLORS,
   IDENTITY_PARAMS,
   NAME_MAX_CODE_POINTS,
+  REC_POINTS,
+  REC_POINT_PARAMS,
+  STEREO_REC_POINTS,
   MONO_PAIRS,
   PAIR_PARAMS,
   CHANNEL_PARAMS,
@@ -26,6 +29,7 @@ import type {
   FaderLevel,
   PanMode,
   Polarity,
+  RecPoint,
 } from "../catalog/settings.js";
 import { OperationFailureError } from "./failure.js";
 import type { OperationContext } from "./context.js";
@@ -301,3 +305,44 @@ function planColor(value: unknown): { planned: ChannelColor; raw: I64Text } | un
 
 /** A channel's palette color (F03-K). */
 export const channelColor = channelSetting(IDENTITY_PARAMS.color, decodeColor, planColor);
+
+/** The Rec Point stages a channel kind has (F03-R). */
+function recPointsOf(channel: ChannelIndex): readonly RecPoint[] {
+  return channel.kind === "mono" ? REC_POINTS : STEREO_REC_POINTS;
+}
+
+function recPointPlan(model: string, target: ChannelTarget, value: RecPoint) {
+  const channel = wholeChannel(model, target);
+  // Only the channel kind's own stages; a request is sent as given, even
+  // pre-eq on a mono channel in SSMCS mode.
+  if (!recPointsOf(channel).includes(value)) {
+    return refuse("invalid_input");
+  }
+  return {
+    at: wholeAddress(REC_POINT_PARAMS, channel),
+    requested: value,
+    planned: value,
+    raw: `${REC_POINTS.indexOf(value)}`,
+  };
+}
+
+/** A channel's Rec Point (F03-R): one addressed read or write, no mode read. */
+export const channelRecPoint = {
+  read(context: OperationContext, target: ChannelTarget): Promise<Reading<RecPoint>> {
+    const channel = wholeChannel(context.model, target);
+    const stages = recPointsOf(channel);
+    return readDecoded(context, wholeAddress(REC_POINT_PARAMS, channel), (raw) => {
+      const index = decodeInteger(raw, 0, REC_POINTS.length - 1);
+      const stage = index === undefined ? undefined : REC_POINTS[index];
+      return stage !== undefined && stages.includes(stage) ? stage : undefined;
+    });
+  },
+  plan(model: string, target: ChannelTarget, value: RecPoint): WritePlan<RecPoint> {
+    const { requested, planned } = recPointPlan(model, target, value);
+    return { requested, planned };
+  },
+  write(context: OperationContext, target: ChannelTarget, value: RecPoint): Promise<WriteResult<RecPoint>> {
+    const { at, raw, requested, planned } = recPointPlan(context.model, target, value);
+    return writeRaw(context, at, raw, { requested, planned });
+  },
+};

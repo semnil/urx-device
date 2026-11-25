@@ -17,6 +17,7 @@ import {
   channelPan,
   channelPanMode,
   channelPolarity,
+  channelRecPoint,
   channelSource,
   channelStereoLink,
 } from "./channels.js";
@@ -71,6 +72,7 @@ export const settingHandlers: SettingHandlers = {
   "channel.pan-mode": channelPanMode,
   "channel.name": channelName,
   "channel.color": channelColor,
+  "channel.rec-point": channelRecPoint,
 };
 
 function unknownId(): Promise<never> {

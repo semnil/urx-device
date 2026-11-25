@@ -2,7 +2,7 @@
 // setting ID with its definition; operations bind every ID to a handler.
 // Rows are added per K35 catalog part (stages D7–D15).
 
-import type { CHANNEL_COLORS } from "./channels.js";
+import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
 import type { I64Text } from "./i64.js";
 import type { SourceToken } from "./inputs.js";
 
@@ -35,6 +35,7 @@ export const settingDefinitions = {
   "channel.pan-mode": { readable: true, writable: true },
   "channel.name": { readable: true, writable: true },
   "channel.color": { readable: true, writable: true },
+  "channel.rec-point": { readable: true, writable: true },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */
@@ -82,6 +83,8 @@ export type ChannelName = { kind: "text"; text: string } | { kind: "preset"; pre
 
 export type ChannelColor = (typeof CHANNEL_COLORS)[number];
 
+export type RecPoint = (typeof REC_POINTS)[number];
+
 /**
  * Each setting's target, observed value and requested value types (K35:
  * switches are boolean, levels are dB numbers).
@@ -102,6 +105,7 @@ export interface SettingTypes {
   "channel.pan-mode": { target: ChannelTarget; value: PanMode };
   "channel.name": { target: ChannelTarget; value: ChannelName; input: string };
   "channel.color": { target: ChannelTarget; value: ChannelColor };
+  "channel.rec-point": { target: ChannelTarget; value: RecPoint };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.
