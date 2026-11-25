@@ -139,7 +139,14 @@ fn check(
     control: &Control,
 ) -> Result<Option<DeviceEntry>, Failure> {
     let mut link = Link::connect(port, budget, PHASE, control)?;
-    let synchronize = get(&mut link, Request::GetSynchronize, false, options, budget)?;
+    let synchronize = get(
+        &mut link,
+        Request::GetSynchronize,
+        false,
+        options.request_deadline,
+        budget,
+        PHASE,
+    )?;
     let status = synchronize
         .get("sync_status")
         .and_then(Value::as_str)
@@ -155,7 +162,14 @@ fn check(
         .ok_or(Failure::cause(Cause::IdentityError, PHASE))?
         .to_string();
     let firmware = if options.metadata {
-        let device = get(&mut link, Request::GetDevice, true, options, budget)?;
+        let device = get(
+            &mut link,
+            Request::GetDevice,
+            true,
+            options.request_deadline,
+            budget,
+            PHASE,
+        )?;
         Some(system_firmware(&device).ok_or_else(malformed)?)
     } else {
         None
@@ -168,36 +182,46 @@ fn check(
     }))
 }
 
-/// Sends a GET and returns its reply's `data`. With `watch_lost`, a
-/// `/vd/synchronize` notification whose nonempty status is not `online`,
-/// received while waiting, fails it as `connection_lost`; replies and
-/// notifications without a readable status do not.
-fn get(
+/// Whether `message` is a `/vd/synchronize` notification whose nonempty
+/// status is not `online`: Device Center's push when the unit is unplugged.
+/// Replies and notifications without a readable status are not.
+pub(crate) fn lost_notification(message: &Value) -> bool {
+    let notification = message
+        .get("vdp")
+        .and_then(|vdp| vdp.get("method"))
+        .and_then(Value::as_str)
+        == Some("notify");
+    notification
+        && Inbound::new(message.clone())
+            .device_lost()
+            .is_some_and(|status| !status.is_empty())
+}
+
+/// Sends a GET and returns its reply's `data`, failing in `phase`. With
+/// `watch_lost`, a [`lost_notification`] received while waiting fails it as
+/// `connection_lost`.
+pub(crate) fn get(
     link: &mut Link<'_>,
     request: Request,
     watch_lost: bool,
-    options: &DiscoveryOptions,
+    request_deadline: Duration,
     budget: &Budget,
+    phase: Phase,
 ) -> Result<Value, Failure> {
-    link.send(&request.message(), options.request_deadline, budget)?;
+    link.send(&request.message(), request_deadline, budget)?;
     let key = request.reply_key();
-    link.await_frame(options.request_deadline, budget, |message| {
-        let inbound = Inbound::new(message.clone());
-        let notification = message
-            .get("vdp")
-            .and_then(|vdp| vdp.get("method"))
-            .and_then(Value::as_str)
-            == Some("notify");
-        if watch_lost
-            && notification
-            && inbound
-                .device_lost()
-                .is_some_and(|status| !status.is_empty())
-        {
-            return Some(Err(Failure::cause(Cause::ConnectionLost, PHASE)));
+    link.await_frame(request_deadline, budget, |message| {
+        if watch_lost && lost_notification(message) {
+            return Some(Err(Failure::cause(Cause::ConnectionLost, phase)));
         }
+        let inbound = Inbound::new(message.clone());
         let reply = inbound.reply(&key)?;
-        Some(reply.data().cloned().ok_or_else(malformed))
+        Some(
+            reply
+                .data()
+                .cloned()
+                .ok_or(Failure::cause(Cause::InvalidResponse, phase)),
+        )
     })
 }
 
@@ -206,7 +230,7 @@ fn get(
 /// `firm_list` array, an entry without a nonempty string `firm_name`, a System
 /// entry without a string `firm_version`, or System entries that disagree.
 /// Entry order does not change the result.
-fn system_firmware(device: &Value) -> Option<SystemFirmware> {
+pub(crate) fn system_firmware(device: &Value) -> Option<SystemFirmware> {
     let list = device.get("firm_list")?.as_array()?;
     let mut version: Option<&str> = None;
     for entry in list {

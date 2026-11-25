@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod connection;
 pub mod discovery;
 pub mod frame;
 pub mod i64_text;
