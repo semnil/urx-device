@@ -11,7 +11,11 @@ describe("operation context", () => {
       .script("getNumeric", { kind: "success", value: "42", evidence: { state: "read" } })
       .script("setText", { kind: "success", value: null, evidence: { state: "accepted" } });
     const context = new OperationContext(transport, "URX44");
-    expect(await context.getNumeric(address)).toEqual({ kind: "success", value: "42", evidence: { state: "read" } });
+    expect((await context.getNumeric(address)).record).toEqual({
+      kind: "success",
+      value: "42",
+      evidence: { state: "read" },
+    });
     expect(await context.setText(address, "Lead ")).toEqual({
       kind: "success",
       value: null,

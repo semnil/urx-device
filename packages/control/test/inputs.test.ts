@@ -212,3 +212,54 @@ describe("source gain (F03-G)", () => {
     expect(() => plan(-24.5)).toThrow();
   });
 });
+
+describe("review round 1 fixes", () => {
+  it("rounds a value just above −0.5 dB to 0 and keeps the midpoint rule", () => {
+    const plan = (value: number) => previewSetting("URX44", "input.gain", { input: 1 }, value).planned;
+    expect(plan(-0.49999999999999994)).toBe(0);
+    expect(plan(-0.5)).toBe(-1);
+    expect(plan(0.5)).toBe(0);
+    expect(plan(0.5000000000000001)).toBe(1);
+    expect(plan(69.5)).toBe(69);
+  });
+
+  it("keeps the plan when a write has no trusted record", async () => {
+    const plan = { requested: 3, planned: 3 };
+    const rejected = new FakeTransport().script("setNumeric", new Error("bridge"));
+    const c = new OperationContext(rejected, "URX44", () => at);
+    expect(await failureOf(writeSetting(c, "input.gain", { input: 1 }, 3))).toEqual({
+      code: "internal_error",
+      phase: "delivery",
+      progress: { ...plan, outcome: "uncertain" },
+    });
+    const malformed = new FakeTransport().script("setNumeric", { kind: "success", value: 1, evidence: { state: "accepted" } });
+    const m = new OperationContext(malformed, "URX44", () => at);
+    expect((await failureOf(writeSetting(m, "input.gain", { input: 1 }, 3)))?.progress).toEqual({
+      ...plan,
+      outcome: "uncertain",
+    });
+    const noTicket = new FakeTransport();
+    noTicket.newRequestTicket = () => {
+      throw new Error("no ticket");
+    };
+    const n = new OperationContext(noTicket, "URX44", () => at);
+    expect(await failureOf(writeSetting(n, "input.gain", { input: 1 }, 3))).toEqual({
+      code: "internal_error",
+      phase: "admission",
+      progress: { ...plan, outcome: "not_sent" },
+    });
+    expect(noTicket.calls).toEqual([]);
+  });
+
+  it("stamps a read with its receipt time, not the end of a slow adoption", async () => {
+    let now = Date.parse("2026-11-20T00:00:00.000Z");
+    const transport = new FakeTransport().script("getNumeric", read("100"));
+    const adopt = transport.adoptResult.bind(transport);
+    transport.adoptResult = async (ticket: string) => {
+      now += 2500;
+      await adopt(ticket);
+    };
+    const c = new OperationContext(transport, "URX44", () => new Date(now));
+    expect((await readSetting(c, "input.gain", { input: 1 })).observedAt).toBe("2026-11-20T00:00:00.000Z");
+  });
+});

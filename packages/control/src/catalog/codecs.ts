@@ -25,8 +25,10 @@ export function planWholeDb(requested: number, minDb: number, maxDb: number): nu
   if (!Number.isFinite(requested) || requested < minDb || requested > maxDb) {
     return undefined;
   }
-  // Nearest integer, a tie going down: x - 0.5 rounded up.
-  const planned = Math.ceil(requested - 0.5);
+  // Nearest integer, a tie going down. Compared with the exact midpoint, so
+  // no subtraction rounds a value just above it onto it.
+  const floor = Math.floor(requested);
+  const planned = requested > floor + 0.5 ? floor + 1 : floor;
   return Object.is(planned, -0) ? 0 : planned;
 }
 

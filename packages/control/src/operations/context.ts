@@ -17,6 +17,12 @@ import {
 } from "./native.js";
 import type { ParameterAddress, Transport, TransportOperation } from "./transport.js";
 
+/** A validated record and its PC receipt time. */
+export interface Received<T> {
+  readonly record: T;
+  readonly observedAt: string;
+}
+
 /** Runs `call`, turning a throw or a rejection into false. */
 async function settle(call: () => Promise<void>): Promise<boolean> {
   try {
@@ -82,24 +88,24 @@ export class OperationContext {
     this.#operation.finish();
   }
 
-  getNumeric(address: ParameterAddress): Promise<NativeNumericReadResult> {
+  getNumeric(address: ParameterAddress): Promise<Received<NativeNumericReadResult>> {
     return this.#issue((request) => this.transport.getNumeric(address, request), validateNumericRead);
   }
 
-  getText(address: ParameterAddress): Promise<NativeTextReadResult> {
+  getText(address: ParameterAddress): Promise<Received<NativeTextReadResult>> {
     return this.#issue((request) => this.transport.getText(address, request), validateTextRead);
   }
 
-  getName(address: ParameterAddress): Promise<NativeNameReadResult> {
+  getName(address: ParameterAddress): Promise<Received<NativeNameReadResult>> {
     return this.#issue((request) => this.transport.getName(address, request), validateNameRead);
   }
 
-  setNumeric(address: ParameterAddress, value: I64Text): Promise<NativePostResult> {
-    return this.#issue((request) => this.transport.setNumeric(address, value, request), validatePost);
+  async setNumeric(address: ParameterAddress, value: I64Text): Promise<NativePostResult> {
+    return (await this.#issue((request) => this.transport.setNumeric(address, value, request), validatePost)).record;
   }
 
-  setText(address: ParameterAddress, value: string): Promise<NativePostResult> {
-    return this.#issue((request) => this.transport.setText(address, value, request), validatePost);
+  async setText(address: ParameterAddress, value: string): Promise<NativePostResult> {
+    return (await this.#issue((request) => this.transport.setText(address, value, request), validatePost)).record;
   }
 
   /**
@@ -115,9 +121,15 @@ export class OperationContext {
   async #issue<T>(
     send: (request: { operation: TransportOperation; requestTicket: string }) => Promise<unknown>,
     validate: (record: unknown) => T | undefined,
-  ): Promise<T> {
-    // Issued by the connection, so it releases only this request's slot.
-    const requestTicket = this.transport.newRequestTicket();
+  ): Promise<Received<T>> {
+    // Issued by the connection, so it releases only this request's slot. A
+    // failure here is before the request was handed over: nothing was sent.
+    let requestTicket: string;
+    try {
+      requestTicket = this.transport.newRequestTicket();
+    } catch {
+      throw new OperationFailureError({ code: "internal_error", phase: "admission", progress: null });
+    }
     // Awaited, so the slot is handed over before the caller can finish:
     // when the report itself fails, the connection's end takes the slot.
     const reportUndelivered = async () => {
@@ -136,18 +148,20 @@ export class OperationContext {
       // A rejected native promise is not evidence of anything (K33).
       throw await undelivered();
     }
+    // The PC receipt time (O5), before any wait for the adoption.
+    const observedAt = this.now();
     const record = validate(raw);
     if (record === undefined) {
       // Its claimed evidence is not adopted (K34).
       throw await undelivered();
     }
     if (await settle(() => this.transport.adoptResult(requestTicket))) {
-      return record;
+      return { record, observedAt };
     }
     // Established evidence could not be delivered normally: a success fails
     // at delivery keeping its evidence; a failure (a rejection included)
     // stays as received (K34).
     await reportUndelivered();
-    return atDelivery(record);
+    return { record: atDelivery(record), observedAt };
   }
 }

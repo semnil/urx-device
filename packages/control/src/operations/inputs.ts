@@ -56,21 +56,27 @@ function sourceOf(model: string, target: unknown): (typeof SOURCE_GAIN)[keyof ty
   return entry.models.includes(known) ? entry : refuse("unsupported_operation");
 }
 
-/** The read-only value of a numeric read, or the failure it reports. */
-async function readRaw(context: OperationContext, at: ParameterAddress): Promise<I64Text> {
-  const record = await context.getNumeric(at);
+/** The raw value of a numeric read and its receipt time, or the failure it reports. */
+async function readRaw(context: OperationContext, at: ParameterAddress): Promise<{ raw: I64Text; observedAt: string }> {
+  const { record, observedAt } = await context.getNumeric(at);
   if (record.kind === "failure") {
     throw context.failureOf(record, null);
   }
-  return record.value;
+  return { raw: record.value, observedAt };
 }
 
-function decoded<V>(value: V | undefined, context: OperationContext): Reading<V> {
+async function readDecoded<V>(
+  context: OperationContext,
+  at: ParameterAddress,
+  decode: (raw: I64Text) => V | undefined,
+): Promise<Reading<V>> {
+  const { raw, observedAt } = await readRaw(context, at);
+  const value = decode(raw);
   if (value === undefined) {
     // A raw value outside the definition is malformed, not a default.
     throw new OperationFailureError({ code: "invalid_response", phase: "response", progress: null });
   }
-  return { value, observedAt: context.now() };
+  return { value, observedAt };
 }
 
 function outcomeOf(evidence: PostEvidence): WriteOutcome {
@@ -93,7 +99,20 @@ async function writeRaw<V>(
   raw: I64Text,
   plan: WritePlan<V>,
 ): Promise<WriteResult<V>> {
-  const record: NativePostResult = await context.setNumeric(at, raw);
+  let record: NativePostResult;
+  try {
+    record = await context.setNumeric(at, raw);
+  } catch (error) {
+    // No trusted record: unsent when it failed before the request was
+    // handed over, otherwise possibly sent (K34). The plan is kept.
+    const failure = error instanceof OperationFailureError ? error.failure : undefined;
+    const outcome: WriteOutcome = failure?.phase === "admission" ? "not_sent" : "uncertain";
+    throw new OperationFailureError<WriteProgress<V>>({
+      code: failure?.code ?? "internal_error",
+      phase: failure?.phase ?? "delivery",
+      progress: { ...plan, outcome },
+    });
+  }
   if (record.kind === "success") {
     return { ...plan, outcome: "accepted" };
   }
@@ -113,9 +132,8 @@ function inputSwitch(paramId: number, hiZ = false) {
     return typeof value === "boolean" ? { requested: value, planned: value, jack } : refuse("invalid_input");
   };
   return {
-    async read(context: OperationContext, target: InputTarget): Promise<Reading<boolean>> {
-      const raw = await readRaw(context, address(paramId, jackOf(context.model, target, hiZ)));
-      return decoded(decodeSwitch(raw), context);
+    read(context: OperationContext, target: InputTarget): Promise<Reading<boolean>> {
+      return readDecoded(context, address(paramId, jackOf(context.model, target, hiZ)), decodeSwitch);
     },
     plan(model: string, target: InputTarget, value: boolean): WritePlan<boolean> {
       const { requested, planned } = plan(model, target, value);
@@ -135,9 +153,10 @@ function inputGainPlan(model: string, target: InputTarget, value: number) {
 }
 
 export const inputGain = {
-  async read(context: OperationContext, target: InputTarget): Promise<Reading<number>> {
-    const raw = await readRaw(context, address(INPUT_PARAMS.gain, jackOf(context.model, target)));
-    return decoded(decodeCentiDb(raw, INPUT_GAIN_DB.min, INPUT_GAIN_DB.max), context);
+  read(context: OperationContext, target: InputTarget): Promise<Reading<number>> {
+    return readDecoded(context, address(INPUT_PARAMS.gain, jackOf(context.model, target)), (raw) =>
+      decodeCentiDb(raw, INPUT_GAIN_DB.min, INPUT_GAIN_DB.max),
+    );
   },
   plan(model: string, target: InputTarget, value: number): WritePlan<number> {
     const { requested, planned } = inputGainPlan(model, target, value);
@@ -154,9 +173,8 @@ export const inputHiZ = inputSwitch(INPUT_PARAMS.hiZ, true);
 export const inputClipSafe = inputSwitch(INPUT_PARAMS.clipSafe);
 
 export const inputClipSafeActive = {
-  async read(context: OperationContext, target: InputTarget): Promise<Reading<boolean>> {
-    const raw = await readRaw(context, address(INPUT_PARAMS.clipSafeActive, jackOf(context.model, target)));
-    return decoded(decodeSwitch(raw), context);
+  read(context: OperationContext, target: InputTarget): Promise<Reading<boolean>> {
+    return readDecoded(context, address(INPUT_PARAMS.clipSafeActive, jackOf(context.model, target)), decodeSwitch);
   },
 };
 
@@ -175,11 +193,12 @@ function sourceGainPlan(model: string, target: SourceTarget, value: number) {
 }
 
 export const sourceGain = {
-  async read(context: OperationContext, target: SourceTarget): Promise<Reading<number>> {
+  read(context: OperationContext, target: SourceTarget): Promise<Reading<number>> {
     const source = sourceOf(context.model, target);
     // The first catalog instance only; not a claim about both lanes.
-    const raw = await readRaw(context, address(source.paramId, source.instances[0] as number));
-    return decoded(decodeCentiDb(raw, SOURCE_GAIN_DB.min, SOURCE_GAIN_DB.max), context);
+    return readDecoded(context, address(source.paramId, source.instances[0] as number), (raw) =>
+      decodeCentiDb(raw, SOURCE_GAIN_DB.min, SOURCE_GAIN_DB.max),
+    );
   },
   plan(model: string, target: SourceTarget, value: number): WritePlan<number> {
     const { requested, planned } = sourceGainPlan(model, target, value);
