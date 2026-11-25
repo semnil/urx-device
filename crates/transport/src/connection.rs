@@ -313,7 +313,12 @@ impl Connection {
         }
         let _ = self.events.send(Event::Wake);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            // Closing from a completion callback runs on the worker itself,
+            // which cannot wait for its own end: it stops on its own once
+            // the callback returns and it finds the connection closing.
+            if worker.thread().id() != thread::current().id() {
+                let _ = worker.join();
+            }
         }
         self.reader_stop.store(true, Ordering::SeqCst);
         let _ = self.sock.shutdown(Shutdown::Both);

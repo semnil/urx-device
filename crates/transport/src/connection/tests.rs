@@ -843,3 +843,44 @@ fn a_panicking_callback_does_not_stop_other_completions() {
     );
     connection.close();
 }
+
+#[test]
+fn releasing_the_connection_from_a_completion_callback_does_not_deadlock() {
+    for lose in [false, true] {
+        let peer = if lose {
+            unit(|_| {
+                vec![line(
+                    json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "lost" } } }),
+                )]
+            })
+        } else {
+            unit(plain)
+        };
+        let connection = Arc::new(connect(&peer));
+        let operation = connection.create_operation().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let last = Arc::clone(&connection);
+        let waiting = submit(&connection, &operation, Request::GetNumeric(address(9)));
+        connection.submit(
+            &operation,
+            Request::GetNumeric(address(1)),
+            move |outcome| {
+                drop(last);
+                let _ = tx.send(outcome);
+            },
+        );
+        drop(operation);
+        drop(connection);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the callback finished");
+        assert!(matches!(
+            result,
+            Outcome::Success { .. } | Outcome::Failure { .. }
+        ));
+        assert!(
+            waiting.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the earlier request completed"
+        );
+    }
+}
