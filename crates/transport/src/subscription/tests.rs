@@ -1,6 +1,6 @@
 use super::{
-    Ledger, Refusal, SubscriptionAddress, Verdict, MAX_ADDRESSES_PER_ACQUISITION, MAX_MEMBERSHIPS,
-    MAX_TOKENS,
+    Ledger, Refusal, StartRefusal, SubscriptionAddress, Verdict, MAX_ADDRESSES_PER_ACQUISITION,
+    MAX_MEMBERSHIPS, MAX_TOKENS,
 };
 use crate::wire::{MeterAddress, ParameterAddress};
 
@@ -107,12 +107,12 @@ fn a_registration_with_an_unknown_result_is_cleaned_up_as_possibly_registered() 
     assert_eq!(ledger.start_ok(token), [p(1), p(2)]);
     ledger.registered(p(1), Verdict::Unknown);
     assert_eq!(ledger.begin_release(token), [p(1)], "p2 was never sent");
-    // The cleanup's own unregistration is unconfirmed too: a token started
-    // after it does not register an address that may still be registered.
+    // An unconfirmed cleanup leaves the registrations unknown: nothing
+    // starts on this connection afterwards.
     let other = ledger.admit(&[p(1)]).unwrap();
     ledger.unregistered(p(1), Verdict::Unknown);
     ledger.finish(token);
-    assert_eq!(ledger.start_ok(other), []);
+    assert_eq!(ledger.start(other), Err(StartRefusal::Unusable));
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn an_address_taken_by_a_new_owner_during_its_unregistration_is_registered_again
     let new = ledger.admit(&[p(1)]).unwrap();
     assert_eq!(
         ledger.start(new),
-        Err(super::Busy),
+        Err(StartRefusal::Busy),
         "not before the release finishes"
     );
     ledger.unregistered(p(1), Verdict::Accepted);
@@ -330,25 +330,56 @@ fn only_an_activating_token_becomes_active() {
 
 #[test]
 fn no_activation_starts_while_a_release_or_cleanup_is_unfinished() {
-    for verdict in [Verdict::Accepted, Verdict::Rejected, Verdict::Unknown] {
+    let mut ledger = Ledger::new();
+    let old = active(&mut ledger, &[p(1), p(2)]);
+    assert_eq!(ledger.begin_release(old), [p(1), p(2)]);
+    let next = ledger.admit(&[p(1), p(2)]).unwrap();
+    assert_eq!(ledger.recipients(p(1)), [next], "it receives while waiting");
+    assert_eq!(ledger.start(next), Err(StartRefusal::Busy));
+    ledger.unregistered(p(1), Verdict::Accepted);
+    assert_eq!(
+        ledger.start(next),
+        Err(StartRefusal::Busy),
+        "one verdict of two"
+    );
+    ledger.unregistered(p(2), Verdict::Accepted);
+    assert_eq!(
+        ledger.start(next),
+        Err(StartRefusal::Busy),
+        "not finished yet"
+    );
+    ledger.finish(old);
+    assert_eq!(ledger.start_ok(next), [p(1), p(2)]);
+}
+
+#[test]
+fn a_failed_or_unanswered_unregistration_refuses_every_later_activation() {
+    for (meter, outcome) in [
+        (false, Some(Verdict::Rejected)),
+        (true, Some(Verdict::Unknown)),
+        (false, None),
+    ] {
+        let address = if meter { m(1) } else { p(1) };
         let mut ledger = Ledger::new();
-        let old = active(&mut ledger, &[p(1), p(2)]);
+        let old = active(&mut ledger, &[address, p(2)]);
         let sent = ledger.begin_release(old);
-        assert_eq!(sent, [p(1), p(2)]);
-        let next = ledger.admit(&[p(1), p(2)]).unwrap();
-        assert_eq!(ledger.recipients(p(1)), [next], "it receives while waiting");
-        assert_eq!(ledger.start(next), Err(super::Busy));
-        ledger.unregistered(p(1), verdict);
-        assert_eq!(ledger.start(next), Err(super::Busy), "one verdict of two");
+        assert_eq!(sent, [address, p(2)]);
+        let overlapping = ledger.admit(&[address]).unwrap();
+        let separate = ledger.admit(&[p(3)]).unwrap();
         ledger.unregistered(p(2), Verdict::Accepted);
-        assert_eq!(ledger.start(next), Err(super::Busy), "not finished yet");
+        if let Some(verdict) = outcome {
+            ledger.unregistered(address, verdict);
+        }
         ledger.finish(old);
-        let needed = ledger.start_ok(next);
-        match verdict {
-            Verdict::Accepted => assert_eq!(needed, [p(1), p(2)]),
-            // Still registered (rejected) or possibly registered (unknown):
-            // not sent again.
-            Verdict::Rejected | Verdict::Unknown => assert_eq!(needed, [p(2)], "{verdict:?}"),
+        assert_eq!(ledger.token_count(), 2, "capacity is still freed");
+        for token in [overlapping, separate] {
+            assert_eq!(
+                ledger.start(token),
+                Err(StartRefusal::Unusable),
+                "{outcome:?}"
+            );
+            ledger.activate(token);
+            assert!(!ledger.is_active(token));
         }
     }
 }

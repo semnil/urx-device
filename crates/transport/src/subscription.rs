@@ -46,9 +46,15 @@ pub enum Refusal {
     TooManyMemberships,
 }
 
-/// A release or cleanup is still in progress; see [`Ledger::start`].
+/// Why [`Ledger::start`] refused to start an activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Busy;
+pub enum StartRefusal {
+    /// A release or cleanup is still in progress.
+    Busy,
+    /// An unregistration was rejected, left unconfirmed or never completed:
+    /// the connection's registrations are no longer known, and K10 ends it.
+    Unusable,
+}
 
 /// What a registration or unregistration reply established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +107,10 @@ pub struct Ledger {
     entries: HashMap<SubscriptionAddress, Entry>,
     memberships: usize,
     next: u64,
+    /// Unregistrations named by a release and not yet answered.
+    unanswered: HashSet<SubscriptionAddress>,
+    /// Set once an unregistration fails or a release finishes unanswered.
+    unusable: bool,
 }
 
 impl Ledger {
@@ -158,16 +168,20 @@ impl Ledger {
     /// activating or active token are not sent again. Only a provisional token
     /// starts; any other returns nothing.
     ///
-    /// A release or cleanup that has not finished makes this `Err(Busy)`: its
+    /// A release or cleanup that has not finished refuses with `Busy`: its
     /// unregistrations decide what is still registered, so an activation can
     /// start only after their verdicts are recorded and [`Ledger::finish`] ran.
-    pub fn start(&mut self, token: TokenId) -> Result<Vec<SubscriptionAddress>, Busy> {
+    /// Once an unregistration has failed, every start refuses with `Unusable`.
+    pub fn start(&mut self, token: TokenId) -> Result<Vec<SubscriptionAddress>, StartRefusal> {
+        if self.unusable {
+            return Err(StartRefusal::Unusable);
+        }
         if self
             .tokens
             .values()
             .any(|token| token.state == TokenState::Releasing)
         {
-            return Err(Busy);
+            return Err(StartRefusal::Busy);
         }
         let Some(token) = self.tokens.get_mut(&token) else {
             return Ok(Vec::new());
@@ -238,6 +252,7 @@ impl Ledger {
                 entry.holders -= 1;
                 if entry.holders == 0 && entry.registration != Registration::NotRegistered {
                     unregister.push(*address);
+                    self.unanswered.insert(*address);
                     continue;
                 }
             }
@@ -250,8 +265,13 @@ impl Ledger {
 
     /// Records the verdict of an unregistration sent for `address`. An
     /// accepted one forgets the address unless a new owner has taken it
-    /// meanwhile, which then needs it registered again.
+    /// meanwhile, which then needs it registered again; any other verdict
+    /// makes the ledger unusable for further activations.
     pub fn unregistered(&mut self, address: SubscriptionAddress, verdict: Verdict) {
+        self.unanswered.remove(&address);
+        if verdict != Verdict::Accepted {
+            self.unusable = true;
+        }
         let Some(entry) = self.entries.get_mut(&address) else {
             return;
         };
@@ -267,10 +287,17 @@ impl Ledger {
         }
     }
 
-    /// Forgets a token whose release has finished, freeing its capacity.
+    /// Forgets a token whose release has finished, freeing its capacity. An
+    /// unregistration it named that was never answered makes the ledger
+    /// unusable for further activations.
     pub fn finish(&mut self, token: TokenId) {
         if let Some(token) = self.tokens.remove(&token) {
             self.memberships -= token.addresses.len();
+            for address in &token.addresses {
+                if self.unanswered.remove(address) {
+                    self.unusable = true;
+                }
+            }
         }
     }
 
