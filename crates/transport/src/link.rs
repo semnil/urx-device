@@ -68,16 +68,18 @@ struct Bound {
     expired: Cause,
 }
 
-/// Whichever of cancellation and expiry of `bound` happened first; otherwise
-/// the time left in `bound`.
+/// Whichever of cancellation and expiry of `bound` happened first, decided
+/// from the first cancellation time and the bound's end alone (a tie is
+/// expiry); otherwise the time left in `bound`.
 fn stop(control: &Control, bound: &Bound, phase: Phase) -> Result<Duration, Failure> {
-    let now = Instant::now();
     if let Some(cancelled) = control.cancelled_at() {
-        if cancelled < bound.end || now < bound.end {
-            return Err(Failure::Cancelled { phase });
-        }
+        return Err(if cancelled < bound.end {
+            Failure::Cancelled { phase }
+        } else {
+            Failure::cause(bound.expired, phase)
+        });
     }
-    let remaining = bound.end.saturating_duration_since(now);
+    let remaining = bound.end.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(Failure::cause(bound.expired, phase));
     }
@@ -279,6 +281,20 @@ mod tests {
                 phase: Phase::Discovery
             }),
             "cancelled with time left"
+        );
+    }
+
+    #[test]
+    fn a_cancellation_at_the_end_is_expiry() {
+        let control = Control::new();
+        control.cancel();
+        let at = control.cancelled_at().unwrap();
+        assert_eq!(
+            stop(&control, &bound(at), Phase::Discovery),
+            Err(Failure::Cause {
+                code: Cause::ResponseTimeout,
+                phase: Phase::Discovery
+            })
         );
     }
 
