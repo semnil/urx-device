@@ -30,7 +30,7 @@ cargo test --workspace --locked
 
 ## Versioning
 
-The root `package.json` `version` is the only hand-edited version. `pnpm version:write` regenerates the package and crate versions from it, and `pnpm version:check` fails when they differ.
+The root `package.json` `version` is the only hand-edited version. `pnpm version:write` regenerates the package and crate versions and the crate's `Cargo.lock` entry from it, and `pnpm version:check` fails when any of them differs.
 
 ## Contributing
 

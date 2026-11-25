@@ -57,7 +57,7 @@ Observing the protocol from outside — sending a request and recording what com
 
 ## Versioning and adoption
 
-- The root `package.json` `version` is the only hand-edited version; `pnpm version:write` regenerates the package and crate versions, and CI fails on drift
+- The root `package.json` `version` is the only hand-edited version; `pnpm version:write` regenerates the package and crate versions and the crate's `Cargo.lock` entry, and CI fails on drift
 - A version change is a pull request that carries nothing else (`chore(release): X.Y.Z`). A released tag `vX.Y.Z` matches that version and is never moved or rewritten
 - A change lands here first; each application adopts a pinned commit in its own pull request with its own checks. A green run here is not evidence for either application. Fixes are never made inside a consumer's submodule checkout
 

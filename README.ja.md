@@ -30,7 +30,7 @@ cargo test --workspace --locked
 
 ## 版
 
-手で書き換える版はルートの `package.json` の `version` だけ。`pnpm version:write` がパッケージとクレートの版をそこから作り直し、`pnpm version:check` は両者が違うと失敗する。
+手で書き換える版はルートの `package.json` の `version` だけ。`pnpm version:write` がパッケージとクレートの版と、`Cargo.lock` のクレートの項目の版をそこから作り直し、`pnpm version:check` はどれかが違うと失敗する。
 
 ## 協力
 
