@@ -27,8 +27,8 @@ use std::net::{Shutdown, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 /// Waiting requests, excluding the active one (K6).
@@ -74,6 +74,8 @@ struct State {
     waiting: VecDeque<Item>,
     waiting_bytes: usize,
     closing: bool,
+    /// Whether the worker holds a request it has not yet settled.
+    active: bool,
     terminal: Option<RequestCause>,
     cancelled_owners: Vec<u64>,
     next_owner: u64,
@@ -85,6 +87,8 @@ struct Shared {
     /// before reporting it, and the worker starts each write while holding
     /// this lock, so a write never starts after the end is recorded.
     link_end: Mutex<Option<RequestCause>>,
+    /// Signalled when the worker settles its active request.
+    settled: Condvar,
 }
 
 impl Shared {
@@ -107,16 +111,60 @@ enum Event {
     ReadFailed(RequestCause),
 }
 
-/// An open connection to one unit.
+/// An open connection to one unit. It is shared by reference: closing takes
+/// `&self`, and every call to [`Connection::close`] joins the same close.
 pub struct Connection {
     generation: u64,
     firmware: SystemFirmware,
     shared: Arc<Shared>,
     events: Sender<Event>,
-    sock: TcpStream,
+    /// Taken and dropped by the close, so no descriptor outlives it.
+    sock: Mutex<Option<TcpStream>>,
     reader_stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-    reader: Option<JoinHandle<()>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    /// Kept apart from the handle, which a close takes.
+    worker_id: ThreadId,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    close: Arc<CloseCell>,
+}
+
+/// The one close of a connection, shared with the helper that finishes a
+/// close started from a completion callback.
+struct CloseCell {
+    state: Mutex<CloseState>,
+    done: Condvar,
+    /// Threads the close waits for, which must not wait for the close.
+    exempt: Mutex<Vec<ThreadId>>,
+}
+
+impl CloseCell {
+    fn record(&self, outcome: CloseOutcome) {
+        *lock(&self.state) = CloseState::Done(outcome);
+        self.done.notify_all();
+    }
+}
+
+/// How a close ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// Both threads finished and the socket is closed.
+    Closed,
+    /// Called on a thread the close cannot wait for: the worker, from a
+    /// completion callback, or the closing thread itself. Closing has started
+    /// and finishes without this call; callers on other threads wait for and
+    /// receive the final outcome.
+    Started,
+    /// The worker or the reader did not finish within the teardown budget.
+    /// The connection
+    /// is unusable; its socket is shut down and its threads are left to end.
+    Incomplete(Failure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseState {
+    Open,
+    Closing,
+    Done(CloseOutcome),
 }
 
 /// The owner of one logical operation's requests. Cancelling it completes
@@ -187,6 +235,7 @@ impl Connection {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
+            settled: Condvar::new(),
         });
         let (events, inbox) = mpsc::channel();
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -208,10 +257,16 @@ impl Connection {
             firmware,
             shared,
             events,
-            sock,
+            sock: Mutex::new(Some(sock)),
             reader_stop,
-            worker: Some(worker_thread),
-            reader: Some(reader_thread),
+            worker_id: worker_thread.thread().id(),
+            worker: Mutex::new(Some(worker_thread)),
+            reader: Mutex::new(Some(reader_thread)),
+            close: Arc::new(CloseCell {
+                state: Mutex::new(CloseState::Open),
+                done: Condvar::new(),
+                exempt: Mutex::new(Vec::new()),
+            }),
         })
     }
 
@@ -299,53 +354,151 @@ impl Connection {
         let _ = self.events.send(Event::Wake);
     }
 
-    /// Refuses new work, completes waiting requests unsent as
-    /// `not_connected`, lets the active request settle, then stops both
-    /// threads and closes the socket.
-    pub fn close(mut self) {
-        self.shut();
-    }
-
-    fn shut(&mut self) {
+    /// Closes the connection. In order: new submissions and any request not
+    /// yet started on the wire are refused, waiting requests complete unsent
+    /// as `not_connected` (on a separate thread, so their callbacks never hold
+    /// the close up), the request already being sent settles under its own
+    /// deadlines, and then, within `teardown`, the socket is shut down and
+    /// released and both threads must finish. Repeated and concurrent calls
+    /// share the first call's close and its outcome; none starts a second
+    /// shutdown or sends anything.
+    pub fn close(&self, teardown: Duration) -> CloseOutcome {
         let waiting = {
+            let mut close = lock(&self.close.state);
+            loop {
+                match *close {
+                    CloseState::Open => break,
+                    CloseState::Done(outcome) => return outcome,
+                    CloseState::Closing => {
+                        if self.must_not_wait() {
+                            return CloseOutcome::Started;
+                        }
+                        close = self
+                            .close
+                            .done
+                            .wait(close)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+            }
+            // The close becomes visible to other callers only together with
+            // the refusal of new work and of unstarted writes: the send gate
+            // and the state are updated before the close lock is released.
+            let _gate = self.shared.link_end();
             let mut state = self.shared.lock();
             state.closing = true;
             state.waiting_bytes = 0;
+            *close = CloseState::Closing;
+            lock(&self.close.exempt).push(thread::current().id());
             std::mem::take(&mut state.waiting)
         };
-        for item in waiting {
-            deliver(
-                item.done,
-                Outcome::failed(
-                    RequestCause::NotConnected,
-                    RequestPhase::Admission,
-                    Evidence::NotSent,
-                ),
-            );
-        }
         let _ = self.events.send(Event::Wake);
-        if let Some(worker) = self.worker.take() {
-            // Closing from a completion callback runs on the worker itself,
-            // which cannot wait for its own end: it stops on its own once
-            // the callback returns and it finds the connection closing.
-            if worker.thread().id() != thread::current().id() {
-                let _ = worker.join();
+        // Waiting requests complete on their own thread, which the close
+        // waits for within the budget; a close called from one of their
+        // callbacks returns `Started` instead of waiting for itself.
+        let delivery = (!waiting.is_empty()).then(|| {
+            let (go, ready) = mpsc::channel::<()>();
+            let handle = thread::spawn(move || {
+                let _ = ready.recv();
+                for item in waiting {
+                    deliver(
+                        item.done,
+                        Outcome::failed(
+                            RequestCause::NotConnected,
+                            RequestPhase::Admission,
+                            Evidence::NotSent,
+                        ),
+                    );
+                }
+            });
+            lock(&self.close.exempt).push(handle.thread().id());
+            let _ = go.send(());
+            handle
+        });
+        {
+            let mut state = self.shared.lock();
+            while state.active {
+                state = self
+                    .shared
+                    .settled
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         }
+        let end = Instant::now() + teardown;
         self.reader_stop.store(true, Ordering::SeqCst);
-        let _ = self.sock.shutdown(Shutdown::Both);
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        if let Some(sock) = lock(&self.sock).take() {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+        let threads = [
+            delivery,
+            lock(&self.worker).take(),
+            lock(&self.reader).take(),
+        ];
+        if self.on_worker() {
+            // A completion callback cannot wait for the worker it runs on; a
+            // helper waits for the threads within the same budget.
+            let cell = Arc::clone(&self.close);
+            thread::spawn(move || cell.record(wait_for(threads, end)));
+            return CloseOutcome::Started;
+        }
+        let outcome = wait_for(threads, end);
+        self.close.record(outcome);
+        outcome
+    }
+
+    /// Whether this thread is one the close waits for: the worker, the
+    /// thread running the close, or the one delivering waiting outcomes.
+    fn must_not_wait(&self) -> bool {
+        let me = thread::current().id();
+        self.on_worker() || lock(&self.close.exempt).contains(&me)
+    }
+
+    fn on_worker(&self) -> bool {
+        self.worker_id == thread::current().id()
+    }
+}
+
+/// `Closed` only when every thread has been joined before `end`; otherwise
+/// `Incomplete`, even if the threads finish later. The joins run on their own
+/// thread, so a thread whose exit (its thread-local destructors included)
+/// does not finish cannot hold this past `end`.
+fn wait_for(threads: [Option<JoinHandle<()>>; 3], end: Instant) -> CloseOutcome {
+    let incomplete =
+        CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
+    let (joined, all_joined) = mpsc::channel();
+    thread::spawn(move || {
+        for thread in threads.into_iter().flatten() {
+            let _ = thread.join();
+        }
+        let _ = joined.send(());
+    });
+    let remaining = end.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return incomplete;
+    }
+    match all_joined.recv_timeout(remaining) {
+        // Read after the joins: they completed no later than this reading.
+        Ok(()) if Instant::now() < end => CloseOutcome::Closed,
+        _ => incomplete,
+    }
+}
+
+/// Teardown budget a dropped connection uses when it was never closed.
+const DROP_TEARDOWN: Duration = Duration::from_secs(2);
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if matches!(*lock(&self.close.state), CloseState::Open) {
+            self.close(DROP_TEARDOWN);
         }
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        if self.worker.is_some() || self.reader.is_some() {
-            self.shut();
-        }
-    }
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Operation {
@@ -478,12 +631,15 @@ fn serve(
             let item = state.waiting.pop_front();
             if let Some(item) = &item {
                 state.waiting_bytes -= item.frame.len();
+                state.active = true;
             }
             item
         };
         let fatal = match next {
             Some(item) => {
                 let (outcome, fatal) = execute(&mut sock, &inbox, &shared, &options, &item);
+                shared.lock().active = false;
+                shared.settled.notify_all();
                 // The end is recorded, and the waiting requests taken with it,
                 // before the outcome is delivered: whoever receives it sees
                 // the ended state, and nothing it does can change how the
@@ -579,6 +735,13 @@ fn execute(
         } else {
             Evidence::Unconfirmed
         };
+        if cause == RequestCause::NotConnected {
+            // The connection began closing before this request's first byte.
+            return (
+                Outcome::failed(cause, RequestPhase::Admission, evidence),
+                None,
+            );
+        }
         // A frame cut short leaves the stream unusable; an untouched one does not.
         return (
             Outcome::failed(cause, RequestPhase::Send, evidence),
@@ -683,6 +846,9 @@ fn write_frame<O: Outgoing>(
         let link_end = shared.link_end();
         if let Some(cause) = *link_end {
             return Err((cause, written));
+        }
+        if written == 0 && shared.lock().closing {
+            return Err((RequestCause::NotConnected, 0));
         }
         let outcome = sock.write(&frame[written..]);
         drop(link_end);

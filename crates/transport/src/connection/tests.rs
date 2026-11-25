@@ -1,6 +1,8 @@
 //! The operational connection against a fake unit endpoint.
 
-use super::{open, Connection, ConnectionOptions, MAX_WAITING_BYTES, MAX_WAITING_REQUESTS};
+use super::{
+    open, CloseOutcome, Connection, ConnectionOptions, MAX_WAITING_BYTES, MAX_WAITING_REQUESTS,
+};
 use crate::discovery::SystemFirmware;
 use crate::frame;
 use crate::lifecycle::{Cause, Control, Failure, Phase};
@@ -18,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const ID: &str = "<device-id-a>";
+const TEARDOWN: Duration = Duration::from_secs(2);
 
 fn address(param_id: u32) -> ParameterAddress {
     ParameterAddress {
@@ -450,7 +453,7 @@ fn the_waiting_queue_admits_exactly_its_count_limit() {
         None,
         "a full queue does not end the connection"
     );
-    connection.close();
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
 }
 
 #[test]
@@ -507,7 +510,7 @@ fn the_waiting_queue_admits_exactly_its_byte_limit() {
         "nothing fits once the limit is full"
     );
     drop((admitted, active));
-    connection.close();
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
 }
 
 #[test]
@@ -722,7 +725,7 @@ fn close_completes_waiting_requests_unsent_after_the_active_one_settles() {
     let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
     wait_until(|| parameter_uris(&peer).len() == 1);
     let waiting = submit(&connection, &operation, Request::SetNumeric(address(2), 1));
-    connection.close();
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     assert_eq!(
         outcome(&waiting),
         failed(
@@ -756,7 +759,7 @@ fn an_operation_of_another_connection_is_not_connected() {
             Evidence::NotSent
         )
     );
-    first.close();
+    assert_eq!(first.close(TEARDOWN), CloseOutcome::Closed);
     let rx = submit(
         &second,
         &second.create_operation().unwrap(),
@@ -841,7 +844,7 @@ fn a_panicking_callback_does_not_stop_other_completions() {
             Evidence::NotSent
         )
     );
-    connection.close();
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
 }
 
 #[test]
@@ -927,7 +930,7 @@ fn cancelling_or_closing_after_the_end_does_not_change_how_waiting_requests_end(
     );
     assert_eq!(outcome(&mine), ended.clone(), "not cancelled after the end");
     assert_eq!(outcome(&theirs), ended);
-    connection.close();
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
 }
 
 #[test]
@@ -1009,6 +1012,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
         shared: Arc::new(super::Shared {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
+            settled: std::sync::Condvar::new(),
         }),
         written: Vec::new(),
         end_before_write,
@@ -1054,4 +1058,343 @@ fn a_write_never_starts_after_the_reader_records_the_end() {
         !sock.recordable_during_write,
         "the end lock is held across each write"
     );
+}
+
+#[test]
+fn repeated_and_concurrent_closes_share_one_close() {
+    let peer = slow(Duration::from_millis(150));
+    let connection = Arc::new(connect(&peer));
+    let operation = connection.create_operation().unwrap();
+    let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
+    wait_until(|| parameter_uris(&peer).len() == 1);
+    let closers: Vec<_> = (0..3)
+        .map(|_| {
+            let connection = Arc::clone(&connection);
+            thread::spawn(move || connection.close(TEARDOWN))
+        })
+        .collect();
+    for closer in closers {
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+    }
+    assert!(
+        matches!(outcome(&active), Outcome::Success { .. }),
+        "the sent request settled first"
+    );
+    assert_eq!(
+        connection.close(TEARDOWN),
+        CloseOutcome::Closed,
+        "a later close returns the same outcome"
+    );
+    assert!(connection.create_operation().is_err());
+    let late = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(
+        outcome(&late),
+        failed(
+            RequestCause::NotConnected,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    assert_eq!(parameter_uris(&peer).len(), 1, "closing sent nothing");
+}
+
+#[test]
+fn a_reader_that_does_not_finish_in_the_teardown_budget_is_incomplete() {
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    // Stand in for a reader that does not end: the real one is detached and
+    // ends when the socket is shut down.
+    let stuck = thread::spawn(|| thread::sleep(Duration::from_secs(1)));
+    drop(connection.reader.lock().unwrap().replace(stuck));
+    let started = Instant::now();
+    let outcome = connection.close(Duration::from_millis(100));
+    assert_eq!(
+        outcome,
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        })
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        connection.close(TEARDOWN),
+        outcome,
+        "later calls get the same outcome"
+    );
+    assert!(connection.create_operation().is_err());
+}
+
+#[test]
+fn a_close_started_from_a_callback_finishes_for_other_callers() {
+    let peer = unit(plain);
+    let connection = Arc::new(connect(&peer));
+    let operation = connection.create_operation().unwrap();
+    let (tx, started) = mpsc::channel();
+    let closer = Arc::clone(&connection);
+    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+        let _ = tx.send(closer.close(TEARDOWN));
+    });
+    assert_eq!(
+        started.recv_timeout(Duration::from_secs(5)).unwrap(),
+        CloseOutcome::Started
+    );
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+}
+
+#[test]
+fn a_second_close_from_the_same_callback_does_not_wait_for_its_own_worker() {
+    let peer = unit(plain);
+    let connection = Arc::new(connect(&peer));
+    let operation = connection.create_operation().unwrap();
+    let (tx, outcomes) = mpsc::channel();
+    let closer = Arc::clone(&connection);
+    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+        let first = closer.close(TEARDOWN);
+        let second = closer.close(TEARDOWN);
+        let _ = tx.send((first, second));
+    });
+    assert_eq!(
+        outcomes.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (CloseOutcome::Started, CloseOutcome::Started)
+    );
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+}
+
+#[test]
+fn a_write_not_yet_started_when_closing_begins_is_never_sent() {
+    let frame = vec![b'x'; 30];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut sock = scripted(None);
+    let shared = Arc::clone(&sock.shared);
+    shared.lock().closing = true;
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline),
+        Err((RequestCause::NotConnected, 0))
+    );
+    assert!(sock.written.is_empty());
+
+    // A write already under way finishes: its bytes are on the wire.
+    let mut sock = scripted(None);
+    let shared = Arc::clone(&sock.shared);
+    struct CloseAfterFirst(Scripted);
+    impl super::Outgoing for CloseAfterFirst {
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            self.0.set_write_timeout(timeout)
+        }
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let n = self.0.write(bytes)?;
+            self.0.shared.lock().closing = true;
+            Ok(n)
+        }
+    }
+    let mut sock = CloseAfterFirst(std::mem::replace(&mut sock, scripted(None)));
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline),
+        Ok(())
+    );
+    assert_eq!(sock.0.written, frame);
+}
+
+#[test]
+fn a_waiting_request_callback_that_closes_does_not_hold_the_close_up() {
+    let peer = slow(Duration::from_millis(150));
+    let connection = Arc::new(connect(&peer));
+    let operation = connection.create_operation().unwrap();
+    let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
+    wait_until(|| parameter_uris(&peer).len() == 1);
+    let (tx, inner) = mpsc::channel();
+    let again = Arc::clone(&connection);
+    connection.submit(
+        &operation,
+        Request::SetNumeric(address(2), 1),
+        move |outcome| {
+            let _ = tx.send((outcome, again.close(TEARDOWN)));
+        },
+    );
+    let started = Instant::now();
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let (waiting, closed) = inner.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        waiting,
+        failed(
+            RequestCause::NotConnected,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    assert_eq!(
+        closed,
+        CloseOutcome::Started,
+        "it runs on a thread the close waits for"
+    );
+    assert!(matches!(outcome(&active), Outcome::Success { .. }));
+}
+
+#[test]
+fn a_callback_that_outlasts_the_teardown_budget_makes_the_close_incomplete() {
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let (tx, delivered) = mpsc::channel();
+    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+        let _ = tx.send(());
+        thread::sleep(Duration::from_millis(600));
+    });
+    delivered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    let outcome = connection.close(Duration::from_millis(100));
+    assert_eq!(
+        outcome,
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        })
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        connection.close(TEARDOWN),
+        outcome,
+        "the outcome does not change later"
+    );
+}
+
+#[test]
+fn a_slow_waiting_request_callback_is_bounded_by_the_teardown_budget() {
+    let peer = slow(Duration::from_millis(100));
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
+    wait_until(|| parameter_uris(&peer).len() == 1);
+    connection.submit(&operation, Request::SetNumeric(address(2), 1), |_| {
+        thread::sleep(Duration::from_secs(1));
+    });
+    let started = Instant::now();
+    assert_eq!(
+        connection.close(Duration::from_millis(300)),
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        }),
+        "the waiting outcome was not delivered within the budget"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(matches!(outcome(&active), Outcome::Success { .. }));
+}
+
+#[test]
+fn a_closed_connection_keeps_no_socket() {
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    assert!(connection.sock.lock().unwrap().is_none());
+}
+
+#[test]
+fn waiting_outcomes_are_delivered_before_closed_is_returned() {
+    let peer = slow(Duration::from_millis(100));
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
+    wait_until(|| parameter_uris(&peer).len() == 1);
+    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for id in [2, 3] {
+        let delivered = Arc::clone(&delivered);
+        connection.submit(&operation, Request::SetNumeric(address(id), 1), move |_| {
+            thread::sleep(Duration::from_millis(50));
+            delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(matches!(outcome(&active), Outcome::Success { .. }));
+}
+
+#[test]
+fn closing_is_visible_only_once_new_work_is_refused() {
+    let peer = unit(plain);
+    let connection = Arc::new(connect(&peer));
+    let operation = connection.create_operation().unwrap();
+    let (tx, seen) = mpsc::channel();
+    let probe = Arc::clone(&connection);
+    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+        let outcome = probe.close(TEARDOWN);
+        let _ = tx.send((outcome, probe.create_operation().is_err()));
+    });
+    let (outcome, refused) = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(outcome, CloseOutcome::Started);
+    assert!(refused);
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+}
+
+#[test]
+fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
+    let finished = thread::spawn(|| {});
+    while !finished.is_finished() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let past = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        super::wait_for([Some(finished), None, None], past),
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        })
+    );
+    let done = thread::spawn(|| {});
+    assert_eq!(
+        super::wait_for(
+            [Some(done), None, None],
+            Instant::now() + Duration::from_secs(1)
+        ),
+        CloseOutcome::Closed
+    );
+}
+
+#[test]
+fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
+    // A thread-local destructor blocks the thread's exit after its body
+    // returned, so the thread reports finished while join() would block.
+    struct Blocks(mpsc::Receiver<()>);
+    impl Drop for Blocks {
+        fn drop(&mut self) {
+            let _ = self.0.recv_timeout(Duration::from_secs(2));
+        }
+    }
+    thread_local! {
+        static HOLD: std::cell::RefCell<Option<Blocks>> = const { std::cell::RefCell::new(None) };
+    }
+    let (release, hold) = mpsc::channel();
+    let stuck = thread::spawn(move || HOLD.with(|slot| *slot.borrow_mut() = Some(Blocks(hold))));
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    assert_eq!(
+        super::wait_for(
+            [Some(stuck), None, None],
+            Instant::now() + Duration::from_millis(100)
+        ),
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        })
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(release);
 }
