@@ -45,6 +45,19 @@ export const CHANNEL_PARAMS = {
   polarity: { mono: 24, left: 211, right: 212 },
 } as const;
 
+/**
+ * Mono pairs per model, by primary channel (F03-J): URX22 CH1/2; URX44 and
+ * URX44V CH1/2 and CH3/4.
+ */
+export const MONO_PAIRS: Readonly<Record<Model, readonly number[]>> = {
+  URX22: [1],
+  URX44: [1, 3],
+  URX44V: [1, 3],
+};
+
+/** Pair settings at the primary: x 0, y primary − 1. */
+export const PAIR_PARAMS = { stereoLink: 23, panMode: 891 } as const;
+
 /** Finite fader writes and reads, dB; written in 0.01 dB steps. */
 export const FADER_DB = { min: -96, max: 10 } as const;
 /** The raw value of negative infinity, and only that. */

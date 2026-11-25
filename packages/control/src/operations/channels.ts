@@ -3,6 +3,8 @@
 // equality reads, no readback.
 
 import {
+  MONO_PAIRS,
+  PAIR_PARAMS,
   CHANNEL_PARAMS,
   FADER_DB,
   FADER_NEGATIVE_INFINITY_RAW,
@@ -13,7 +15,7 @@ import {
 import { decodeInteger, decodeSwitch, encodeSwitch, planOnGrid } from "../catalog/codecs.js";
 import { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "../catalog/ports.js";
 import { formatI64, type I64Text } from "../catalog/i64.js";
-import type { ChannelSideTarget, ChannelTarget, FaderLevel, Polarity } from "../catalog/settings.js";
+import type { ChannelSideTarget, ChannelTarget, FaderLevel, PanMode, Polarity } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
 import { address, modelOf, readDecoded, refuse, writeRaw } from "./setting-io.js";
@@ -167,6 +169,59 @@ export const channelSource = {
   },
   write(context: OperationContext, target: ChannelSideTarget, value: string): Promise<WriteResult<string>> {
     const { at, raw, requested, planned } = sourcePlan(context.model, target, value);
+    return writeRaw(context, at, raw, { requested, planned });
+  },
+};
+
+/** A mono pair's primary address; the secondary is not an alias, fixed stereo has no pair. */
+function pairAddress(paramId: number, model: string, target: unknown): ParameterAddress {
+  const known = modelOf(model);
+  const channel = channelOf(model, target);
+  if ((target as ChannelSideTarget).side !== undefined) {
+    return refuse("invalid_input");
+  }
+  if (channel.kind === "stereo") {
+    return refuse("unsupported_operation");
+  }
+  const primary = channel.index + 1;
+  return MONO_PAIRS[known].includes(primary) ? address(paramId, channel.index) : refuse("invalid_input");
+}
+
+/**
+ * The mono-pair link (F03-J): read at the primary only. Its write sequence
+ * (one write, or both members) needs evidence first, so it is read-only
+ * until then.
+ */
+export const channelStereoLink = {
+  read(context: OperationContext, target: ChannelTarget): Promise<Reading<boolean>> {
+    return readDecoded(context, pairAddress(PAIR_PARAMS.stereoLink, context.model, target), decodeSwitch);
+  },
+};
+
+function decodePanMode(raw: I64Text): PanMode | undefined {
+  const balance = decodeSwitch(raw);
+  return balance === undefined ? undefined : balance ? "balance" : "pan";
+}
+
+function panModePlan(model: string, target: ChannelTarget, value: PanMode) {
+  const at = pairAddress(PAIR_PARAMS.panMode, model, target);
+  if (value !== "pan" && value !== "balance") {
+    return refuse("invalid_input");
+  }
+  return { at, requested: value, planned: value, raw: encodeSwitch(value === "balance") };
+}
+
+/** PAN/BAL of a mono pair (F03-J): one write at the primary, no link-state read. */
+export const channelPanMode = {
+  read(context: OperationContext, target: ChannelTarget): Promise<Reading<PanMode>> {
+    return readDecoded(context, pairAddress(PAIR_PARAMS.panMode, context.model, target), decodePanMode);
+  },
+  plan(model: string, target: ChannelTarget, value: PanMode): WritePlan<PanMode> {
+    const { requested, planned } = panModePlan(model, target, value);
+    return { requested, planned };
+  },
+  write(context: OperationContext, target: ChannelTarget, value: PanMode): Promise<WriteResult<PanMode>> {
+    const { at, raw, requested, planned } = panModePlan(context.model, target, value);
     return writeRaw(context, at, raw, { requested, planned });
   },
 };
