@@ -11,4 +11,6 @@ pub mod frame;
 pub mod i64_text;
 pub mod lifecycle;
 mod link;
+#[cfg(test)]
+mod test_peer;
 pub mod wire;
