@@ -13,6 +13,10 @@ pub enum Cause {
     ConnectionLost,
     /// The whole-discovery budget expired.
     DiscoveryTimeout,
+    /// The operational-connection budget expired.
+    ConnectTimeout,
+    /// The requested unit is not online, or another unit answers in its place.
+    DeviceNotFound,
     /// One request could not be written within its send deadline.
     SendTimeout,
     /// One response did not arrive within its response deadline.

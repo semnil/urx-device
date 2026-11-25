@@ -174,6 +174,16 @@ impl<'a> Link<'a> {
         })
     }
 
+    /// The phase later failures on this link report.
+    pub fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+    }
+
+    /// The connected socket and the reader holding any bytes already received.
+    pub fn into_parts(self) -> (TcpStream, FrameReader) {
+        (self.sock, self.reader)
+    }
+
     /// Writes `message` as one frame within `deadline` and the budget.
     pub fn send(
         &mut self,
