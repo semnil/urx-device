@@ -719,15 +719,59 @@ fn execute(
         );
     }
     let send_end = *submitted + options.send_deadline;
+    match exchange(sock, inbox, shared, options, frame, key, send_end) {
+        Ok(inbound) => {
+            let reply = inbound
+                .reply(key)
+                .expect("exchange returns the matching reply");
+            (decode(request, reply), None)
+        }
+        Err(failed) => (
+            Outcome::failed(failed.cause, failed.phase, failed.evidence),
+            failed.ends,
+        ),
+    }
+}
+
+/// Why one request/reply exchange produced no reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Failed {
+    cause: RequestCause,
+    phase: RequestPhase,
+    evidence: Evidence,
+    /// The cause that ends the connection, if this failure does.
+    ends: Option<RequestCause>,
+}
+
+impl Failed {
+    fn new(cause: RequestCause, phase: RequestPhase, evidence: Evidence, ends: bool) -> Self {
+        Failed {
+            cause,
+            phase,
+            evidence,
+            ends: ends.then_some(cause),
+        }
+    }
+}
+
+/// Writes `frame` by `send_end` and awaits the frame `key` matches, within
+/// the response deadline from the end of the write.
+fn exchange(
+    sock: &mut TcpStream,
+    inbox: &Receiver<Event>,
+    shared: &Shared,
+    options: &ConnectionOptions,
+    frame: &[u8],
+    key: &ReplyKey,
+    send_end: Instant,
+) -> Result<Inbound, Failed> {
     if Instant::now() >= send_end {
-        return (
-            Outcome::failed(
-                RequestCause::SendTimeout,
-                RequestPhase::Admission,
-                Evidence::NotSent,
-            ),
-            None,
-        );
+        return Err(Failed::new(
+            RequestCause::SendTimeout,
+            RequestPhase::Admission,
+            Evidence::NotSent,
+            false,
+        ));
     }
     if let Err((cause, written)) = write_frame(sock, shared, frame, send_end) {
         let evidence = if written == 0 {
@@ -737,18 +781,21 @@ fn execute(
         };
         if cause == RequestCause::NotConnected {
             // The connection began closing before this request's first byte.
-            return (
-                Outcome::failed(cause, RequestPhase::Admission, evidence),
-                None,
-            );
+            return Err(Failed::new(cause, RequestPhase::Admission, evidence, false));
         }
         // A frame cut short leaves the stream unusable; an untouched one does not.
-        return (
-            Outcome::failed(cause, RequestPhase::Send, evidence),
-            (written > 0 || cause != RequestCause::SendTimeout).then_some(cause),
-        );
+        let ends = written > 0 || cause != RequestCause::SendTimeout;
+        return Err(Failed::new(cause, RequestPhase::Send, evidence, ends));
     }
     let response_end = Instant::now() + options.response_deadline;
+    let unconfirmed = |cause| {
+        Err(Failed::new(
+            cause,
+            RequestPhase::Response,
+            Evidence::Unconfirmed,
+            true,
+        ))
+    };
     loop {
         let remaining = response_end.saturating_duration_since(Instant::now());
         let event = if remaining.is_zero() {
@@ -759,47 +806,17 @@ fn execute(
         match event {
             Ok(Event::Frame(message)) => {
                 if lost_notification(&message) {
-                    return (
-                        Outcome::failed(
-                            RequestCause::ConnectionLost,
-                            RequestPhase::Response,
-                            Evidence::Unconfirmed,
-                        ),
-                        Some(RequestCause::ConnectionLost),
-                    );
+                    return unconfirmed(RequestCause::ConnectionLost);
                 }
                 let inbound = Inbound::new(message);
-                if let Some(reply) = inbound.reply(key) {
-                    return (decode(request, reply), None);
+                if inbound.reply(key).is_some() {
+                    return Ok(inbound);
                 }
             }
             Ok(Event::Wake) => {}
-            Ok(Event::ReadFailed(cause)) => {
-                return (
-                    Outcome::failed(cause, RequestPhase::Response, Evidence::Unconfirmed),
-                    Some(cause),
-                );
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                return (
-                    Outcome::failed(
-                        RequestCause::ResponseTimeout,
-                        RequestPhase::Response,
-                        Evidence::Unconfirmed,
-                    ),
-                    Some(RequestCause::ResponseTimeout),
-                );
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return (
-                    Outcome::failed(
-                        RequestCause::InternalError,
-                        RequestPhase::Response,
-                        Evidence::Unconfirmed,
-                    ),
-                    Some(RequestCause::InternalError),
-                );
-            }
+            Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
+            Err(RecvTimeoutError::Timeout) => return unconfirmed(RequestCause::ResponseTimeout),
+            Err(RecvTimeoutError::Disconnected) => return unconfirmed(RequestCause::InternalError),
         }
     }
 }
