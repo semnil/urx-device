@@ -28,6 +28,14 @@ export { DUCKER_RULES } from "./ducker.js";
 export { SEND_RULES } from "./sends.js";
 export { BUS_RULES, BUS_TOKENS, CHANNEL_STEREO_ASSIGN_RULE } from "./buses.js";
 export { INSERT_FX_EFFECTS, INSERT_FX_RULES } from "./insert-fx.js";
+export { FX_RETURN_EFFECTS, FX_RETURN_RULES } from "./fx-return.js";
+export {
+  FX2_FREQUENCY_DECIHZ,
+  INITIAL_DELAY_DECIMS,
+  REV_R3_TIME_DECISECONDS,
+  REVX_FREQUENCY_HZ,
+  REVX_TIME_MS,
+} from "./fx-return-tables.js";
 export { DYNAMICS_RULES } from "./dynamics.js";
 export type {
   ByBandRule,
@@ -40,6 +48,9 @@ export type {
   BusSettingRule,
   NameRule,
   SelectorRule,
+  ContextStopsRule,
+  FxEffectRule,
+  FxParameterRule,
   SendSettingRule,
   Sentinel,
   SettingRule,
@@ -88,6 +99,9 @@ export type {
   BusTarget,
   BusType,
   InsertFxType,
+  FxParameterTarget,
+  FxParameterValue,
+  FxReturnType,
   SendTarget,
   EqBand,
   EqBandType,

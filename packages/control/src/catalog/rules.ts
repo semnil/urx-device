@@ -6,12 +6,15 @@
 import type { ChannelKind } from "./channels.js";
 
 /** A public unit; null for unitless numbers. */
-export type ValueUnit = "dB" | "ms" | "Hz" | "%" | "ratio" | null;
+export type ValueUnit = "dB" | "ms" | "s" | "Hz" | "%" | "bpm" | "ratio" | null;
 
 /** A named value outside the finite range, with its exact raw value. */
 export interface Sentinel {
   readonly value: string;
+  /** The raw value a write sends. */
   readonly raw: string;
+  /** Other raw values a read also takes as the sentinel (one public meaning, no alias per raw). */
+  readonly reads?: readonly string[];
 }
 
 /** On/off: on is raw 1, off raw 0. */
@@ -101,13 +104,14 @@ export interface NameRule {
 
 /**
  * A selector on an unsigned 32-bit value: each token this target takes with
- * its exact raw value, and `none` as the exact sentinel. `known` lists every
+ * its exact raw value, and `none`, where present, as the exact sentinel. `known` lists every
  * token any target of the setting takes: one of them this target lacks is
  * unsupported, anything else invalid. A read takes only the listed raw values.
  */
 export interface SelectorRule {
   readonly kind: "selector";
-  readonly none: Sentinel;
+  /** The nothing-selected sentinel, for a selector that has one. */
+  readonly none?: Sentinel;
   readonly known: readonly string[];
   readonly choices: readonly { readonly token: string; readonly raw: string }[];
   /**
@@ -205,8 +209,46 @@ export interface BusSettingRule {
   readonly target: "bus";
   readonly known: readonly string[];
   /** Undefined for a known bus without the setting. */
-  readonly address: { readonly [bus: string]: { readonly paramId: number; readonly y: number; readonly write: boolean } | undefined };
+  readonly address: {
+    readonly [bus: string]:
+      | { readonly paramId: number; readonly y: number; readonly write: boolean; readonly value?: ValueRule }
+      | undefined;
+  };
+  /** The value rule; an address entry's own `value` replaces it for that bus. */
   readonly value: ValueRule;
 }
 
-export type SettingRule = ChannelSettingRule | ChannelBandSettingRule | SendSettingRule | BusSettingRule;
+/**
+ * REV-X Reverb Time (F06-F): seconds from 70 stops chosen by the checked type
+ * and a freshly read Room Size; `tables[type][roomSize]` in ms (× 1000 s),
+ * raw = stop index. `envelope` is each type's range over every Room Size.
+ */
+export interface ContextStopsRule {
+  readonly kind: "context-stops";
+  readonly unit: ValueUnit;
+  readonly scale: number;
+  readonly contextSlot: number;
+  readonly contexts: { readonly [effect: string]: readonly (readonly number[])[] | undefined };
+  readonly envelope: { readonly [effect: string]: { readonly min: number; readonly max: number } | undefined };
+}
+
+/** One FX-return effect: its selector value per bus that offers it, and its parameters by slot. */
+export interface FxEffectRule {
+  readonly selector: { readonly [bus: string]: string | undefined };
+  readonly parameters: { readonly [parameter: string]: { readonly slot: number; readonly value: ValueRule | ContextStopsRule } | undefined };
+}
+
+/**
+ * An FX-return parameter (F06-F): the target names an FX bus, the expected
+ * effect and a parameter. The bus's selector is read first and must equal the
+ * effect; the parameter is then one request at the bus's array, y the slot.
+ */
+export interface FxParameterRule {
+  readonly target: "fx-parameter";
+  readonly buses: { readonly [bus: string]: { readonly selector: number; readonly array: number } | undefined };
+  readonly knownBuses: readonly string[];
+  readonly effects: { readonly [effect: string]: FxEffectRule | undefined };
+  readonly knownParameters: readonly string[];
+}
+
+export type SettingRule = ChannelSettingRule | ChannelBandSettingRule | SendSettingRule | BusSettingRule | FxParameterRule;

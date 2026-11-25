@@ -86,6 +86,7 @@ import {
   channelStereoAssign,
 } from "./buses.js";
 import { busInsertFxOn, busInsertFxType, channelInsertFxOn, channelInsertFxType } from "./insert-fx.js";
+import { busFxParameter, busFxType } from "./fx-return.js";
 import {
   compOn,
   eqOn,
@@ -126,6 +127,11 @@ export interface ReadHandler<K extends SettingId> {
 export interface WriteHandler<K extends SettingId> extends ReadHandler<K> {
   /** The validated plan; it sends nothing (preview). */
   plan(model: string, target: Target<K>, value: Input<K>): WritePlan<Input<K>>;
+  /**
+   * The plan with the operation's required prerequisite reads, sending no
+   * write (O13); absent where the plan needs no device state.
+   */
+  dryRun?(context: OperationContext, target: Target<K>, value: Input<K>): Promise<WritePlan<Input<K>>>;
   write(context: OperationContext, target: Target<K>, value: Input<K>): Promise<WriteResult<Input<K>>>;
 }
 
@@ -221,6 +227,8 @@ export const settingHandlers: SettingHandlers = {
   "channel.insert-fx.on": channelInsertFxOn,
   "bus.insert-fx.type": busInsertFxType,
   "bus.insert-fx.on": busInsertFxOn,
+  "bus.fx.type": busFxType,
+  "bus.fx.parameter": busFxParameter,
 };
 
 function unknownId(): Promise<never> {
@@ -306,3 +314,21 @@ export function previewSetting<A extends WriteArgs>(model: string, ...[id, targe
   const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
   return handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
 }
+
+/**
+ * The plan a write of `value` would send, after the operation's required
+ * prerequisite reads (O13): no setting write is sent. A setting whose plan
+ * needs no device state reads nothing and plans as `previewSetting` does.
+ */
+export function dryRunSetting<A extends WriteArgs>(
+  context: OperationContext,
+  ...[id, target, value]: A
+): Promise<WritePlan<Input<A[0]>>> {
+  return settled(() => {
+    const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    return handler.dryRun === undefined
+      ? Promise.resolve(handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>))
+      : handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>);
+  });
+}
+
