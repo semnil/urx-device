@@ -107,6 +107,8 @@ type Input<K extends SettingId> = K extends SettingId
 
 export interface ReadHandler<K extends SettingId> {
   read(context: OperationContext, target: Target<K>): Promise<Reading<Value<K>>>;
+  /** The target's validation without traffic, throwing its refusal (used to refuse a write of a read-only setting). */
+  check?(model: string, target: Target<K>): void;
 }
 
 export interface WriteHandler<K extends SettingId> extends ReadHandler<K> {
@@ -246,9 +248,19 @@ export function readSetting<A extends ReadArgs>(
   return settled(() => handler.read(context, target as Target<A[0]>));
 }
 
-function writeHandler<K extends WritableSettingId>(id: K): WriteHandler<K> | undefined {
-  if (!Object.hasOwn(settingDefinitions, id) || !settingDefinitions[id].writable) {
-    return undefined;
+/**
+ * The handler a write of `id` uses. An ID outside the catalog is
+ * `invalid_input`. A known read-only setting first validates its target, so
+ * a malformed one is still `invalid_input`, then is `unsupported_operation`:
+ * a known setting without a write.
+ */
+function writeHandler<K extends WritableSettingId>(id: K, model: string, target: unknown): WriteHandler<K> {
+  if (!Object.hasOwn(settingDefinitions, id)) {
+    throw new OperationFailureError({ code: "invalid_input", phase: "preparation", progress: null });
+  }
+  if (!(settingDefinitions as Record<string, { writable: boolean }>)[id]?.writable) {
+    (settingHandlers[id as SettingId] as unknown as ReadHandler<SettingId>).check?.(model, target as never);
+    throw new OperationFailureError({ code: "unsupported_operation", phase: "preparation", progress: null });
   }
   return settingHandlers[id] as unknown as WriteHandler<K>;
 }
@@ -258,17 +270,14 @@ export function writeSetting<A extends WriteArgs>(
   context: OperationContext,
   ...[id, target, value]: A
 ): Promise<WriteResult<Input<A[0]>>> {
-  const handler = writeHandler(id) as WriteHandler<A[0]> | undefined;
-  return handler === undefined
-    ? unknownId()
-    : settled(() => handler.write(context, target as Target<A[0]>, value as Input<A[0]>));
+  return settled(() => {
+    const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    return handler.write(context, target as Target<A[0]>, value as Input<A[0]>);
+  });
 }
 
 /** The plan a write of `value` would send, through the same validation; no traffic. */
 export function previewSetting<A extends WriteArgs>(model: string, ...[id, target, value]: A): WritePlan<Input<A[0]>> {
-  const handler = writeHandler(id) as WriteHandler<A[0]> | undefined;
-  if (handler === undefined) {
-    throw new OperationFailureError({ code: "invalid_input", phase: "preparation", progress: null });
-  }
+  const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
   return handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
 }

@@ -177,6 +177,10 @@ function handler<V>(resolve: (model: string, target: unknown, write: boolean) =>
       : { at, codec, raw: result.raw as I64Text, requested, planned: result.planned as V };
   };
   return {
+    /** The target's read resolution without traffic: its refusal, if any. */
+    check(model: string, target: unknown): void {
+      resolve(model, target, false);
+    },
     read(context: OperationContext, target: unknown): Promise<Reading<V>> {
       const { at, codec } = resolve(context.model, target, false);
       const decode = (raw: string) => codec.decode(raw) as V | undefined;

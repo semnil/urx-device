@@ -92,12 +92,21 @@ describe("sends (F05-S)", () => {
               { address: { paramId: a + offset + stride * b, x: "0", y: `${y}` }, value: raw },
             ]);
           } else {
-            // No route binds a pan write, so send.pan is a read-only ID: refused like any unknown write.
-            expect((await failureOf(result))?.code, label).toBe(field === "pan" ? "invalid_input" : "unsupported_operation");
+            // send.pan, with no bound route, is a known read-only setting: unsupported like the others.
+            expect((await failureOf(result))?.code, label).toBe("unsupported_operation");
             expect(transport.calls, label).toEqual([]);
           }
         }
       }
+    }
+    // The read-only send.pan still checks its target: unknown tokens are invalid, unmatched pairs unsupported.
+    for (const [target, code] of [
+      [{ source: "channel-6", destination: "mix-1" }, "invalid_input"],
+      [{ source: "channel-1", destination: "mix-1", side: "left" }, "invalid_input"],
+      [{ source: "fx-1", destination: "fx-2" }, "unsupported_operation"],
+      [{ source: "channel-11", destination: "mix-1" }, "unsupported_operation"],
+    ] as const) {
+      expect(() => plan("send.pan", target, -3, "URX22"), JSON.stringify(target)).toThrow(new RegExp(code));
     }
     // CH → FX tap is read-only for both values.
     for (const value of ["pre", "post"]) {

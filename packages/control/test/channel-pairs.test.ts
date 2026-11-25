@@ -51,11 +51,15 @@ describe("mono pairs (F03-J)", () => {
     ] as const) {
       expect((await failureOf(readSetting(c, id, target as never)))?.code, JSON.stringify(target)).toBe(code);
     }
-    // Read-only until its write sequence is evidenced: not writable at the type level either.
+    // Read-only until its write sequence is evidenced: a known setting without a
+    // write (after its target check), and not writable at the type level either.
     expect((await failureOf(writeSetting(c, "channel.stereo-link" as never, { channel: 1 } as never, true as never)))?.code).toBe(
+      "unsupported_operation",
+    );
+    expect(() => previewSetting("URX44", "channel.stereo-link" as never, { channel: 1 } as never, true as never)).toThrow(/unsupported_operation/);
+    expect((await failureOf(writeSetting(c, "channel.stereo-link" as never, { channel: 1, side: "left" } as never, true as never)))?.code).toBe(
       "invalid_input",
     );
-    expect(() => previewSetting("URX44", "channel.stereo-link" as never, { channel: 1 } as never, true as never)).toThrow();
     // @ts-expect-error the link is not a writable setting
     void (() => writeSetting(c, "channel.stereo-link", { channel: 1 }, true));
     expect((await failureOf(writeSetting(c, "channel.pan-mode", { channel: 1 }, "bal" as never)))?.code).toBe(
