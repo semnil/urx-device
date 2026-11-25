@@ -1,10 +1,10 @@
 //! Device Center `vdp` messages: the requests this crate sends, and how an
 //! inbound frame is recognised as a reply, a notification or a device-lost push.
 //!
-//! The protocol carries no request id. A reply is recognised by its verb and
-//! its address with the query removed, so a notification for the address in
-//! flight, or the other verb's reply on the same address, never answers a
-//! request.
+//! The protocol carries no request id. A reply is recognised by its verb, its
+//! address with the query removed and, for a POST, its `operation`, so a
+//! notification for the address in flight, the other verb's reply, or the reply
+//! to another operation on the same address never answers a request.
 
 use serde_json::{json, Value};
 
@@ -69,11 +69,13 @@ pub enum Request {
     GetDevice,
 }
 
-/// What a reply to one request carries: its verb and its address without query.
+/// What a reply to one request carries: its verb, its address without query
+/// and, for a POST, its `operation` (K9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyKey {
     method: &'static str,
     base: String,
+    operation: Option<&'static str>,
 }
 
 impl Request {
@@ -102,20 +104,23 @@ impl Request {
         json!({ "vdp": vdp })
     }
 
-    /// The verb and address a reply to this request carries.
+    /// The verb, address and operation a reply to this request carries.
     pub fn reply_key(&self) -> ReplyKey {
-        let (method, base) = match self {
-            Request::GetParameter(address) => ("get", address.uri()),
-            Request::SetParameter(address, _)
-            | Request::RegisterParameter(address)
-            | Request::UnregisterParameter(address) => ("post", address.uri()),
-            Request::RegisterMeter(address) | Request::UnregisterMeter(address) => {
-                ("post", address.uri())
-            }
-            Request::GetSynchronize => ("get", SYNCHRONIZE.to_string()),
-            Request::GetDevice => ("get", DEVICE.to_string()),
+        let (method, base, operation) = match self {
+            Request::GetParameter(address) => ("get", address.uri(), None),
+            Request::SetParameter(address, _) => ("post", address.uri(), Some("value")),
+            Request::RegisterParameter(address) => ("post", address.uri(), Some("regist")),
+            Request::UnregisterParameter(address) => ("post", address.uri(), Some("unregist")),
+            Request::RegisterMeter(address) => ("post", address.uri(), Some("regist")),
+            Request::UnregisterMeter(address) => ("post", address.uri(), Some("unregist")),
+            Request::GetSynchronize => ("get", SYNCHRONIZE.to_string(), None),
+            Request::GetDevice => ("get", DEVICE.to_string(), None),
         };
-        ReplyKey { method, base }
+        ReplyKey {
+            method,
+            base,
+            operation,
+        }
     }
 }
 
@@ -125,6 +130,18 @@ fn registration(uri: &str, operation: &str) -> Value {
 
 fn without_query(uri: &str) -> &str {
     uri.split('?').next().unwrap_or(uri)
+}
+
+/// The value of the single `operation` query parameter, or `None` when the
+/// query has none or more than one.
+fn operation_of(uri: &str) -> Option<&str> {
+    let (_, query) = uri.split_once('?')?;
+    let mut values = query.split('&').filter_map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (name == "operation").then_some(value)
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 /// A reply's `vdp` object.
@@ -239,14 +256,24 @@ impl Inbound {
     }
 
     /// This frame as the reply `key` describes, or `None` for any other frame:
-    /// a notification, the other verb's reply, or a reply for another address.
+    /// a notification, the other verb's reply, a reply for another address, or
+    /// a POST reply whose single `operation` is not the request's (missing,
+    /// unknown and repeated operations included).
     pub fn reply(&self, key: &ReplyKey) -> Option<Reply<'_>> {
         let vdp = self.vdp()?;
         if self.field("method") != Some(key.method) {
             return None;
         }
         let uri = self.field("uri").unwrap_or("");
-        (without_query(uri) == key.base).then_some(Reply { vdp })
+        if without_query(uri) != key.base {
+            return None;
+        }
+        if let Some(operation) = key.operation {
+            if operation_of(uri) != Some(operation) {
+                return None;
+            }
+        }
+        Some(Reply { vdp })
     }
 
     /// This frame as a notification, or `None` for any other frame. A parameter
@@ -416,6 +443,83 @@ mod tests {
         }
         assert!(Inbound::new(json!({ "vddp": {} })).reply(&get).is_none());
         assert!(Inbound::new(json!([1])).reply(&get).is_none());
+    }
+
+    #[test]
+    fn a_post_reply_matches_only_its_own_single_operation() {
+        let meter = MeterAddress { meter_id: 7, x: -1 };
+        let posts = [
+            (
+                Request::SetParameter(ADDRESS, WriteValue::Integer(1)),
+                "/vd/parameters/142:0:1",
+                "value",
+            ),
+            (
+                Request::SetParameter(ADDRESS, WriteValue::Text("a".into())),
+                "/vd/parameters/142:0:1",
+                "value",
+            ),
+            (
+                Request::RegisterParameter(ADDRESS),
+                "/vd/parameters/142:0:1",
+                "regist",
+            ),
+            (
+                Request::UnregisterParameter(ADDRESS),
+                "/vd/parameters/142:0:1",
+                "unregist",
+            ),
+            (Request::RegisterMeter(meter), "/vd/meters/7:-1", "regist"),
+            (
+                Request::UnregisterMeter(meter),
+                "/vd/meters/7:-1",
+                "unregist",
+            ),
+        ];
+        let queries = [
+            "?operation=value",
+            "?operation=regist",
+            "?operation=unregist",
+            "",
+            "?",
+            "?operation",
+            "?operation=",
+            "?operation=foo",
+            "?operation=Value",
+            "?x=1&operation=value",
+            "?operation=value&operation=value",
+            "?operation=regist&operation=value",
+        ];
+        for (request, base, operation) in posts {
+            let key = request.reply_key();
+            for query in queries {
+                let reply = frame(
+                    "post",
+                    &format!("{base}{query}"),
+                    json!({ "response_code": 200 }),
+                );
+                let own = query == format!("?operation={operation}")
+                    || (operation == "value" && query == "?x=1&operation=value");
+                assert_eq!(reply.reply(&key).is_some(), own, "{request:?} {query}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_get_reply_matches_with_any_query() {
+        let key = Request::GetSynchronize.reply_key();
+        for uri in [
+            "/vd/synchronize",
+            "/vd/synchronize?x=1",
+            "/vd/synchronize?operation=value",
+        ] {
+            assert!(
+                frame("get", uri, json!({ "sync_status": "online" }))
+                    .reply(&key)
+                    .is_some(),
+                "{uri}"
+            );
+        }
     }
 
     #[test]
