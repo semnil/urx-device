@@ -30,12 +30,18 @@ export type LifecycleOutcome<T> =
   | { kind: "success"; value: T }
   | { kind: "failure"; failure: LifecycleFailure; cleanup: Cleanup };
 
-/** One discovered device (D14): exact identity, model and System version. */
+/**
+ * One discovered device (D14): exact identity and model, and the System
+ * version when the discovery read metadata.
+ */
 export interface DiscoveredDevice {
   id: string;
   model: string;
-  /** The System version, or null when a valid response reports none. */
-  firmware: string | null;
+  /**
+   * Present only when metadata was read: the System version, or null when a
+   * valid response reports none.
+   */
+  firmware?: string | null;
 }
 
 const PHASES: readonly string[] = ["discovery", "connect", "identity", "admission", "subscription", "teardown"];
@@ -69,12 +75,22 @@ function hasExactly(value: unknown, keys: readonly string[]): value is Fields {
   return own.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 
+/** The phases a stage deadline's expiry can occur in (N2). */
+const DEADLINE_PHASES: Readonly<Record<string, readonly string[]>> = {
+  discovery_timeout: ["discovery"],
+  connect_timeout: ["connect", "identity"],
+};
+
 function causeOf(value: unknown): { kind: "cause"; code: LifecycleCause; phase: LifecyclePhase } | undefined {
   if (!hasExactly(value, ["kind", "code", "phase"]) || value.kind !== "cause") {
     return undefined;
   }
   const { code, phase } = value;
-  return typeof code === "string" && CAUSES.includes(code) && typeof phase === "string" && PHASES.includes(phase)
+  if (typeof code !== "string" || !CAUSES.includes(code) || typeof phase !== "string" || !PHASES.includes(phase)) {
+    return undefined;
+  }
+  const phases = DEADLINE_PHASES[code];
+  return phases === undefined || phases.includes(phase)
     ? { kind: "cause", code: code as LifecycleCause, phase: phase as LifecyclePhase }
     : undefined;
 }
@@ -125,33 +141,38 @@ export function validateLifecycle<T>(
   return undefined;
 }
 
-function deviceOf(value: unknown): DiscoveredDevice | undefined {
-  if (!hasExactly(value, ["id", "model", "firmware"])) {
+function deviceOf(value: unknown, metadata: boolean): DiscoveredDevice | undefined {
+  if (!hasExactly(value, metadata ? ["id", "model", "firmware"] : ["id", "model"])) {
     return undefined;
   }
-  const { id, model, firmware } = value;
+  const { id, model } = value;
   if (typeof id !== "string" || id === "" || typeof model !== "string" || model === "") {
     return undefined;
   }
-  if (firmware !== null && typeof firmware !== "string") {
+  if (!metadata) {
+    return { id, model };
+  }
+  const { firmware } = value;
+  // A version is a nonempty string; its explicit absence is null (D14).
+  if (firmware !== null && (typeof firmware !== "string" || firmware === "")) {
     return undefined;
   }
   return { id, model, firmware };
 }
 
 /**
- * A complete discovered device list (D14): every entry valid, and each
- * identity once. A list breaking either is invalid as a whole; there is no
- * partial list.
+ * A complete discovered device list (D14): every entry valid for whether
+ * metadata was read, and each identity once, in the order received. A list
+ * breaking either is invalid as a whole; there is no partial list.
  */
-export function validateDeviceList(value: unknown): DiscoveredDevice[] | undefined {
+export function validateDeviceList(value: unknown, metadata: boolean): DiscoveredDevice[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
   }
   const devices: DiscoveredDevice[] = [];
   const ids = new Set<string>();
   for (const entry of value) {
-    const device = deviceOf(entry);
+    const device = deviceOf(entry, metadata);
     if (device === undefined || ids.has(device.id)) {
       return undefined;
     }
@@ -161,7 +182,36 @@ export function validateDeviceList(value: unknown): DiscoveredDevice[] | undefin
   return devices;
 }
 
-/** A validated discovery outcome (K37 `discover`). */
-export function validateDiscovery(record: unknown): LifecycleOutcome<DiscoveredDevice[]> | undefined {
-  return validateLifecycle(record, validateDeviceList);
+/** The causes a discovery can fail with, all in its `discovery` phase. */
+const DISCOVERY_CAUSES: readonly string[] = [
+  "connection_failed",
+  "connection_lost",
+  "send_timeout",
+  "response_timeout",
+  "invalid_response",
+  "identity_error",
+  "discovery_timeout",
+  "internal_error",
+];
+
+/**
+ * A validated discovery outcome (K37 `discover`), for a discovery that read
+ * metadata or not. A failure is in the `discovery` phase with a cause a
+ * discovery has, and its cleanup is complete: it owns no connection.
+ */
+export function validateDiscovery(
+  record: unknown,
+  metadata: boolean,
+): LifecycleOutcome<DiscoveredDevice[]> | undefined {
+  const outcome = validateLifecycle(record, (value) => validateDeviceList(value, metadata));
+  if (outcome === undefined || outcome.kind === "success") {
+    return outcome;
+  }
+  const { failure, cleanup } = outcome;
+  const possible =
+    failure.phase === "discovery" &&
+    (failure.kind === "cancelled" || DISCOVERY_CAUSES.includes(failure.code)) &&
+    cleanup.state === "complete" &&
+    cleanup.failure === null;
+  return possible ? outcome : undefined;
 }
