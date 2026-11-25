@@ -144,10 +144,6 @@ struct State {
     /// The worker's unregistration of the remaining ownership, once done:
     /// its failure, if any.
     teardown: Option<Option<Failure>>,
-    /// Requests that expired during a hold whose completion has not run, and
-    /// their encoded bytes.
-    expiring: usize,
-    expiring_bytes: usize,
     /// The app-issued completion holding the wire slot.
     result: Option<HeldResult>,
     next_result: u64,
@@ -194,10 +190,10 @@ struct Shared {
     /// Signalled, with the state lock, when what a held result waits for may
     /// have changed: a notification or result adoption, an end, a close.
     advance: Condvar,
-    /// Requests that expired while a reply was held, to the one thread that
-    /// completes them, so their callbacks never hold the worker up. `None`
-    /// tells it to stop once what was sent before is completed.
-    expired: Mutex<Sender<Option<Item>>>,
+    /// Requests that expired while a reply was held, and the threads that
+    /// complete them, so their callbacks hold up neither the worker nor each
+    /// other.
+    expiry: Arc<Expiry>,
     /// Notifications waiting for the application (K6), when it takes them.
     notifications: Option<Mutex<Queue>>,
     /// Signalled when a batch can be formed or delivery must stop.
@@ -256,9 +252,6 @@ pub struct Connection {
     worker_id: ThreadId,
     delivery_id: Option<ThreadId>,
     reader: Mutex<Option<JoinHandle<()>>>,
-    /// The thread completing requests that expired during a hold.
-    expiry: Mutex<Option<JoinHandle<()>>>,
-    expiry_id: ThreadId,
     close: Arc<CloseCell>,
 }
 
@@ -390,13 +383,12 @@ impl Connection {
         let reader_sock = sock.try_clone()?;
         let worker_sock = sock.try_clone()?;
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let (expired, expiring) = mpsc::channel();
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
             settled: Condvar::new(),
             advance: Condvar::new(),
-            expired: Mutex::new(expired),
+            expiry: Arc::new(Expiry::default()),
             notifications: notifications
                 .as_ref()
                 .map(|_| Mutex::new(Queue::new(generation))),
@@ -409,10 +401,6 @@ impl Connection {
             let events = events.clone();
             thread::spawn(move || deliver_notifications(&shared, &handler, &events))
         });
-        let expiry_thread = {
-            let shared = Arc::clone(&shared);
-            thread::spawn(move || complete_expired(&shared, &expiring))
-        };
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_thread = {
             let sock = reader_sock;
@@ -439,8 +427,6 @@ impl Connection {
             worker_id: worker_thread.thread().id(),
             worker: Mutex::new(Some(worker_thread)),
             reader: Mutex::new(Some(reader_thread)),
-            expiry_id: expiry_thread.thread().id(),
-            expiry: Mutex::new(Some(expiry_thread)),
             close: Arc::new(CloseCell {
                 state: Mutex::new(CloseState::Open),
                 done: Condvar::new(),
@@ -523,8 +509,9 @@ impl Connection {
             };
             return done(cancelled, ResultAdoption::none());
         }
-        if state.waiting.len() + state.expiring >= MAX_WAITING_REQUESTS
-            || state.waiting_bytes + state.expiring_bytes + frame.len() > MAX_WAITING_BYTES
+        let (expiring, expiring_bytes) = self.shared.expiry.charged();
+        if state.waiting.len() + expiring >= MAX_WAITING_REQUESTS
+            || state.waiting_bytes + expiring_bytes + frame.len() > MAX_WAITING_BYTES
         {
             drop(state);
             return done(
@@ -633,8 +620,8 @@ impl Connection {
             (take_pending(&mut state), cause)
         };
         let (waiting, cause) = waiting;
-        // After the close is marked, no hold sends another expired request.
-        let _ = lock(&self.shared.expired).send(None);
+        // After the close is marked, no hold queues another expired request.
+        self.shared.expiry.stop();
         // A held result stops waiting for the application.
         self.shared.advance.notify_all();
         let _ = self.events.send(Event::Wake);
@@ -676,7 +663,6 @@ impl Connection {
                 lock(&self.worker).take(),
                 lock(&self.reader).take(),
                 lock(&self.delivery).take(),
-                lock(&self.expiry).take(),
             ],
             end,
         };
@@ -700,11 +686,13 @@ impl Connection {
         self.on_own_thread() || lock(&self.close.exempt).contains(&me)
     }
 
-    /// Whether this is the worker, the notification delivery thread or the
+    /// Whether this is the worker, the notification delivery thread or a
     /// thread completing expired requests.
     fn on_own_thread(&self) -> bool {
         let me = thread::current().id();
-        self.worker_id == me || self.delivery_id == Some(me) || self.expiry_id == me
+        self.worker_id == me
+            || self.delivery_id == Some(me)
+            || lock(&self.shared.expiry.pool).ids.contains(&me)
     }
 }
 
@@ -713,7 +701,7 @@ struct Teardown {
     shared: Arc<Shared>,
     reader_stop: Arc<AtomicBool>,
     sock: Option<TcpStream>,
-    threads: [Option<JoinHandle<()>>; 5],
+    threads: [Option<JoinHandle<()>>; 4],
     end: Instant,
 }
 
@@ -757,7 +745,7 @@ impl Teardown {
             None => self.shared.delivery_stop.store(true, Ordering::SeqCst),
         }
         self.shared.deliverable.notify_all();
-        let joined = wait_for(self.threads, self.end);
+        let joined = wait_for(self.threads, &self.shared.expiry, self.end);
         match (unregistered, joined) {
             (None, _) => {
                 CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown))
@@ -782,12 +770,24 @@ impl Teardown {
 /// `Incomplete`, even if the threads finish later. The joins run on their own
 /// thread, so a thread whose exit (its thread-local destructors included)
 /// does not finish cannot hold this past `end`.
-fn wait_for<const N: usize>(threads: [Option<JoinHandle<()>>; N], end: Instant) -> CloseOutcome {
+fn wait_for<const N: usize>(
+    threads: [Option<JoinHandle<()>>; N],
+    expiry: &Arc<Expiry>,
+    end: Instant,
+) -> CloseOutcome {
     let incomplete =
         CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
     let (joined, all_joined) = mpsc::channel();
+    let expiry = Arc::clone(expiry);
     thread::spawn(move || {
         for thread in threads.into_iter().flatten() {
+            let _ = thread.join();
+        }
+        // Taken after the worker is joined: it starts no expiry thread after.
+        // Their identities stay recorded, so a close from one never waits
+        // for itself.
+        let expiries = std::mem::take(&mut lock(&expiry.pool).threads);
+        for thread in expiries {
             let _ = thread.join();
         }
         let _ = joined.send(());
@@ -1026,21 +1026,94 @@ fn tear_down(
     shared.settled.notify_all();
 }
 
-/// The thread completing requests that expired during a hold, in order,
-/// until told to stop. A completion that blocks delays only the ones after
-/// it; their count stays charged to the queue meanwhile (K5, K6).
-fn complete_expired(shared: &Shared, expiring: &Receiver<Option<Item>>) {
-    while let Ok(Some(item)) = expiring.recv() {
-        let bytes = item.frame.len();
-        let timeout = Outcome::failed(
-            RequestCause::SendTimeout,
-            RequestPhase::Admission,
-            Evidence::NotSent,
-        );
-        deliver(item.done, timeout, ResultAdoption::none());
-        let mut state = shared.lock();
-        state.expiring -= 1;
-        state.expiring_bytes -= bytes;
+/// Requests that expired during a hold, waiting for a completing thread,
+/// and those threads (K5, K6).
+#[derive(Default)]
+struct Expiry {
+    pool: Mutex<ExpiryPool>,
+    /// Signalled when a request is queued or the threads must stop.
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct ExpiryPool {
+    queue: VecDeque<Item>,
+    /// Expired requests whose completion has not run, and their bytes: they
+    /// stay charged to the waiting-request limits until then.
+    charged: usize,
+    charged_bytes: usize,
+    /// Threads waiting for a request.
+    idle: usize,
+    threads: Vec<JoinHandle<()>>,
+    /// Identities of every thread started, kept for the connection's life.
+    ids: Vec<ThreadId>,
+    stopping: bool,
+}
+
+impl Expiry {
+    /// Queues expired requests, starting a thread for each one no idle
+    /// thread takes, so a blocked completion delays no other. Every queued
+    /// or running completion is charged, so the threads stay within the
+    /// waiting-request limit.
+    fn queue(self: &Arc<Self>, expired: VecDeque<Item>) {
+        let mut pool = lock(&self.pool);
+        for item in expired {
+            pool.charged += 1;
+            pool.charged_bytes += item.frame.len();
+            pool.queue.push_back(item);
+        }
+        let starting = pool.queue.len().saturating_sub(pool.idle);
+        for _ in 0..starting {
+            let expiry = Arc::clone(self);
+            // Registered before it can run: it waits for this lock first.
+            let thread = thread::spawn(move || expiry.complete());
+            pool.ids.push(thread.thread().id());
+            pool.threads.push(thread);
+        }
+        drop(pool);
+        self.ready.notify_all();
+    }
+
+    /// One completing thread: completes queued requests until told to stop
+    /// with none left.
+    fn complete(&self) {
+        let mut pool = lock(&self.pool);
+        loop {
+            if let Some(item) = pool.queue.pop_front() {
+                drop(pool);
+                let bytes = item.frame.len();
+                let timeout = Outcome::failed(
+                    RequestCause::SendTimeout,
+                    RequestPhase::Admission,
+                    Evidence::NotSent,
+                );
+                deliver(item.done, timeout, ResultAdoption::none());
+                pool = lock(&self.pool);
+                pool.charged -= 1;
+                pool.charged_bytes -= bytes;
+                continue;
+            }
+            if pool.stopping {
+                return;
+            }
+            pool.idle += 1;
+            pool = self
+                .ready
+                .wait(pool)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pool.idle -= 1;
+        }
+    }
+
+    /// Lets the threads end once nothing is queued; no hold follows.
+    fn stop(&self) {
+        lock(&self.pool).stopping = true;
+        self.ready.notify_all();
+    }
+
+    fn charged(&self) -> (usize, usize) {
+        let pool = lock(&self.pool);
+        (pool.charged, pool.charged_bytes)
     }
 }
 
@@ -1461,9 +1534,8 @@ impl Taken {
 fn finish(sock: &mut TcpStream, shared: &Shared, ended: Ended) {
     let _ = sock.shutdown(Shutdown::Both);
     ended.taken.complete(ended.cause);
-    // No hold follows: the expiry thread ends once it has completed what
-    // was sent to it.
-    let _ = lock(&shared.expired).send(None);
+    // No hold follows: the expiry threads end once nothing is queued.
+    shared.expiry.stop();
 }
 
 /// The outcomes a lifecycle job settled, to deliver once the end (if any) is
@@ -1998,15 +2070,9 @@ fn hold(
         state.waiting = waiting;
         if !expired.is_empty() {
             state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
-            // Still counted against the queue until completed; sent under the
-            // state lock, so a close marked after this sees them sent first.
-            let sender = lock(&shared.expired);
-            for item in expired {
-                state.expiring += 1;
-                state.expiring_bytes += item.frame.len();
-                let _ = sender.send(Some(item));
-            }
-            drop(sender);
+            // Queued under the state lock, so a close marked after this
+            // finds them queued before it stops the threads.
+            shared.expiry.queue(expired);
             continue;
         }
         let next = state
