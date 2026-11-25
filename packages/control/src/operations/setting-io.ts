@@ -14,6 +14,18 @@ export function refuse(code: OperationCause): never {
   throw new OperationFailureError({ code, phase: "preparation", progress: null });
 }
 
+/**
+ * `target` as a plain object whose own keys are among `allowed`, or a
+ * refusal: no inherited, extra or array-borne selectors reach an address.
+ */
+export function targetOf<T>(target: unknown, allowed: readonly string[]): T {
+  if (typeof target !== "object" || target === null || Object.getPrototypeOf(target) !== Object.prototype) {
+    return refuse("invalid_input");
+  }
+  const keys = Object.keys(target);
+  return keys.every((key) => allowed.includes(key)) ? (target as T) : refuse("invalid_input");
+}
+
 export function modelOf(model: string): Model {
   return isModel(model) ? model : refuse("unsupported_operation");
 }

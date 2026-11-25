@@ -34,11 +34,12 @@ import type {
 import { OperationFailureError } from "./failure.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
-import { address, modelOf, readDecoded, refuse, writeRaw, writeText } from "./setting-io.js";
+import { address, modelOf, readDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
 function channelOf(model: string, target: unknown): ChannelIndex {
-  const channel = channelIndex(modelOf(model), (target as ChannelTarget | null)?.channel);
+  const own = targetOf<ChannelSideTarget>(target, ["channel", "side"]);
+  const channel = channelIndex(modelOf(model), own.channel);
   return channel ?? refuse("invalid_input");
 }
 

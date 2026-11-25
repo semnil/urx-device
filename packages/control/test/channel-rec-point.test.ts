@@ -51,3 +51,29 @@ describe("Rec Point (F03-R)", () => {
     expect(transport.calls.map((call) => call.method)).toEqual(["getNumeric", "getNumeric", "getNumeric", "getNumeric"]);
   });
 });
+
+describe("target shapes", () => {
+  it("refuse extra, inherited and array-borne selectors before traffic", async () => {
+    const transport = new FakeTransport();
+    const c = new OperationContext(transport, "URX44");
+    const inherited = Object.create({ channel: 1 });
+    const array = Object.assign([], { channel: 1 });
+    for (const target of [{ channel: 1, track: 1 }, { channel: 1, bus: 1 }, { channel: 1, input: 1 }, inherited, array]) {
+      for (const id of ["channel.rec-point", "channel.fader", "channel.on"] as const) {
+        expect((await failureOf(readSetting(c, id, target)))?.code, `${id} ${JSON.stringify(target)}`).toBe("invalid_input");
+      }
+      expect(() => previewSetting("URX44", "channel.rec-point", target, "pre-eq")).toThrow();
+    }
+    for (const target of [{ input: 1, channel: 1 }, Object.create({ input: 1 })]) {
+      expect((await failureOf(readSetting(c, "input.gain", target)))?.code).toBe("invalid_input");
+    }
+    expect((await failureOf(readSetting(c, "source.gain", { source: "aux", channel: 1 } as never)))?.code).toBe(
+      "invalid_input",
+    );
+    expect(transport.calls).toEqual([]);
+    const ok = new FakeTransport().script("getNumeric", read("2"));
+    expect((await readSetting(new OperationContext(ok, "URX44"), "channel.rec-point", { channel: 1, side: undefined })).value).toBe(
+      "pre-eq",
+    );
+  });
+});

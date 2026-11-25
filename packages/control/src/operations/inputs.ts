@@ -15,12 +15,12 @@ import {
 import type { InputTarget, SourceTarget } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
-import { address, modelOf, readDecoded, refuse, writeRaw } from "./setting-io.js";
+import { address, modelOf, readDecoded, refuse, targetOf, writeRaw } from "./setting-io.js";
 
 /** The jack index of a target valid on `model`; `hiZ` also requires HI-Z. */
 function jackOf(model: string, target: unknown, hiZ = false): number {
   const known = modelOf(model);
-  const input = (target as InputTarget | null)?.input;
+  const input = targetOf<InputTarget>(target, ["input"]).input;
   if (typeof input !== "number" || !INPUT_JACKS[known].includes(input)) {
     return refuse("invalid_input");
   }
@@ -32,7 +32,7 @@ function jackOf(model: string, target: unknown, hiZ = false): number {
 
 function sourceOf(model: string, target: unknown): (typeof SOURCE_GAIN)[keyof typeof SOURCE_GAIN] {
   const known = modelOf(model);
-  const source = (target as SourceTarget | null)?.source;
+  const source = targetOf<SourceTarget>(target, ["source"]).source;
   if (!isSourceToken(source)) {
     return refuse("invalid_input");
   }
