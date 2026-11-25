@@ -294,6 +294,27 @@ impl Ledger {
         }
     }
 
+    /// Every address the connection may still have registered, in address
+    /// order: what a close unregisters before the connection is released
+    /// (K8). Each is reported once; its verdict is recorded with
+    /// [`Ledger::unregistered`].
+    pub fn remaining_registrations(&mut self) -> Vec<SubscriptionAddress> {
+        let mut remaining: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(address, entry)| {
+                entry.registration != Registration::NotRegistered
+                    && !self.unanswered.contains_key(*address)
+            })
+            .map(|(address, _)| *address)
+            .collect();
+        remaining.sort_by_key(|address| match address {
+            SubscriptionAddress::Parameter(a) => (0, a.param_id, a.x, a.y),
+            SubscriptionAddress::Meter(a) => (1, a.meter_id, a.x, 0),
+        });
+        remaining
+    }
+
     /// Forgets a token whose release has finished, freeing its capacity. An
     /// unregistration it named that was never answered makes the ledger
     /// unusable for further activations; one another token's release named
