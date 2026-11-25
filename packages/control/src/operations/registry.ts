@@ -140,8 +140,8 @@ function settled<T>(run: () => Promise<T>): Promise<T> {
 
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
-/** The IDs whose target type is exactly `T`. */
-type IdsTaking<T> = { [K in SettingId]: Same<Target<K>, T> extends true ? K : never }[SettingId];
+/** The IDs that accept a target of type `T` (a channel setting with an optional side accepts a plain channel). */
+type IdsTaking<T> = { [K in SettingId]: [T] extends [Target<K>] ? K : never }[SettingId];
 
 /** The writable IDs whose target and write types are exactly `T` and `I`. */
 type IdsWriting<T, I> = {
@@ -150,7 +150,7 @@ type IdsWriting<T, I> = {
 
 /**
  * The (id, target) pairs a read takes: each ID with its own target type. An
- * ID may also be any union of the IDs sharing that target type, so a list of
+ * ID may also be any union of the IDs that accept that target, so a list of
  * settings read alike type-checks however many it holds.
  */
 export type ReadArgs = { [K in SettingId]: [id: IdsTaking<Target<K>>, target: Target<K>] }[SettingId];

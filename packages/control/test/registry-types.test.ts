@@ -1,10 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
-  settingDefinitions,
+  settingIds,
   type ChannelTarget,
   type InputTarget,
   type SettingId,
-  type SettingTypes,
   type SourceTarget,
 } from "../src/catalog/settings.js";
 import { OperationContext } from "../src/operations/context.js";
@@ -12,10 +11,9 @@ import { previewSetting, readSetting, writeSetting, type ReadArgs } from "../src
 import { FakeTransport } from "./fake-transport.js";
 
 // Type-level checks: each line marked @ts-expect-error must fail to compile.
-type ChannelId = {
-  [K in SettingId]: SettingTypes[K]["target"] extends ChannelTarget ? (ChannelTarget extends SettingTypes[K]["target"] ? K : never) : never;
-}[SettingId];
-const channelIds = Object.keys(settingDefinitions).filter((id) => id.startsWith("channel.")) as ChannelId[];
+type ChannelId = Extract<SettingId, `channel.${string}`>;
+// The catalog's channel settings, filtered by name only: every one accepts a plain channel target.
+const channelIds = settingIds().filter((id): id is ChannelId => id.startsWith("channel."));
 
 describe("registry argument types", () => {
   it("bind each ID to its own target and value", () => {
@@ -53,6 +51,11 @@ describe("registry argument types", () => {
       const level: Promise<{ planned: number | "-inf" }> = writeSetting(context, levels, { channel: 1 }, -3);
       void level;
       void previewSetting("URX44", levels, { channel: 1 }, -3);
+      const sided = "channel.polarity" as "channel.polarity" | "channel.source";
+      void readSetting(context, sided, { channel: 5, side: "left" });
+      const sidedAndWhole = "channel.polarity" as "channel.polarity" | "channel.fader";
+      // @ts-expect-error a whole-channel setting takes no side
+      void readSetting(context, sidedAndWhole, { channel: 5, side: "left" });
       const withInput = "channel.on" as "channel.on" | "input.phantom";
       // @ts-expect-error a channel target is not an input target
       void readSetting(context, withInput, { channel: 1 });
