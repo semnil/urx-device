@@ -1741,7 +1741,7 @@ mod lifecycle {
     }
 
     #[test]
-    fn a_release_asked_during_a_successful_activation_still_unregisters() {
+    fn a_release_asked_during_the_last_registration_cancels_the_activation() {
         let peer = unit(Duration::from_millis(150), |_| Some(200));
         let connection = connect(&peer);
         let token = connection.prepare_subscription(&[p(1)]).unwrap();
@@ -1750,8 +1750,13 @@ mod lifecycle {
         let released = release(&token);
         assert_eq!(
             settled(&activated),
-            Ok(()),
-            "its only registration was already sent"
+            Err(LifecycleFailure {
+                failure: Failure::Cancelled {
+                    phase: Phase::Subscription
+                },
+                cleanup: Cleanup::COMPLETE,
+            }),
+            "a release during activation cancels it (K37), though its only registration was sent"
         );
         assert_eq!(settled(&released), Ok(()));
         assert_eq!(posts(&peer), [reg(1), unreg(1)]);
@@ -1974,6 +1979,11 @@ mod notifications {
     /// A unit that answers the handshake, accepts every POST after `delay`
     /// and writes whatever lines the returned sender is given.
     fn pushing_unit(delay: Duration) -> (u16, Sender<Vec<u8>>) {
+        pushing_unit_coded(delay, |_| 200)
+    }
+
+    /// `pushing_unit`, answering each POST with `code(request)`.
+    fn pushing_unit_coded(delay: Duration, code: fn(&Value) -> i64) -> (u16, Sender<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (push, pushed) = mpsc::channel::<Vec<u8>>();
@@ -1996,7 +2006,7 @@ mod notifications {
                         _ => {
                             thread::sleep(delay);
                             line(
-                                json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": 200 } } }),
+                                json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": code(&request) } } }),
                             )
                         }
                     };
@@ -2711,5 +2721,167 @@ mod notifications {
             activated.recv_timeout(Duration::from_secs(5)).unwrap(),
             Ok(())
         );
+    }
+
+    #[test]
+    fn notifications_adopted_after_an_end_do_not_make_a_held_result_normal() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        super::wait_until(|| connection.shared.link_end().is_some());
+        connection.adopt_notifications(first.ticket);
+        assert_eq!(
+            held.recv_timeout(Duration::from_secs(5)).unwrap().0,
+            Outcome::failed(
+                RequestCause::ConnectionLost,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
+            )
+        );
+    }
+
+    #[test]
+    fn notifications_adopted_after_an_end_do_not_activate_a_subscription() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        super::wait_until(|| connection.shared.link_end().is_some());
+        connection.adopt_notifications(first.ticket);
+        let failure = activated
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            Failure::Cause {
+                code: Cause::ConnectionLost,
+                phase: Phase::Subscription
+            }
+        );
+    }
+
+    #[test]
+    fn a_cancellation_during_the_last_registrations_cutoff_cleans_it_up() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        operation.cancel();
+        assert!(connection.adopt_notifications(first.ticket));
+        let failure = activated
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            Failure::Cancelled {
+                phase: Phase::Subscription
+            }
+        );
+        let state = connection.shared.lock();
+        assert!(!state.ledger.is_active(b.token()));
+        assert!(
+            state.ledger.recipients(p(2)).is_empty(),
+            "only the cancelled acquisition owned it, and it was unregistered"
+        );
+        assert_eq!(
+            state.ledger.recipients(p(1)).len(),
+            1,
+            "the existing owner keeps its address"
+        );
+    }
+
+    #[test]
+    fn a_waiting_request_expires_while_a_result_is_held() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let _ = tx.lock().unwrap().send(batch);
+        });
+        let short = crate::connection::ConnectionOptions {
+            send_deadline: Duration::from_millis(80),
+            ..options()
+        };
+        let connection = open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap();
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        let other = connection.create_operation().unwrap();
+        let waiting = submit_held(&connection, &other, 6);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            unsent_with(RequestCause::SendTimeout),
+            "completed while the earlier result is still held"
+        );
+        assert!(held.try_recv().is_err(), "still held");
+        assert_eq!(connection.shared.lock().waiting_bytes, 0);
+    }
+
+    #[test]
+    fn a_rejection_held_for_its_cutoff_stays_a_rejection_when_the_link_ends() {
+        let (port, push) = pushing_unit_coded(Duration::from_millis(200), |request| {
+            if request["vdp"]["uri"] == "/vd/parameters/2:0:0?operation=regist" {
+                409
+            } else {
+                200
+            }
+        });
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        let failure = activated
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            Failure::Cause {
+                code: Cause::DeviceRejected,
+                phase: Phase::Subscription
+            }
+        );
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
     }
 }

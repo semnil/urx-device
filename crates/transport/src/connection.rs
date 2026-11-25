@@ -134,6 +134,9 @@ struct State {
     /// The end recorded in `Shared::link_end`, mirrored for the waits that
     /// hold the state lock (K12).
     ended: Option<RequestCause>,
+    /// Notification records acknowledged when the end was recorded: a held
+    /// reply whose cutoff they reach was released before the end (K12).
+    ended_adopted: u64,
     /// The app-issued completion holding the wire slot.
     result: Option<HeldResult>,
     next_result: u64,
@@ -1158,9 +1161,12 @@ fn serve(
                 if holds {
                     // Nothing starts on the wire until the result is
                     // adopted; an end or a close does not wait for it.
-                    hold(&shared, |state| {
-                        state.result.as_ref().is_none_or(|held| held.adopted)
-                    });
+                    hold(
+                        &shared,
+                        options.send_deadline,
+                        |state| state.result.as_ref().is_none_or(|held| held.adopted),
+                        |_| false,
+                    );
                     shared.lock().result = None;
                 }
                 None
@@ -1186,10 +1192,23 @@ fn serve(
 fn record_end(shared: &Shared, cause: RequestCause) -> RequestCause {
     let mut link_end = shared.link_end();
     let cause = *link_end.get_or_insert(cause);
-    shared.lock().ended = Some(cause);
+    note_end(shared, &mut shared.lock(), cause);
     drop(link_end);
     shared.advance.notify_all();
     cause
+}
+
+/// Mirrors the recorded end into the state, once, with the notification
+/// records acknowledged at that moment.
+fn note_end(shared: &Shared, state: &mut State, cause: RequestCause) {
+    if state.ended.is_none() {
+        state.ended = Some(cause);
+        // The queue lock is taken under the state lock, never the reverse.
+        state.ended_adopted = shared
+            .notifications
+            .as_ref()
+            .map_or(0, |queue| lock(queue).adopted());
+    }
 }
 
 /// Records `cause` as the end of the connection and takes the waiting
@@ -1201,7 +1220,7 @@ fn mark_ended(shared: &Shared, cause: RequestCause) -> Ended {
     let mut link_end = shared.link_end();
     let cause = *link_end.get_or_insert(cause);
     let mut state = shared.lock();
-    state.ended = Some(cause);
+    note_end(shared, &mut state, cause);
     state.terminal.get_or_insert(cause);
     let taken = take_pending(&mut state);
     drop(state);
@@ -1353,8 +1372,9 @@ enum Posted {
     Refused {
         verdict: Verdict,
         cause: RequestCause,
-        /// Whether it ends the connection by itself.
-        ends: bool,
+        /// The end of the connection it comes with, if any: its own cause,
+        /// or an end recorded meanwhile that leaves its verdict as it is.
+        ends: Option<RequestCause>,
     },
     /// Not started, because the operation was cancelled or the release asked.
     Stopped,
@@ -1392,7 +1412,7 @@ impl Io<'_> {
             ends,
         };
         let Ok(frame) = frame::encode(&request.message()) else {
-            return refused(Verdict::Rejected, RequestCause::InternalError, false);
+            return refused(Verdict::Rejected, RequestCause::InternalError, None);
         };
         let key = request.reply_key();
         let send_end = Instant::now() + self.options.send_deadline;
@@ -1413,7 +1433,7 @@ impl Io<'_> {
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
             Ok(held) => {
-                let ending = match await_cutoff(self.shared, &held) {
+                let ending = match await_cutoff(self.shared, self.options, &held) {
                     Held::Ready | Held::Closing => None,
                     Held::Ended(cause) => Some(cause),
                 };
@@ -1421,22 +1441,25 @@ impl Io<'_> {
                     .inbound
                     .reply(&key)
                     .expect("exchange returns the matching reply");
-                if let Some(cause) = ending {
-                    let verdict = match reply.post_verdict() {
-                        PostVerdict::Accepted => Verdict::Accepted,
-                        PostVerdict::Rejected(_) => Verdict::Rejected,
-                        PostVerdict::Malformed => Verdict::Unknown,
-                    };
-                    return refused(verdict, cause, true);
-                }
-                match reply.post_verdict() {
+                let posted = match reply.post_verdict() {
                     PostVerdict::Accepted => Posted::Accepted,
                     PostVerdict::Rejected(_) => {
-                        refused(Verdict::Rejected, RequestCause::DeviceRejected, false)
+                        refused(Verdict::Rejected, RequestCause::DeviceRejected, None)
                     }
                     PostVerdict::Malformed => {
-                        refused(Verdict::Unknown, RequestCause::InvalidResponse, false)
+                        refused(Verdict::Unknown, RequestCause::InvalidResponse, None)
                     }
+                };
+                // An end before the verdict is consumed ends the connection;
+                // an acceptance then fails with it, and a refusal keeps its
+                // own cause (K34).
+                match (posted, ending) {
+                    (posted, None) => posted,
+                    (Posted::Accepted, Some(end)) => refused(Verdict::Accepted, end, Some(end)),
+                    (Posted::Refused { verdict, cause, .. }, Some(end)) => {
+                        refused(verdict, cause, Some(end))
+                    }
+                    (Posted::Stopped, Some(_)) => Posted::Stopped,
                 }
             }
             Err(failed) => match failed.failure {
@@ -1447,7 +1470,7 @@ impl Io<'_> {
                     } else {
                         Verdict::Unknown
                     };
-                    refused(verdict, code, failed.ends.is_some())
+                    refused(verdict, code, failed.ends)
                 }
             },
         }
@@ -1510,23 +1533,35 @@ impl Io<'_> {
                 } => {
                     self.shared.lock().ledger.registered(address, verdict);
                     let failed = Failure::cause(lifecycle_cause(cause), Phase::Subscription);
-                    failure = Some((failed, ends.then_some(cause)));
+                    failure = Some((failed, ends));
                     break;
                 }
             }
         }
-        let Some((failure, ends)) = failure else {
-            let mut state = self.shared.lock();
-            state.ledger.activate(token);
-            if state.ledger.is_active(token) {
-                return done(Ok(()), None, false);
+        let (failure, ends) = match failure {
+            Some(failure) => failure,
+            None => {
+                // The stop check and the activation happen under one lock: a
+                // cancellation or release accepted first is cleaned up.
+                let mut state = self.shared.lock();
+                if stopped(&state) {
+                    let cancelled = Failure::Cancelled {
+                        phase: Phase::Subscription,
+                    };
+                    (cancelled, None)
+                } else {
+                    state.ledger.activate(token);
+                    if state.ledger.is_active(token) {
+                        return done(Ok(()), None, false);
+                    }
+                    drop(state);
+                    let failure = LifecycleFailure {
+                        failure: Failure::cause(Cause::PreconditionFailed, Phase::Subscription),
+                        cleanup: Cleanup::COMPLETE,
+                    };
+                    return done(Err(failure), None, false);
+                }
             }
-            drop(state);
-            let failure = LifecycleFailure {
-                failure: Failure::cause(Cause::PreconditionFailed, Phase::Subscription),
-                cleanup: Cleanup::COMPLETE,
-            };
-            return done(Err(failure), None, false);
         };
         // A failed activation's cleanup is the token's release: it is
         // recorded as running before any unregistration, so a release asked
@@ -1573,10 +1608,14 @@ impl Io<'_> {
         let addresses = self.shared.lock().ledger.begin_release(token);
         for address in addresses {
             let posted = self.post(unregister(address), &|_| false);
-            let (verdict, cause) = match posted {
-                Posted::Accepted => (Verdict::Accepted, None),
-                Posted::Refused { verdict, cause, .. } => (verdict, Some(cause)),
-                Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected)),
+            let (verdict, cause, ends) = match posted {
+                Posted::Accepted => (Verdict::Accepted, None, None),
+                Posted::Refused {
+                    verdict,
+                    cause,
+                    ends,
+                } => (verdict, Some(cause), ends),
+                Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected), None),
             };
             self.shared.lock().ledger.unregistered(address, verdict);
             if let Some(cause) = cause {
@@ -1586,7 +1625,7 @@ impl Io<'_> {
                     state: CleanupState::ConnectionClosed,
                     failure: Some(failure),
                 };
-                return (cleanup, Some(cause));
+                return (cleanup, Some(ends.unwrap_or(cause)));
             }
         }
         self.shared.lock().ledger.finish(token);
@@ -1661,7 +1700,7 @@ fn execute(
                     .reply(key)
                     .expect("exchange returns the matching reply"),
             );
-            match await_cutoff(shared, &reply) {
+            match await_cutoff(shared, options, &reply) {
                 Held::Ready | Held::Closing => (outcome, None),
                 Held::Ended(cause) => (at_delivery(outcome, cause), Some(cause)),
             }
@@ -1694,38 +1733,91 @@ enum Held {
 
 /// Waits until `ready`, or until the connection ends or closes: fatal
 /// stopping and a close never wait for the application (K6, K12).
-fn hold(shared: &Shared, ready: impl Fn(&State) -> bool) -> Held {
+fn hold(
+    shared: &Shared,
+    send_deadline: Duration,
+    ready: impl Fn(&State) -> bool,
+    ready_before_end: impl Fn(&State) -> bool,
+) -> Held {
     let mut state = shared.lock();
     loop {
+        // Once an end is recorded, only what was ready before it counts:
+        // what the application adopts afterwards does not turn the result
+        // into a normal one.
+        if let Some(cause) = state.ended {
+            return if ready_before_end(&state) {
+                Held::Ready
+            } else {
+                Held::Ended(cause)
+            };
+        }
         if ready(&state) {
             return Held::Ready;
-        }
-        if let Some(cause) = state.ended {
-            return Held::Ended(cause);
         }
         if state.closing {
             return Held::Closing;
         }
-        state = shared
-            .advance
-            .wait(state)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Waiting requests whose send budget runs out meanwhile complete
+        // unsent, releasing their queue capacity (K5, K6).
+        let now = Instant::now();
+        let (expired, waiting): (VecDeque<Item>, VecDeque<Item>) =
+            std::mem::take(&mut state.waiting)
+                .into_iter()
+                .partition(|item| item.submitted + send_deadline <= now);
+        state.waiting = waiting;
+        if !expired.is_empty() {
+            state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
+            drop(state);
+            for item in expired {
+                let timeout = Outcome::failed(
+                    RequestCause::SendTimeout,
+                    RequestPhase::Admission,
+                    Evidence::NotSent,
+                );
+                deliver(item.done, timeout, ResultAdoption::none());
+            }
+            state = shared.lock();
+            continue;
+        }
+        let next = state
+            .waiting
+            .iter()
+            .map(|item| item.submitted + send_deadline)
+            .min();
+        state = match next {
+            Some(at) => {
+                shared
+                    .advance
+                    .wait_timeout(state, at.saturating_duration_since(now))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0
+            }
+            None => shared
+                .advance
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        };
     }
 }
 
 /// Holds a reply until every notification record received before it is
 /// adopted (K12), or the connection ends or closes.
-fn await_cutoff(shared: &Shared, reply: &Answer) -> Held {
+fn await_cutoff(shared: &Shared, options: &ConnectionOptions, reply: &Answer) -> Held {
     if let Some(cause) = reply.ending {
         return Held::Ended(cause);
     }
-    // The queue lock is taken under the state lock only here.
-    hold(shared, |_| {
-        shared
-            .notifications
-            .as_ref()
-            .is_none_or(|queue| lock(queue).has_adopted(reply.cutoff))
-    })
+    // The queue lock is taken under the state lock, never the reverse.
+    hold(
+        shared,
+        options.send_deadline,
+        |_| {
+            shared
+                .notifications
+                .as_ref()
+                .is_none_or(|queue| lock(queue).has_adopted(reply.cutoff))
+        },
+        |state| state.ended_adopted >= reply.cutoff,
+    )
 }
 
 /// An established result whose normal delivery cannot complete because the

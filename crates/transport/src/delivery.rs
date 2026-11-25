@@ -171,6 +171,11 @@ impl Queue {
         self.adopted >= cutoff
     }
 
+    /// Records acknowledged so far.
+    pub fn adopted(&self) -> u64 {
+        self.adopted
+    }
+
     pub fn is_idle(&self) -> bool {
         self.in_delivery.is_none() && self.pending.is_empty()
     }
