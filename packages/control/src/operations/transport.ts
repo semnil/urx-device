@@ -51,15 +51,17 @@ export interface Transport {
   setText(address: ParameterAddress, value: string, request: TransportRequest): Promise<unknown>;
   /**
    * Acknowledges the validated result of `requestTicket`, releasing its
-   * completion slot; no device I/O. At most once per ticket.
+   * completion slot; no device I/O. At most once per ticket. It settles
+   * once the slot is released; a rejection means it could not be.
    */
-  adoptResult(requestTicket: RequestTicket): void;
+  adoptResult(requestTicket: RequestTicket): Promise<void>;
   /**
    * Reports that the result of `requestTicket` could not be adopted: its
    * record was invalid or its promise rejected. The adapter applies its
-   * fatal rules to the slot instead of releasing it as adopted.
+   * fatal rules to the slot instead of releasing it as adopted, and settles
+   * once it has.
    */
-  failDelivery(requestTicket: RequestTicket): void;
+  failDelivery(requestTicket: RequestTicket): Promise<void>;
 }
 
 /** The records the methods resolve with, once validated. */

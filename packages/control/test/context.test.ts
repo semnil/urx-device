@@ -22,6 +22,39 @@ describe("operation context", () => {
     expect(transport.calls[1]).toMatchObject({ method: "setText", value: "Lead " });
   });
 
+  it("waits for the adoption before returning, and keeps evidence when it fails", async () => {
+    const success = { kind: "success", value: null, evidence: { state: "accepted" } };
+    const rejected = {
+      kind: "failure",
+      failure: { kind: "cause", code: "device_rejected", phase: "response" },
+      evidence: { state: "rejected", responseCode: "409" },
+    };
+    const transport = new FakeTransport().script("setNumeric", success);
+    const context = new OperationContext(transport, "URX44");
+    await context.setNumeric(address, "1");
+    expect(transport.adopted).toEqual(["t0"]);
+    for (const completion of ["throw", "reject"] as const) {
+      const failing = new FakeTransport().script("setNumeric", success, rejected);
+      failing.completion = completion;
+      const failingContext = new OperationContext(failing, "URX44");
+      expect(await failingContext.setNumeric(address, "1")).toEqual({
+        kind: "failure",
+        failure: { kind: "cause", code: "internal_error", phase: "delivery" },
+        evidence: { state: "accepted" },
+      });
+      expect(await failingContext.setNumeric(address, "1")).toEqual(rejected);
+    }
+  });
+
+  it("turns a failed delivery report into the same internal_error", async () => {
+    for (const completion of ["throw", "reject"] as const) {
+      const transport = new FakeTransport().script("getText", { kind: "success", value: 1, evidence: { state: "read" } });
+      transport.completion = completion;
+      const error = await new OperationContext(transport, "URX44").getText(address).catch((caught: unknown) => caught);
+      expect(operationFailureOf(error)).toEqual({ code: "internal_error", phase: "delivery", progress: null });
+    }
+  });
+
   it("takes tickets from the connection, so two operations never share one", async () => {
     const success = { kind: "success", value: "1", evidence: { state: "read" } };
     const transport = new FakeTransport().script("getNumeric", success, success);

@@ -17,6 +17,29 @@ import {
 } from "./native.js";
 import type { ParameterAddress, Transport, TransportOperation } from "./transport.js";
 
+/** Runs `call`, turning a throw or a rejection into false. */
+async function settle(call: () => Promise<void>): Promise<boolean> {
+  try {
+    await call();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A success whose delivery failed: `internal_error` at delivery, same evidence. */
+function atDelivery<T>(record: T): T {
+  const result = record as { kind: string; evidence: unknown };
+  if (result.kind !== "success") {
+    return record;
+  }
+  return {
+    kind: "failure",
+    failure: { kind: "cause", code: "internal_error", phase: "delivery" },
+    evidence: result.evidence,
+  } as T;
+}
+
 /** The owner of one logical operation over one connection. */
 export class OperationContext {
   readonly transport: Transport;
@@ -87,8 +110,10 @@ export class OperationContext {
   ): Promise<T> {
     // Issued by the connection, so it releases only this request's slot.
     const requestTicket = this.transport.newRequestTicket();
-    const undelivered = () => {
-      this.transport.failDelivery(requestTicket);
+    const undelivered = async () => {
+      // Awaited, so the slot is handed over before the caller can finish;
+      // its own failure changes nothing about this one.
+      await settle(() => this.transport.failDelivery(requestTicket));
       return new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
     };
     let raw: unknown;
@@ -96,14 +121,20 @@ export class OperationContext {
       raw = await send({ operation: this.#operation, requestTicket });
     } catch {
       // A rejected native promise is not evidence of anything (K33).
-      throw undelivered();
+      throw await undelivered();
     }
     const record = validate(raw);
     if (record === undefined) {
       // Its claimed evidence is not adopted (K34).
-      throw undelivered();
+      throw await undelivered();
     }
-    this.transport.adoptResult(requestTicket);
-    return record;
+    if (await settle(() => this.transport.adoptResult(requestTicket))) {
+      return record;
+    }
+    // Established evidence could not be delivered normally: a success fails
+    // at delivery keeping its evidence; a failure (a rejection included)
+    // stays as received (K34).
+    await settle(() => this.transport.failDelivery(requestTicket));
+    return atDelivery(record);
   }
 }

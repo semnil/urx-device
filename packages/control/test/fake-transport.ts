@@ -68,12 +68,32 @@ export class FakeTransport implements Transport {
     return `t${this.#nextTicket++}`;
   }
 
-  adoptResult(requestTicket: string): void {
-    this.adopted.push(requestTicket);
+  /** How `adoptResult` and `failDelivery` complete; resolving by default. */
+  completion: "resolve" | "throw" | "reject" = "resolve";
+
+  adoptResult(requestTicket: string): Promise<void> {
+    return this.#complete(() => this.adopted.push(requestTicket));
   }
 
-  failDelivery(requestTicket: string): void {
-    this.undelivered.push(requestTicket);
+  failDelivery(requestTicket: string): Promise<void> {
+    return this.#complete(() => this.undelivered.push(requestTicket));
+  }
+
+  #complete(record: () => void): Promise<void> {
+    if (this.completion === "throw") {
+      throw new Error("adapter failure");
+    }
+    // Recorded only once the asynchronous completion runs.
+    return new Promise((resolve, reject) => {
+      setTimeout(() => {
+        record();
+        if (this.completion === "reject") {
+          reject(new Error("adapter failure"));
+        } else {
+          resolve();
+        }
+      }, 1);
+    });
   }
 
   #answer(
