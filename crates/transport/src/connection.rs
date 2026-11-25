@@ -584,16 +584,28 @@ impl Connection {
         })
     }
 
-    /// Closes the connection. In order: new submissions and any request not
-    /// yet started on the wire are refused, waiting requests complete unsent
-    /// as `not_connected` (on a separate thread, so their callbacks never hold
-    /// the close up), the request already being sent settles under its own
-    /// deadlines, and then, within `teardown`, the worker unregisters every
-    /// address the connection may still have registered (once each,
-    /// stopping at the first failure; nothing once the link has ended), the
-    /// socket is shut down and released and the threads must finish.
-    /// Repeated and concurrent calls share the first call's close and its
-    /// outcome; none starts a second shutdown or sends anything more.
+    /// Closes the connection. In order:
+    ///
+    /// 1. New submissions and any request not yet started on the wire are
+    ///    refused. Waiting requests and lifecycle calls not yet started
+    ///    complete unsent as `not_connected` (on a separate thread, so their
+    ///    callbacks never hold the close up).
+    /// 2. The request already being sent settles under its own deadlines. A
+    ///    lifecycle call already running goes on to its end: its remaining
+    ///    registrations stop, but its owned cleanup (a release, or the
+    ///    cleanup of a failed or cancelled activation) sends its
+    ///    unregistrations under their own deadlines, not `teardown`.
+    /// 3. Only then does `teardown` start. Within it, the worker unregisters
+    ///    every address the connection may still have registered (once
+    ///    each, stopping at the first failure; nothing once the link has
+    ///    ended), and the socket is shut down and released and the threads
+    ///    must finish.
+    ///
+    /// So a close may take longer than `teardown` by the cleanup running when
+    /// it was called. A cleanup unregistration that fails after the close is
+    /// called makes the outcome `Failed`. Repeated and concurrent calls share
+    /// the first call's close and its outcome; none starts a second shutdown
+    /// or sends anything more.
     pub fn close(&self, teardown: Duration) -> CloseOutcome {
         let waiting = {
             let mut close = lock(&self.close.state);
