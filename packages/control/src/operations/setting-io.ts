@@ -3,6 +3,7 @@
 // reported with its actual outcome (K3, K34, W1).
 
 import type { I64Text } from "../catalog/i64.js";
+import type { ChannelName } from "../catalog/settings.js";
 import { isModel, type Model } from "../catalog/models.js";
 import type { OperationContext, Received } from "./context.js";
 import { OperationFailureError, type OperationCause } from "./failure.js";
@@ -87,6 +88,14 @@ export async function readTextDecoded<V>(
 ): Promise<Reading<V>> {
   const { raw, observedAt } = await readValue(context, context.getText(at));
   return decoded(decode(raw), observedAt);
+}
+
+/** The single name read of `at` (F03-K): received text as is, or a numeric preset index. */
+export async function readName(context: OperationContext, at: ParameterAddress): Promise<Reading<ChannelName>> {
+  const { raw, observedAt } = await readValue(context, context.getName(at));
+  // Received as is: not clipped, trimmed or normalized.
+  const value: ChannelName = raw.kind === "text" ? { kind: "text", text: raw.value } : { kind: "preset", presetIndex: raw.value };
+  return { value, observedAt };
 }
 
 function outcomeOf(evidence: PostEvidence): WriteOutcome {

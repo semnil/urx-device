@@ -6,6 +6,7 @@ import { frozen } from "./frozen.js";
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
 import { DUCKER_RULES } from "./ducker.js";
 import { SEND_RULES } from "./sends.js";
+import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE, type BUS_TOKENS } from "./buses.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -103,6 +104,15 @@ export const settingDefinitions = frozen({
   "send.level": { readable: true, writable: true, rule: SEND_RULES["send.level"] },
   "send.pan": { readable: true, writable: false, rule: SEND_RULES["send.pan"] },
   "send.tap": { readable: true, writable: true, rule: SEND_RULES["send.tap"] },
+  "bus.on": { readable: true, writable: true, rule: BUS_RULES["bus.on"] },
+  "bus.fader": { readable: true, writable: true, rule: BUS_RULES["bus.fader"] },
+  "bus.balance": { readable: true, writable: true, rule: BUS_RULES["bus.balance"] },
+  "bus.type": { readable: true, writable: false, rule: BUS_RULES["bus.type"] },
+  "bus.pan-link": { readable: true, writable: true, rule: BUS_RULES["bus.pan-link"] },
+  "bus.stereo-assign": { readable: true, writable: true, rule: BUS_RULES["bus.stereo-assign"] },
+  "bus.name": { readable: true, writable: true, rule: BUS_RULES["bus.name"] },
+  "bus.color": { readable: true, writable: true, rule: BUS_RULES["bus.color"] },
+  "channel.stereo-assign": { readable: true, writable: true, rule: CHANNEL_STEREO_ASSIGN_RULE },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -150,6 +160,12 @@ export interface ChannelSsmcsBandTarget {
   readonly side?: undefined;
 }
 
+/** One bus by its token (F05-B). */
+export interface BusTarget {
+  readonly bus: (typeof BUS_TOKENS)[number];
+  readonly band?: never;
+}
+
 /** One existing send, by source and destination token (F05-S). */
 export interface SendTarget {
   readonly source: string;
@@ -185,6 +201,9 @@ export type GateRange = number | "-inf";
 /** A compressor ratio: finite N for N:1, or infinity (F04-D). */
 export type CompRatio = number | "inf";
 export type CompKnee = "soft" | "medium" | "hard";
+
+/** A MIX bus type (F05-B). */
+export type BusType = "vari" | "fixed";
 
 /** A send tap point (F05-S). */
 export type SendTap = "pre" | "post";
@@ -273,6 +292,15 @@ export interface SettingTypes {
   "send.level": { target: SendTarget; value: FaderLevel };
   "send.pan": { target: SendTarget; value: number };
   "send.tap": { target: SendTarget; value: SendTap };
+  "bus.on": { target: BusTarget; value: boolean };
+  "bus.fader": { target: BusTarget; value: FaderLevel };
+  "bus.balance": { target: BusTarget; value: number };
+  "bus.type": { target: BusTarget; value: BusType };
+  "bus.pan-link": { target: BusTarget; value: boolean };
+  "bus.stereo-assign": { target: BusTarget; value: boolean };
+  "bus.name": { target: BusTarget; value: ChannelName; input: string };
+  "bus.color": { target: BusTarget; value: ChannelColor };
+  "channel.stereo-assign": { target: ChannelTarget; value: boolean };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

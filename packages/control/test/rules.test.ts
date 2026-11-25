@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
 import { DUCKER_RULES } from "../src/catalog/ducker.js";
+import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE } from "../src/catalog/buses.js";
 import { SEND_RULES } from "../src/catalog/sends.js";
 import { DYNAMICS_RULES } from "../src/catalog/dynamics.js";
 import { EQ_RULES } from "../src/catalog/eq.js";
@@ -20,10 +21,10 @@ const ruled = Object.entries(settingDefinitions as Record<string, SettingDefinit
   definition.rule === undefined ? [] : [[id, definition.rule] as [string, SettingRule]],
 );
 
-const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES };
+const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES, ...BUS_RULES, "channel.stereo-assign": CHANNEL_STEREO_ASSIGN_RULE };
 
-/** The channel and band rules; send rules, addressed by route, have their own tests. */
-const addressed = ruled.flatMap(([id, rule]) => (rule.target === "send" ? [] : [[id, rule] as const]));
+/** The channel and band rules; send and bus rules, addressed per route or bus, have their own tests. */
+const addressed = ruled.flatMap(([id, rule]) => (rule.target === "send" || rule.target === "bus" ? [] : [[id, rule] as const]));
 
 /** Each (id, target, value rule) a rule defines: one per band for a band rule. */
 const valueCases = addressed.flatMap(([id, rule]): [string, object, ValueRule][] => {

@@ -31,10 +31,9 @@ import type {
   Polarity,
   RecPoint,
 } from "../catalog/settings.js";
-import { OperationFailureError } from "./failure.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
-import { address, modelOf, readDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
+import { address, modelOf, readDecoded, readName, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
 /** The channel a target names and its side, each read once from the target's own values. */
@@ -249,12 +248,12 @@ export const channelPanMode = {
 };
 
 /** Whether `name` is writable: at most 8 Unicode scalar values, no C0/C1 controls (F03-K). */
-function writableName(name: unknown): name is string {
+export function writableName(name: unknown, maxCodePoints: number = NAME_MAX_CODE_POINTS): name is string {
   if (typeof name !== "string") {
     return false;
   }
   const points = Array.from(name);
-  if (points.length > NAME_MAX_CODE_POINTS) {
+  if (points.length > maxCodePoints) {
     return false;
   }
   return points.every((point) => {
@@ -273,21 +272,8 @@ function namePlan(model: string, target: ChannelTarget, value: string) {
 
 /** A channel's name (F03-K): text written as given; read as text or a preset index. */
 export const channelName = {
-  async read(context: OperationContext, target: ChannelTarget): Promise<Reading<ChannelName>> {
-    const at = wholeAddress(IDENTITY_PARAMS.name, wholeChannel(context.model, target));
-    const { record, observedAt } = await context.getName(at);
-    if (record.kind === "failure") {
-      throw context.failureOf(record, null);
-    }
-    if (observedAt === undefined) {
-      throw new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
-    }
-    // Received as is: not clipped, trimmed or normalized.
-    const value: ChannelName =
-      record.value.kind === "text"
-        ? { kind: "text", text: record.value.value }
-        : { kind: "preset", presetIndex: record.value.value };
-    return { value, observedAt };
+  read(context: OperationContext, target: ChannelTarget): Promise<Reading<ChannelName>> {
+    return readName(context, wholeAddress(IDENTITY_PARAMS.name, wholeChannel(context.model, target)));
   },
   plan(model: string, target: ChannelTarget, value: string): WritePlan<string> {
     const { requested, planned } = namePlan(model, target, value);
