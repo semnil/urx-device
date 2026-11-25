@@ -3236,4 +3236,17 @@ mod notifications {
         );
         super::wait_until(|| connection.shared.lock().expiring == 0);
     }
+
+    #[test]
+    fn the_expiry_thread_ends_with_the_connection_without_a_close() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        push.send(lost()).unwrap();
+        super::wait_until(|| connection.terminal().is_some());
+        super::wait_until(|| {
+            crate::connection::lock(&connection.expiry)
+                .as_ref()
+                .is_some_and(|thread| thread.is_finished())
+        });
+    }
 }
