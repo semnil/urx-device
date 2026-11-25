@@ -8,3 +8,5 @@ export type * from "./native.js";
 export { readSetting, settingHandlers } from "./registry.js";
 export type { SettingHandler, SettingHandlers } from "./registry.js";
 export type * from "./transport.js";
+export { validateDeviceList, validateDiscovery, validateLifecycle } from "./lifecycle.js";
+export type * from "./lifecycle.js";
