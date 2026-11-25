@@ -147,6 +147,9 @@ struct State {
     /// The worker's unregistration of the remaining ownership, once done:
     /// its failure, if any.
     teardown: Option<Option<Failure>>,
+    /// The first failure of an owned cleanup's unregistration determined
+    /// after the close was marked: the close reports it (K37).
+    close_cleanup_failure: Option<Failure>,
     /// The app-issued completion holding the wire slot.
     result: Option<HeldResult>,
     next_result: u64,
@@ -716,11 +719,13 @@ impl Teardown {
         let unregistered = {
             let mut state = self.shared.lock();
             loop {
+                // A cleanup that failed after the close was marked comes
+                // first: the worker's teardown follows it.
                 if let Some(failure) = state.teardown {
-                    break Some(failure);
+                    break Some(state.close_cleanup_failure.or(failure));
                 }
                 if state.terminal.is_some() {
-                    break Some(None);
+                    break Some(state.close_cleanup_failure);
                 }
                 let remaining = self.end.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -1947,7 +1952,13 @@ impl Io<'_> {
             };
             self.shared.lock().ledger.unregistered(address, verdict);
             if let Some(cause) = cause {
-                self.shared.lock().ledger.finish(token);
+                let mut state = self.shared.lock();
+                state.ledger.finish(token);
+                if state.closing {
+                    let teardown = Failure::cause(lifecycle_cause(cause), Phase::Teardown);
+                    state.close_cleanup_failure.get_or_insert(teardown);
+                }
+                drop(state);
                 let failure = Failure::cause(lifecycle_cause(cause), Phase::Subscription);
                 let cleanup = Cleanup {
                     state: CleanupState::ConnectionClosed,
@@ -2351,8 +2362,14 @@ fn write_frame<O: Outgoing>(
             return failed(RequestCause::SendTimeout);
         }
         if written == 0 {
-            if let Some(stop) = unstarted(&shared.lock()) {
+            let state = shared.lock();
+            if let Some(stop) = unstarted(&state) {
                 return Err(WriteError::Stopped(stop));
+            }
+            drop(state);
+            // And after the state lock, the last wait before the write.
+            if Instant::now() >= end {
+                return failed(RequestCause::SendTimeout);
             }
         }
         let outcome = sock.write(&frame[written..]);

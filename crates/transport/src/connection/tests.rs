@@ -1032,6 +1032,33 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
 }
 
 #[test]
+fn a_write_does_not_start_once_waiting_for_the_state_used_up_its_budget() {
+    let frame = vec![b'x'; 30];
+    let mut sock = scripted(None);
+    let shared = Arc::clone(&sock.shared);
+    let (held_tx, held) = mpsc::channel();
+    let holder = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            let _state = shared.lock();
+            held_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        })
+    };
+    held.recv().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        Err(super::WriteError::Failed {
+            cause: RequestCause::SendTimeout,
+            written: 0
+        })
+    );
+    assert!(sock.written.is_empty());
+    holder.join().unwrap();
+}
+
+#[test]
 fn a_write_never_starts_after_the_reader_records_the_end() {
     let frame = vec![b'x'; 30];
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2130,6 +2157,53 @@ mod lifecycle {
         );
         assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
         assert_eq!(posts(&peer)[3..], [unreg(1), unreg(2), unreg(3)]);
+    }
+
+    #[test]
+    fn a_cleanup_failing_after_the_close_fails_the_close() {
+        for activation in [false, true] {
+            let peer = unit(Duration::from_millis(150), move |uri| {
+                Some(if uri == unreg(2) || (activation && uri == reg(3)) {
+                    409
+                } else {
+                    200
+                })
+            });
+            let connection = Arc::new(connect(&peer));
+            let token = if activation {
+                connection
+                    .prepare_subscription(&[p(1), p(2), p(3)])
+                    .unwrap()
+            } else {
+                let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+                assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+                token
+            };
+            let outcome = if activation {
+                activate(&connection, &token)
+            } else {
+                release(&token)
+            };
+            // The close comes while the first cleanup unregistration is sent.
+            let before = if activation { 3 } else { 2 };
+            let closer = close_after(&connection, &peer, before + 1);
+            assert!(settled(&outcome).is_err());
+            let closed = closer.join().unwrap();
+            assert_eq!(
+                closed,
+                CloseOutcome::Failed(Failure::Cause {
+                    code: Cause::DeviceRejected,
+                    phase: Phase::Teardown
+                }),
+                "activation: {activation}"
+            );
+            assert_eq!(connection.close(TEARDOWN), closed, "the same outcome again");
+            assert_eq!(
+                posts(&peer).last(),
+                Some(&unreg(2)),
+                "nothing after the failed unregistration"
+            );
+        }
     }
 
     #[test]
