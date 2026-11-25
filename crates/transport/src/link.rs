@@ -11,7 +11,7 @@
 use crate::frame::{self, FrameReader, ReadError};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use serde_json::Value;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -224,29 +224,60 @@ impl<'a> Link<'a> {
         &mut self,
         deadline: Duration,
         budget: &Budget,
-        mut answer: impl FnMut(&Value) -> Option<Result<T, Failure>>,
+        answer: impl FnMut(&Value) -> Option<Result<T, Failure>>,
     ) -> Result<T, Failure> {
         let bound = budget.bound(deadline, Cause::ResponseTimeout);
-        loop {
-            let remaining = stop(self.control, &bound, self.phase)?;
-            self.sock
-                .set_read_timeout(Some(remaining.min(POLL)))
-                .map_err(|_| Failure::cause(Cause::ConnectionLost, self.phase))?;
-            let outcome = self.reader.read_once(&mut self.sock);
-            stop(self.control, &bound, self.phase)?;
-            match outcome {
-                Ok(Some(frame)) => {
-                    if let Some(decided) = frame.json.as_ref().and_then(&mut answer) {
-                        return decided;
-                    }
+        read_until(
+            &mut self.sock,
+            &mut self.reader,
+            self.control,
+            self.phase,
+            &bound,
+            answer,
+        )
+    }
+}
+
+/// What [`read_until`] reads from: the connection's socket, or a test's
+/// scripted source.
+trait Source: Read {
+    fn set_poll(&mut self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl Source for TcpStream {
+    fn set_poll(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(timeout))
+    }
+}
+
+/// [`Link::await_frame`]'s loop: one read at a time, each bounded by
+/// [`POLL`], with the stop conditions checked before and after every read.
+fn read_until<S: Source, T>(
+    sock: &mut S,
+    reader: &mut FrameReader,
+    control: &Control,
+    phase: Phase,
+    bound: &Bound,
+    mut answer: impl FnMut(&Value) -> Option<Result<T, Failure>>,
+) -> Result<T, Failure> {
+    loop {
+        let remaining = stop(control, bound, phase)?;
+        sock.set_poll(remaining.min(POLL))
+            .map_err(|_| Failure::cause(Cause::ConnectionLost, phase))?;
+        let outcome = reader.read_once(sock);
+        stop(control, bound, phase)?;
+        match outcome {
+            Ok(Some(frame)) => {
+                if let Some(decided) = frame.json.as_ref().and_then(&mut answer) {
+                    return decided;
                 }
-                Ok(None) => {}
-                Err(ReadError::Oversized { .. }) => {
-                    return Err(Failure::cause(Cause::InvalidResponse, self.phase))
-                }
-                Err(ReadError::Closed | ReadError::Io(_)) => {
-                    return Err(Failure::cause(Cause::ConnectionLost, self.phase))
-                }
+            }
+            Ok(None) => {}
+            Err(ReadError::Oversized { .. }) => {
+                return Err(Failure::cause(Cause::InvalidResponse, phase))
+            }
+            Err(ReadError::Closed | ReadError::Io(_)) => {
+                return Err(Failure::cause(Cause::ConnectionLost, phase))
             }
         }
     }
@@ -254,11 +285,110 @@ impl<'a> Link<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt, decide, stop, Bound};
+    use super::{attempt, decide, read_until, stop, Bound, Source};
+    use crate::frame::FrameReader;
     use crate::lifecycle::{Cause, Control, Failure, Phase};
+    use serde_json::Value;
+    use std::collections::VecDeque;
+    use std::io::{ErrorKind, Read};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// A source that returns one scripted piece per read, cancels `control`
+    /// during the given read (counted from 1), and counts its reads.
+    struct Pieces<'a> {
+        pieces: VecDeque<&'static [u8]>,
+        cancel_in_read: Option<(usize, &'a Control)>,
+        reads: usize,
+    }
+
+    impl Read for Pieces<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if let Some((read, control)) = self.cancel_in_read {
+                if read == self.reads {
+                    control.cancel();
+                }
+            }
+            match self.pieces.pop_front() {
+                Some(piece) => {
+                    buf[..piece.len()].copy_from_slice(piece);
+                    Ok(piece.len())
+                }
+                None => Err(ErrorKind::WouldBlock.into()),
+            }
+        }
+    }
+
+    impl Source for Pieces<'_> {
+        fn set_poll(&mut self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One frame in four pieces, each readable at once, cancelled during read
+    /// `cancel_in` when given; the frame is accepted.
+    fn read_pieces(control: &Control, cancel_in: Option<usize>) -> (Result<Value, Failure>, usize) {
+        let mut source = Pieces {
+            pieces: VecDeque::from([&b"{\"uri\":"[..], b"\"/vd/", b"synchronize\"", b"}\n"]),
+            cancel_in_read: cancel_in.map(|read| (read, control)),
+            reads: 0,
+        };
+        let bound = bound(Instant::now() + Duration::from_secs(5));
+        let result = read_until(
+            &mut source,
+            &mut FrameReader::new(),
+            control,
+            Phase::Discovery,
+            &bound,
+            |frame| Some(Ok(frame.clone())),
+        );
+        (result, source.reads)
+    }
+
+    #[test]
+    fn the_read_loop_stops_at_a_cancel_before_reading_on_or_using_the_frame() {
+        // The cancel lands while the first piece is being read; the rest of
+        // the frame is readable at once. The loop returns Cancelled without
+        // reading again: reading on to the end of the line, or past the
+        // cancel, takes more reads.
+        let (result, reads) = read_pieces(&Control::new(), Some(1));
+        assert_eq!(
+            result,
+            Err(Failure::Cancelled {
+                phase: Phase::Discovery
+            })
+        );
+        assert_eq!(reads, 1);
+
+        // Cancelled before the loop starts: no read at all.
+        let cancelled = Control::new();
+        cancelled.cancel();
+        let (result, reads) = read_pieces(&cancelled, None);
+        assert_eq!(
+            result,
+            Err(Failure::Cancelled {
+                phase: Phase::Discovery
+            })
+        );
+        assert_eq!(reads, 0);
+
+        // A cancel during the read that completes the frame: the frame is not used.
+        let (result, reads) = read_pieces(&Control::new(), Some(4));
+        assert_eq!(
+            result,
+            Err(Failure::Cancelled {
+                phase: Phase::Discovery
+            })
+        );
+        assert_eq!(reads, 4);
+
+        // The same pieces without the cancel: the frame completes and is used.
+        let (result, reads) = read_pieces(&Control::new(), None);
+        assert_eq!(result, Ok(serde_json::json!({ "uri": "/vd/synchronize" })));
+        assert_eq!(reads, 4);
+    }
 
     fn bound(end: Instant) -> Bound {
         Bound {
