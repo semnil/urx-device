@@ -66,8 +66,12 @@ export interface ChannelSettingRule {
 /** A value rule for each band that has the setting. */
 export interface ByBandRule {
   readonly kind: "by-band";
-  readonly rules: { readonly [band: string]: ValueRule };
+  /** Undefined for a band without the setting. */
+  readonly rules: { readonly [band: string]: ValueRule | undefined };
 }
+
+/** A band's parameter ID per channel kind; a kind without one lacks the setting. */
+export type BandAddress = { readonly [K in ChannelKind]?: number };
 
 /**
  * A setting of one band of a channel: the target names a channel and exactly
@@ -77,7 +81,8 @@ export interface ByBandRule {
 export interface ChannelBandSettingRule {
   readonly target: "channel-band";
   readonly bands: readonly string[];
-  readonly address: { readonly [band: string]: { readonly [K in ChannelKind]?: number } };
+  /** Undefined for a band without the setting. */
+  readonly address: { readonly [band: string]: BandAddress | undefined };
   readonly value: ValueRule | ByBandRule;
 }
 

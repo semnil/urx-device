@@ -95,7 +95,7 @@ export function bandRuleSetting<V>(rule: ChannelBandSettingRule) {
   const value = rule.value;
   const codecs = new Map<string, Codec>(
     value.kind === "by-band"
-      ? Object.entries(value.rules).map(([band, each]) => [band, codecOf(each)])
+      ? Object.entries(value.rules).flatMap(([band, each]) => (each === undefined ? [] : [[band, codecOf(each)] as const]))
       : rule.bands.map((band) => [band, codecOf(value)]),
   );
   const resolve = (model: string, target: unknown): { at: ParameterAddress; codec: Codec } => {

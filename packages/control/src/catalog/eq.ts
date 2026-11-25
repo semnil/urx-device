@@ -28,7 +28,7 @@ function ids(offset: number): { [K in ChannelKind]: number } {
 function bandAddress(field: keyof typeof EQ_BAND_FIELDS, bands: readonly (typeof EQ_BANDS)[number][] = EQ_BANDS) {
   return Object.fromEntries(
     bands.map((band) => [band, ids(5 + 5 * EQ_BANDS.indexOf(band) + EQ_BAND_FIELDS[field])]),
-  ) as { readonly [band: string]: { readonly [K in ChannelKind]?: number } };
+  ) as ChannelBandSettingRule["address"];
 }
 
 const Q: GridRule = { kind: "grid", unit: null, min: 0.5, max: 16, scale: 100 };

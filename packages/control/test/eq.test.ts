@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
-import { EQ_BANDS } from "../src/catalog/eq.js";
+import { EQ_BANDS, EQ_RULES } from "../src/catalog/eq.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import {
@@ -243,4 +243,30 @@ describe("ordinary EQ (F04-E)", () => {
       expect(observed, id).toEqual(values);
     }
   });
+
+  it("type a missing band as undefined and refuse a band where a setting takes none", () => {
+    const context = new OperationContext(new FakeTransport(), "URX44");
+    const rule = EQ_RULES["channel.eq.band.type"];
+    const checks = () => {
+      for (const band of rule.bands) {
+        // @ts-expect-error a middle band has no type address
+        void rule.address[band].mono;
+        void rule.address[band]?.mono;
+        const value = rule.value.kind === "by-band" ? rule.value.rules[band] : rule.value;
+        // @ts-expect-error a middle band has no type value rule
+        void value.kind;
+      }
+      // @ts-expect-error the 1-knob settings take no band
+      void readSetting(context, "channel.eq.one-knob.on", { channel: 1, band: "low" });
+      // @ts-expect-error a whole-channel setting takes no band
+      void writeSetting(context, "channel.fader", { channel: 1, band: "low" }, -3);
+      const ids = "channel.eq.band.on" as "channel.eq.band.on" | "channel.eq.one-knob.on";
+      // @ts-expect-error a band for a group that has a setting without bands
+      void readSetting(context, ids, { channel: 1, band: "low" });
+      void readSetting(context, "channel.eq.band.on", { channel: 1, band: "low" });
+    };
+    expect(typeof checks).toBe("function");
+    expect(rule.address["low-mid"]).toBeUndefined();
+  });
 });
+

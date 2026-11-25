@@ -87,11 +87,14 @@ export type WritableSettingId = {
 /** A physical MIC/LINE jack, numbered from 1 (F02-B). */
 export interface InputTarget {
   readonly input: number;
+  /** Bands belong to band targets only. */
+  readonly band?: never;
 }
 
 /** A digital input source (F03-G). */
 export interface SourceTarget {
   readonly source: SourceToken;
+  readonly band?: never;
 }
 
 /**
@@ -101,6 +104,7 @@ export interface SourceTarget {
 export interface ChannelTarget {
   readonly channel: number;
   readonly side?: undefined;
+  readonly band?: never;
 }
 
 /** A whole channel and one EQ band (F04-E). It takes no side. */
@@ -114,6 +118,7 @@ export interface ChannelBandTarget {
 export interface ChannelSideTarget {
   readonly channel: number;
   readonly side?: "left" | "right";
+  readonly band?: never;
 }
 
 /** A fader level: finite dB, or negative infinity. */
