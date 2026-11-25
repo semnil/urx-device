@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
+import { BASIC_RULES } from "../src/catalog/basic-rules.js";
 import { DUCKER_RULES } from "../src/catalog/ducker.js";
 import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE } from "../src/catalog/buses.js";
 import { INSERT_FX_RULES } from "../src/catalog/insert-fx.js";
@@ -30,16 +31,20 @@ const ruled = Object.entries(settingDefinitions as Record<string, SettingDefinit
   definition.rule === undefined ? [] : [[id, definition.rule] as [string, SettingRule]],
 );
 
-const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES, ...BUS_RULES, "channel.stereo-assign": CHANNEL_STEREO_ASSIGN_RULE, ...INSERT_FX_RULES, ...FX_RETURN_RULES, ...OUTPUT_EQ_RULES, ...OUTPUT_PEQ_RULES, ...STREAM_DELAY_RULES, ...OUTPUT_SOURCE_RULES, ...MONITOR_RULES, ...CUE_RULES, ...OSCILLATOR_RULES, ...DEVICE_RULES, ...KNOB_RULES, ...INTEGRATION_RULES, ...SCENE_RECORDER_RULES };
+const allRules: Record<string, SettingRule> = {
+  ...BASIC_RULES,
+  ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES, ...BUS_RULES, "channel.stereo-assign": CHANNEL_STEREO_ASSIGN_RULE, ...INSERT_FX_RULES, ...FX_RETURN_RULES, ...OUTPUT_EQ_RULES, ...OUTPUT_PEQ_RULES, ...STREAM_DELAY_RULES, ...OUTPUT_SOURCE_RULES, ...MONITOR_RULES, ...CUE_RULES, ...OSCILLATOR_RULES, ...DEVICE_RULES, ...KNOB_RULES, ...INTEGRATION_RULES, ...SCENE_RECORDER_RULES };
 
 /** The channel and band rules; send and bus rules, addressed per route or bus, have their own tests. */
-const addressed = ruled.flatMap(([id, rule]) => (rule.target === "send" || rule.target === "bus" || rule.target === "fx-parameter" || rule.target === "bus-side" || rule.target === "bus-side-band" || rule.target === "bus-band" || rule.target === "output-side" || rule.target === "output" || rule.target === "device" || rule.target === "knob" || rule.target === "track" ? [] : [[id, rule] as const]));
+const addressed = ruled.flatMap(([id, rule]) =>
+  (rule.target === "channel" && rule.value.kind !== "by-kind") || rule.target === "channel-band" ? [[id, rule] as const] : [],
+);
 
 /** Each (id, target, value rule) a rule defines: one per band for a band rule. */
 const valueCases = addressed.flatMap(([id, rule]): [string, object, ValueRule][] => {
   if (rule.target === "channel") {
-    // URX44 channel 1 is mono, channel 5 the first fixed stereo pair.
-    return [[id, { channel: rule.address.mono === undefined ? 5 : 1 }, rule.value]];
+    // URX44 channel 1 is mono, channel 5 the first fixed stereo pair (per-kind values are excluded above).
+    return rule.value.kind === "by-kind" ? [] : [[id, { channel: rule.address.mono === undefined ? 5 : 1 }, rule.value]];
   }
   const value = rule.value;
   return rule.bands.flatMap((band): [string, object, ValueRule][] => {
@@ -70,7 +75,8 @@ async function observed(label: string, target: object, raw: string, text = false
 }
 
 describe("setting rules (K35 definition metadata)", () => {
-  it("carry the rule objects the operations are built from", () => {
+  it("carry a rule on every definition, the object the operations are built from", () => {
+    expect(ruled.length).toBe(Object.keys(settingDefinitions).length);
     expect(ruled.map(([id]) => id).sort()).toEqual(Object.keys(allRules).sort());
     for (const [id, rule] of ruled) {
       expect(rule, id).toBe(allRules[id]);
@@ -115,10 +121,13 @@ describe("setting rules (K35 definition metadata)", () => {
   it("predict each operation's write domain, wire values and read domain from the rule alone", async () => {
     for (const [id, target, rule] of valueCases) {
       switch (rule.kind) {
-        case "switch":
-          expect([await wire(id, target, true), await wire(id, target, false)], id).toEqual(["1", "0"]);
-          expect([await observed(id, target, "1"), await observed(id, target, "2")], id).toEqual([{ value: true }, { code: "invalid_response" }]);
+        case "switch": {
+          // On is raw 1, or raw 0 for an inverted switch.
+          const [on, off] = rule.on === "0" ? ["0", "1"] : ["1", "0"];
+          expect([await wire(id, target, true), await wire(id, target, false)], id).toEqual([on, off]);
+          expect([await observed(id, target, on), await observed(id, target, "2")], id).toEqual([{ value: true }, { code: "invalid_response" }]);
           break;
+        }
         case "choice":
           for (const [index, choice] of rule.choices.entries()) {
             expect(await wire(id, target, choice), `${id} ${choice}`).toBe(`${index}`);
@@ -173,9 +182,17 @@ describe("setting rules (K35 definition metadata)", () => {
           const lastIndex = rule.stops.length - 1;
           const first = (rule.stops[0] as number) / rule.scale;
           const last = (rule.stops[lastIndex] as number) / rule.scale;
-          expect([plan(id, target, first), plan(id, target, last)], id).toEqual([first, last]);
-          expect(() => plan(id, target, first - 1 / rule.scale), id).toThrow();
-          expect(() => plan(id, target, last + 1 / rule.scale), id).toThrow();
+          // The write range: the stops, or a wider `write` window whose ends round to the end stops.
+          const writeMin = rule.write?.min ?? first;
+          const writeMax = rule.write?.max ?? last;
+          expect([plan(id, target, first), plan(id, target, last), plan(id, target, writeMin), plan(id, target, writeMax)], id).toEqual([
+            first,
+            last,
+            first,
+            last,
+          ]);
+          expect(() => plan(id, target, writeMin - 1 / rule.scale), id).toThrow();
+          expect(() => plan(id, target, writeMax + 1 / rule.scale), id).toThrow();
           // The raw read range: the indices with an ordinal, else the stop values or `read`.
           const low = rule.ordinal ?? rule.read?.min ?? (rule.stops[0] as number);
           const high = rule.ordinal === undefined ? (rule.read?.max ?? (rule.stops[lastIndex] as number)) : rule.ordinal + lastIndex;

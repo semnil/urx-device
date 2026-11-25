@@ -17,9 +17,10 @@ export interface Sentinel {
   readonly reads?: readonly string[];
 }
 
-/** On/off: on is raw 1, off raw 0. */
+/** On/off: on is raw 1 and off raw 0, or the reverse where `on` is "0". */
 export interface SwitchRule {
   readonly kind: "switch";
+  readonly on?: "0";
 }
 
 /** Named choices in raw order 0, 1, … */
@@ -61,6 +62,8 @@ export interface StopsRule {
   readonly scale: number;
   readonly ordinal?: number;
   readonly read?: { readonly min: number; readonly max: number };
+  /** The write range in public units, where it reaches past the stops (a request beyond the last stop rounds to it). */
+  readonly write?: { readonly min: number; readonly max: number };
   readonly sentinel?: Sentinel;
 }
 
@@ -118,7 +121,8 @@ export interface SelectorRule {
   /** The nothing-selected sentinel, for a selector that has one. */
   readonly none?: Sentinel;
   readonly known: readonly string[];
-  readonly choices: readonly { readonly token: string; readonly raw: string }[];
+  /** Each choice; one listing `models` exists on those models only. */
+  readonly choices: readonly { readonly token: string; readonly raw: string; readonly models?: readonly string[] }[];
   /**
    * The defined limits of each choice and of `none` where the selector has
    * one, by token, for help. A definition, not a measurement; nothing reads
@@ -162,11 +166,17 @@ export type ValueRule =
   | NameRule
   | SelectorRule;
 
+/** A value rule per channel kind, for a setting whose choices differ by kind. */
+export interface ByKindRule {
+  readonly kind: "by-kind";
+  readonly rules: { readonly [K in ChannelKind]?: ValueRule };
+}
+
 /** A whole-channel setting: its parameter ID per channel kind and its value rule. */
 export interface ChannelSettingRule {
   readonly target: "channel";
   readonly address: { readonly [K in ChannelKind]?: number };
-  readonly value: ValueRule;
+  readonly value: ValueRule | ByKindRule;
 }
 
 /** A value rule for each band that has the setting. */
@@ -415,7 +425,54 @@ export interface TrackSettingRule {
   readonly value: ValueRule;
 }
 
+/**
+ * A physical input jack's setting (F02-B): the target names a jack of the
+ * model; y = jack − 1. `only` restricts it to some jacks (HI-Z): another jack
+ * of the model lacks the setting.
+ */
+export interface InputSettingRule {
+  readonly target: "input";
+  readonly jacks: { readonly [model: string]: readonly number[] };
+  readonly only?: { readonly [model: string]: readonly number[] };
+  readonly paramId: number;
+  readonly value: ValueRule;
+}
+
+/**
+ * A digital source's gain (F03-G): the target names a source token. A read
+ * takes its first known instance; a write sends the evidenced instance, and a
+ * source whose write sequence awaits evidence has no bound write.
+ */
+export interface SourceSettingRule {
+  readonly target: "source";
+  readonly sources: {
+    readonly [source: string]:
+      | { readonly models: readonly string[]; readonly paramId: number; readonly read: number; readonly write: number | null }
+      | undefined;
+  };
+  readonly value: ValueRule;
+}
+
+/** A side-specific channel setting (F03-H/I): mono at `mono`, a fixed stereo side at `left` / `right`. */
+export interface ChannelSideSettingRule {
+  readonly target: "channel-side";
+  readonly address: { readonly mono: number; readonly left: number; readonly right: number };
+  readonly value: ValueRule;
+}
+
+/** A mono pair's setting (F03-J): addressed at the pair's primary only; fixed stereo has none. */
+export interface PairSettingRule {
+  readonly target: "pair";
+  readonly primaries: { readonly [model: string]: readonly number[] };
+  readonly paramId: number;
+  readonly value: ValueRule;
+}
+
 export type SettingRule =
+  | InputSettingRule
+  | SourceSettingRule
+  | ChannelSideSettingRule
+  | PairSettingRule
   | TrackSettingRule
   | KnobAssignmentRule
   | DeviceSettingRule
