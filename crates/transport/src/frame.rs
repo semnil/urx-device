@@ -252,17 +252,38 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_at_the_limit_followed_by_more_data_in_the_same_read_is_accepted() {
+    fn the_limit_applies_to_each_frame_not_to_the_bytes_buffered_after_it() {
+        for first in [MAX_FRAME_BYTES - 1, MAX_FRAME_BYTES] {
+            // The next frame arrives in the same read, so the buffer holds more
+            // than the limit while the first frame is within it.
+            let mut bytes = line_of_len(first);
+            bytes.extend_from_slice(b"{\"b\":2}\n");
+            assert!(bytes.len() - 1 > MAX_FRAME_BYTES);
+            let mut reader = FrameReader::new();
+            let mut src = Chunks::of(&[&bytes]);
+            assert_eq!(
+                reader.read_frame(&mut src).unwrap().map(|f| f.len),
+                Some(first)
+            );
+            assert_eq!(
+                json_of(reader.read_frame(&mut src).unwrap()),
+                Some(json!({"b": 2}))
+            );
+        }
+
+        // The next frame is split across reads with a read timeout between.
+        let mut bytes = line_of_len(MAX_FRAME_BYTES);
+        bytes.extend_from_slice(b"{\"b\"");
         let mut reader = FrameReader::new();
-        let mut bytes = line_of_len(MAX_FRAME_BYTES - 10);
-        bytes.extend_from_slice(b"{\"b\":2}\n");
         let mut src = Chunks::of(&[&bytes]);
         assert_eq!(
             reader.read_frame(&mut src).unwrap().map(|f| f.len),
-            Some(MAX_FRAME_BYTES - 10)
+            Some(MAX_FRAME_BYTES)
         );
+        assert_eq!(reader.read_frame(&mut src).unwrap(), None);
+        let mut rest = Chunks::of(&[b":2}\n"]);
         assert_eq!(
-            json_of(reader.read_frame(&mut src).unwrap()),
+            json_of(reader.read_frame(&mut rest).unwrap()),
             Some(json!({"b": 2}))
         );
     }
