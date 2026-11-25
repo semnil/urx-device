@@ -23,7 +23,6 @@ export class OperationContext {
   /** The connected unit's model, as the app verified it. */
   readonly model: string;
   readonly #operation: TransportOperation;
-  #nextTicket = 0;
   #stopping: OperationCause | undefined;
 
   constructor(transport: Transport, model: string) {
@@ -86,21 +85,25 @@ export class OperationContext {
     send: (request: { operation: TransportOperation; requestTicket: string }) => Promise<unknown>,
     validate: (record: unknown) => T | undefined,
   ): Promise<T> {
-    // Immutable and unique within this context: it releases only its own slot.
-    const requestTicket = `${this.#nextTicket++}`;
+    // Issued by the connection, so it releases only this request's slot.
+    const requestTicket = this.transport.newRequestTicket();
+    const undelivered = () => {
+      this.transport.failDelivery(requestTicket);
+      return new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
+    };
     let raw: unknown;
     try {
       raw = await send({ operation: this.#operation, requestTicket });
     } catch {
       // A rejected native promise is not evidence of anything (K33).
-      throw new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
+      throw undelivered();
     }
     const record = validate(raw);
-    // The evidence is adopted here, valid or not: the slot is released.
-    this.transport.adoptResult(requestTicket);
     if (record === undefined) {
-      throw new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
+      // Its claimed evidence is not adopted (K34).
+      throw undelivered();
     }
+    this.transport.adoptResult(requestTicket);
     return record;
   }
 }

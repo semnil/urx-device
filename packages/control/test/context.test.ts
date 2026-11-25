@@ -17,9 +17,19 @@ describe("operation context", () => {
       value: null,
       evidence: { state: "accepted" },
     });
-    expect(transport.calls.map((call) => call.ticket)).toEqual(["0", "1"]);
-    expect(transport.adopted).toEqual(["0", "1"]);
+    expect(transport.calls.map((call) => call.ticket)).toEqual(["t0", "t1"]);
+    expect(transport.adopted).toEqual(["t0", "t1"]);
     expect(transport.calls[1]).toMatchObject({ method: "setText", value: "Lead " });
+  });
+
+  it("takes tickets from the connection, so two operations never share one", async () => {
+    const success = { kind: "success", value: "1", evidence: { state: "read" } };
+    const transport = new FakeTransport().script("getNumeric", success, success);
+    const first = new OperationContext(transport, "URX44");
+    const second = new OperationContext(transport, "URX44");
+    await first.getNumeric(address);
+    await second.getNumeric(address);
+    expect(transport.calls.map((call) => call.ticket)).toEqual(["t0", "t1"]);
   });
 
   it("turns an invalid record into internal_error without adopting its evidence", async () => {
@@ -31,8 +41,8 @@ describe("operation context", () => {
     const context = new OperationContext(transport, "URX44");
     const error = await context.setNumeric(address, "1").catch((caught: unknown) => caught);
     expect(operationFailureOf(error)).toEqual({ code: "internal_error", phase: "delivery", progress: null });
-    // The slot is still released.
-    expect(transport.adopted).toEqual(["0"]);
+    expect(transport.adopted).toEqual([]);
+    expect(transport.undelivered).toEqual(["t0"]);
   });
 
   it("turns a rejected native promise into internal_error", async () => {
@@ -41,6 +51,8 @@ describe("operation context", () => {
     expect(error).toBeInstanceOf(OperationFailureError);
     expect(operationFailureOf(error)?.code).toBe("internal_error");
     expect((error as Error).message).not.toContain("bridge failure");
+    expect(transport.adopted).toEqual([]);
+    expect(transport.undelivered).toEqual(["t0"]);
   });
 
   it("reports a cancellation with the owner's stopping cause, or internal_error without one", async () => {

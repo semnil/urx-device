@@ -21,6 +21,8 @@ export interface Call {
 export class FakeTransport implements Transport {
   readonly calls: Call[] = [];
   readonly adopted: string[] = [];
+  readonly undelivered: string[] = [];
+  #nextTicket = 0;
   cancelled = 0;
   finished = 0;
   readonly #scripts = new Map<Method, unknown[]>();
@@ -62,8 +64,16 @@ export class FakeTransport implements Transport {
     return this.#answer("setText", address, value, request);
   }
 
+  newRequestTicket(): string {
+    return `t${this.#nextTicket++}`;
+  }
+
   adoptResult(requestTicket: string): void {
     this.adopted.push(requestTicket);
+  }
+
+  failDelivery(requestTicket: string): void {
+    this.undelivered.push(requestTicket);
   }
 
   #answer(

@@ -26,8 +26,8 @@ export interface TransportOperation {
 }
 
 /**
- * The adapter's identity for one submitted request: it releases only that
- * request's completion slot.
+ * The adapter's identity for one submitted request, unique for the
+ * connection's life: it releases only that request's completion slot.
  */
 export type RequestTicket = string;
 
@@ -42,13 +42,24 @@ export interface TransportRequest {
  */
 export interface Transport {
   createOperation(): TransportOperation;
+  /** A ticket never issued before on this connection (K37). */
+  newRequestTicket(): RequestTicket;
   getNumeric(address: ParameterAddress, request: TransportRequest): Promise<unknown>;
   getText(address: ParameterAddress, request: TransportRequest): Promise<unknown>;
   getName(address: ParameterAddress, request: TransportRequest): Promise<unknown>;
   setNumeric(address: ParameterAddress, value: I64Text, request: TransportRequest): Promise<unknown>;
   setText(address: ParameterAddress, value: string, request: TransportRequest): Promise<unknown>;
-  /** Releases the completion slot of `requestTicket`; no device I/O. */
+  /**
+   * Acknowledges the validated result of `requestTicket`, releasing its
+   * completion slot; no device I/O. At most once per ticket.
+   */
   adoptResult(requestTicket: RequestTicket): void;
+  /**
+   * Reports that the result of `requestTicket` could not be adopted: its
+   * record was invalid or its promise rejected. The adapter applies its
+   * fatal rules to the slot instead of releasing it as adopted.
+   */
+  failDelivery(requestTicket: RequestTicket): void;
 }
 
 /** The records the methods resolve with, once validated. */
