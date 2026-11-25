@@ -138,6 +138,14 @@ function settled<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
+type Intersection<U> = (U extends unknown ? (value: U) => void : never) extends (value: infer I) => void ? I : never;
+
+/** A target every ID of `K` takes; for a single ID, its own target. */
+export type CommonTarget<K extends SettingId> = Intersection<K extends SettingId ? Target<K> : never>;
+
+/** A value every ID of `K` takes as a write; for a single ID, its own input. */
+export type CommonInput<K extends WritableSettingId> = Intersection<K extends WritableSettingId ? Input<K> : never>;
+
 /** The (id, target) pairs a read takes: each ID with its own target type. */
 export type ReadArgs = { [K in SettingId]: [id: K, target: Target<K>] }[SettingId];
 
@@ -148,15 +156,19 @@ export type WriteArgs = { [K in WritableSettingId]: [id: K, target: Target<K>, v
  * Reads `id` for `target`. An ID outside the catalog, reachable only from
  * untyped input, is `invalid_input` without traffic.
  */
-export function readSetting<A extends ReadArgs>(
+export function readSetting<A extends ReadArgs>(context: OperationContext, ...args: A): Promise<Reading<Value<A[0]>>>;
+/** Reads one of the IDs `K` with a target all of them take (a list of settings read alike). */
+export function readSetting<K extends SettingId>(
   context: OperationContext,
-  ...[id, target]: A
-): Promise<Reading<Value<A[0]>>> {
+  id: K,
+  target: CommonTarget<K>,
+): Promise<Reading<Value<K>>>;
+export function readSetting(context: OperationContext, id: SettingId, target: unknown): Promise<Reading<unknown>> {
   if (!Object.hasOwn(settingDefinitions, id)) {
     return unknownId();
   }
-  const handler = settingHandlers[id] as unknown as ReadHandler<A[0]>;
-  return settled(() => handler.read(context, target as Target<A[0]>));
+  const handler = settingHandlers[id] as unknown as ReadHandler<SettingId>;
+  return settled(() => handler.read(context, target as Target<SettingId>));
 }
 
 function writeHandler<K extends WritableSettingId>(id: K): WriteHandler<K> | undefined {
@@ -167,21 +179,39 @@ function writeHandler<K extends WritableSettingId>(id: K): WriteHandler<K> | und
 }
 
 /** Writes `value` to `id` for `target`: its single selected request. */
-export function writeSetting<A extends WriteArgs>(
+export function writeSetting<A extends WriteArgs>(context: OperationContext, ...args: A): Promise<WriteResult<Input<A[0]>>>;
+/** Writes one of the IDs `K` with a target and value all of them take. */
+export function writeSetting<K extends WritableSettingId>(
   context: OperationContext,
-  ...[id, target, value]: A
-): Promise<WriteResult<Input<A[0]>>> {
-  const handler = writeHandler(id) as WriteHandler<A[0]> | undefined;
+  id: K,
+  target: CommonTarget<K>,
+  value: CommonInput<K>,
+): Promise<WriteResult<Input<K>>>;
+export function writeSetting(
+  context: OperationContext,
+  id: WritableSettingId,
+  target: unknown,
+  value: unknown,
+): Promise<WriteResult<unknown>> {
+  const handler = writeHandler(id) as WriteHandler<WritableSettingId> | undefined;
   return handler === undefined
     ? unknownId()
-    : settled(() => handler.write(context, target as Target<A[0]>, value as Input<A[0]>));
+    : settled(() => handler.write(context, target as Target<WritableSettingId>, value as Input<WritableSettingId>));
 }
 
 /** The plan a write of `value` would send, through the same validation; no traffic. */
-export function previewSetting<A extends WriteArgs>(model: string, ...[id, target, value]: A): WritePlan<Input<A[0]>> {
-  const handler = writeHandler(id) as WriteHandler<A[0]> | undefined;
+export function previewSetting<A extends WriteArgs>(model: string, ...args: A): WritePlan<Input<A[0]>>;
+/** The plan for one of the IDs `K` with a target and value all of them take. */
+export function previewSetting<K extends WritableSettingId>(
+  model: string,
+  id: K,
+  target: CommonTarget<K>,
+  value: CommonInput<K>,
+): WritePlan<Input<K>>;
+export function previewSetting(model: string, id: WritableSettingId, target: unknown, value: unknown): WritePlan<unknown> {
+  const handler = writeHandler(id) as WriteHandler<WritableSettingId> | undefined;
   if (handler === undefined) {
     throw new OperationFailureError({ code: "invalid_input", phase: "preparation", progress: null });
   }
-  return handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
+  return handler.plan(model, target as Target<WritableSettingId>, value as Input<WritableSettingId>);
 }

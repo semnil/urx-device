@@ -1,10 +1,22 @@
 import { describe, expect, it } from "vitest";
-import type { InputTarget, SourceTarget } from "../src/catalog/settings.js";
+import {
+  settingDefinitions,
+  type ChannelTarget,
+  type InputTarget,
+  type SettingId,
+  type SettingTypes,
+  type SourceTarget,
+} from "../src/catalog/settings.js";
 import { OperationContext } from "../src/operations/context.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 // Type-level checks: each line marked @ts-expect-error must fail to compile.
+type ChannelId = {
+  [K in SettingId]: SettingTypes[K]["target"] extends ChannelTarget ? (ChannelTarget extends SettingTypes[K]["target"] ? K : never) : never;
+}[SettingId];
+const channelIds = Object.keys(settingDefinitions).filter((id) => id.startsWith("channel.")) as ChannelId[];
+
 describe("registry argument types", () => {
   it("bind each ID to its own target and value", () => {
     const context = new OperationContext(new FakeTransport(), "URX44");
@@ -33,6 +45,19 @@ describe("registry argument types", () => {
       void written;
       // @ts-expect-error a read-side name object is not a write value
       void writeSetting(context, "channel.name", { channel: 1 }, { kind: "text", text: "Lead" });
+      // Every channel-target ID from the catalog list, read alike, however many there are.
+      for (const each of channelIds) {
+        void readSetting(context, each, { channel: 1 });
+      }
+      const levels = "channel.gate.threshold" as "channel.gate.threshold" | "channel.comp.gain" | "channel.fader";
+      const level: Promise<{ planned: number | "-inf" }> = writeSetting(context, levels, { channel: 1 }, -3);
+      void level;
+      void previewSetting("URX44", levels, { channel: 1 }, -3);
+      const withInput = "channel.on" as "channel.on" | "input.phantom";
+      // @ts-expect-error a channel target is not an input target
+      void readSetting(context, withInput, { channel: 1 });
+      // @ts-expect-error "-inf" is not a value every ID of the group takes
+      void writeSetting(context, levels, { channel: 1 }, "-inf");
     };
     expect(typeof checks).toBe("function");
   });
