@@ -5,6 +5,7 @@
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
 import type { I64Text } from "./i64.js";
 import type { SourceToken } from "./inputs.js";
+import type { PROCESSING_MODES } from "./processing.js";
 
 /** What every setting definition states, independent of its value types. */
 export interface SettingDefinitionBase {
@@ -36,6 +37,15 @@ export const settingDefinitions = {
   "channel.name": { readable: true, writable: true },
   "channel.color": { readable: true, writable: true },
   "channel.rec-point": { readable: true, writable: true },
+  "channel.processing-mode": { readable: true, writable: true },
+  "channel.hpf.on": { readable: true, writable: true },
+  "channel.hpf.frequency": { readable: true, writable: true },
+  "channel.gate.on": { readable: true, writable: true },
+  "channel.comp.on": { readable: true, writable: true },
+  "channel.eq.on": { readable: true, writable: true },
+  "channel.ssmcs.on": { readable: true, writable: true },
+  "channel.ssmcs.comp.on": { readable: true, writable: true },
+  "channel.ssmcs.eq.on": { readable: true, writable: true },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */
@@ -85,6 +95,8 @@ export type ChannelColor = (typeof CHANNEL_COLORS)[number];
 
 export type RecPoint = (typeof REC_POINTS)[number];
 
+export type ProcessingMode = (typeof PROCESSING_MODES)[number];
+
 /**
  * Each setting's target, observed value and requested value types (K35:
  * switches are boolean, levels are dB numbers).
@@ -106,6 +118,15 @@ export interface SettingTypes {
   "channel.name": { target: ChannelTarget; value: ChannelName; input: string };
   "channel.color": { target: ChannelTarget; value: ChannelColor };
   "channel.rec-point": { target: ChannelTarget; value: RecPoint };
+  "channel.processing-mode": { target: ChannelTarget; value: ProcessingMode };
+  "channel.hpf.on": { target: ChannelTarget; value: boolean };
+  "channel.hpf.frequency": { target: ChannelTarget; value: number };
+  "channel.gate.on": { target: ChannelTarget; value: boolean };
+  "channel.comp.on": { target: ChannelTarget; value: boolean };
+  "channel.eq.on": { target: ChannelTarget; value: boolean };
+  "channel.ssmcs.on": { target: ChannelTarget; value: boolean };
+  "channel.ssmcs.comp.on": { target: ChannelTarget; value: boolean };
+  "channel.ssmcs.eq.on": { target: ChannelTarget; value: boolean };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

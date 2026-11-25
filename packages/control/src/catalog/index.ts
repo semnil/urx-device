@@ -24,12 +24,22 @@ export {
 export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
+export {
+  HPF_FREQUENCY_ID,
+  HPF_READ_RAW,
+  HPF_WRITE_HZ,
+  HPF_WRITE_STOPS_HZ,
+  PROCESSING_MODES,
+  PROCESSING_MODE_ID,
+  PROCESSING_SWITCHES,
+} from "./processing.js";
 export type { InputPort } from "./ports.js";
 export type {
   ChannelSideTarget,
   ChannelTarget,
   ChannelColor,
   ChannelName,
+  ProcessingMode,
   RecPoint,
   FaderLevel,
   PanMode,
