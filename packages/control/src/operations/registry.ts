@@ -138,37 +138,41 @@ function settled<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-type Intersection<U> = (U extends unknown ? (value: U) => void : never) extends (value: infer I) => void ? I : never;
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
-/** A target every ID of `K` takes; for a single ID, its own target. */
-export type CommonTarget<K extends SettingId> = Intersection<K extends SettingId ? Target<K> : never>;
+/** The IDs whose target type is exactly `T`. */
+type IdsTaking<T> = { [K in SettingId]: Same<Target<K>, T> extends true ? K : never }[SettingId];
 
-/** A value every ID of `K` takes as a write; for a single ID, its own input. */
-export type CommonInput<K extends WritableSettingId> = Intersection<K extends WritableSettingId ? Input<K> : never>;
+/** The writable IDs whose target and write types are exactly `T` and `I`. */
+type IdsWriting<T, I> = {
+  [K in WritableSettingId]: Same<Target<K>, T> extends true ? (Same<Input<K>, I> extends true ? K : never) : never;
+}[WritableSettingId];
 
-/** The (id, target) pairs a read takes: each ID with its own target type. */
-export type ReadArgs = { [K in SettingId]: [id: K, target: Target<K>] }[SettingId];
+/**
+ * The (id, target) pairs a read takes: each ID with its own target type. An
+ * ID may also be any union of the IDs sharing that target type, so a list of
+ * settings read alike type-checks however many it holds.
+ */
+export type ReadArgs = { [K in SettingId]: [id: IdsTaking<Target<K>>, target: Target<K>] }[SettingId];
 
-/** The (id, target, value) triples a write takes. */
-export type WriteArgs = { [K in WritableSettingId]: [id: K, target: Target<K>, value: Input<K>] }[WritableSettingId];
+/** The (id, target, value) triples a write takes, grouped the same way by target and write type. */
+export type WriteArgs = {
+  [K in WritableSettingId]: [id: IdsWriting<Target<K>, Input<K>>, target: Target<K>, value: Input<K>];
+}[WritableSettingId];
 
 /**
  * Reads `id` for `target`. An ID outside the catalog, reachable only from
  * untyped input, is `invalid_input` without traffic.
  */
-export function readSetting<A extends ReadArgs>(context: OperationContext, ...args: A): Promise<Reading<Value<A[0]>>>;
-/** Reads one of the IDs `K` with a target all of them take (a list of settings read alike). */
-export function readSetting<K extends SettingId>(
+export function readSetting<A extends ReadArgs>(
   context: OperationContext,
-  id: K,
-  target: CommonTarget<K>,
-): Promise<Reading<Value<K>>>;
-export function readSetting(context: OperationContext, id: SettingId, target: unknown): Promise<Reading<unknown>> {
+  ...[id, target]: A
+): Promise<Reading<Value<A[0]>>> {
   if (!Object.hasOwn(settingDefinitions, id)) {
     return unknownId();
   }
-  const handler = settingHandlers[id] as unknown as ReadHandler<SettingId>;
-  return settled(() => handler.read(context, target as Target<SettingId>));
+  const handler = settingHandlers[id] as unknown as ReadHandler<A[0]>;
+  return settled(() => handler.read(context, target as Target<A[0]>));
 }
 
 function writeHandler<K extends WritableSettingId>(id: K): WriteHandler<K> | undefined {
@@ -179,39 +183,21 @@ function writeHandler<K extends WritableSettingId>(id: K): WriteHandler<K> | und
 }
 
 /** Writes `value` to `id` for `target`: its single selected request. */
-export function writeSetting<A extends WriteArgs>(context: OperationContext, ...args: A): Promise<WriteResult<Input<A[0]>>>;
-/** Writes one of the IDs `K` with a target and value all of them take. */
-export function writeSetting<K extends WritableSettingId>(
+export function writeSetting<A extends WriteArgs>(
   context: OperationContext,
-  id: K,
-  target: CommonTarget<K>,
-  value: CommonInput<K>,
-): Promise<WriteResult<Input<K>>>;
-export function writeSetting(
-  context: OperationContext,
-  id: WritableSettingId,
-  target: unknown,
-  value: unknown,
-): Promise<WriteResult<unknown>> {
-  const handler = writeHandler(id) as WriteHandler<WritableSettingId> | undefined;
+  ...[id, target, value]: A
+): Promise<WriteResult<Input<A[0]>>> {
+  const handler = writeHandler(id) as WriteHandler<A[0]> | undefined;
   return handler === undefined
     ? unknownId()
-    : settled(() => handler.write(context, target as Target<WritableSettingId>, value as Input<WritableSettingId>));
+    : settled(() => handler.write(context, target as Target<A[0]>, value as Input<A[0]>));
 }
 
 /** The plan a write of `value` would send, through the same validation; no traffic. */
-export function previewSetting<A extends WriteArgs>(model: string, ...args: A): WritePlan<Input<A[0]>>;
-/** The plan for one of the IDs `K` with a target and value all of them take. */
-export function previewSetting<K extends WritableSettingId>(
-  model: string,
-  id: K,
-  target: CommonTarget<K>,
-  value: CommonInput<K>,
-): WritePlan<Input<K>>;
-export function previewSetting(model: string, id: WritableSettingId, target: unknown, value: unknown): WritePlan<unknown> {
-  const handler = writeHandler(id) as WriteHandler<WritableSettingId> | undefined;
+export function previewSetting<A extends WriteArgs>(model: string, ...[id, target, value]: A): WritePlan<Input<A[0]>> {
+  const handler = writeHandler(id) as WriteHandler<A[0]> | undefined;
   if (handler === undefined) {
     throw new OperationFailureError({ code: "invalid_input", phase: "preparation", progress: null });
   }
-  return handler.plan(model, target as Target<WritableSettingId>, value as Input<WritableSettingId>);
+  return handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
 }
