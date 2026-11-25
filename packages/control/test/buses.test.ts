@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
+import { BUS_RULES } from "../src/catalog/buses.js";
+import {
+  FADER_DB,
+  FADER_LEVEL_RULE,
+  FADER_NEGATIVE_INFINITY_RAW,
+  MONO_CHANNELS,
+  PAN_RANGE,
+  PAN_RULE,
+  STEREO_CHANNELS,
+} from "../src/catalog/channels.js";
+import { SEND_RULES } from "../src/catalog/sends.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
@@ -145,4 +155,25 @@ describe("bus controls (F05-B)", () => {
       expect((await failureOf(readAny(new OperationContext(transport, "URX44"), id, { bus: "mix-1" })))?.code, `${id} ${raw}`).toBe("invalid_response");
     }
   });
+
+  it("type a bus without the setting as undefined, and share one level and PAN/BAL rule", () => {
+    const rule = BUS_RULES["bus.type"];
+    const checks = () => {
+      for (const bus of rule.known) {
+        // @ts-expect-error a known bus may have no address for this setting
+        void rule.address[bus].write;
+        void rule.address[bus]?.write;
+      }
+    };
+    expect(typeof checks).toBe("function");
+    expect(rule.address["stereo"]).toBeUndefined();
+    // One definition of the level and PAN/BAL rules, built from the channel constants.
+    expect(BUS_RULES["bus.fader"].value).toBe(FADER_LEVEL_RULE);
+    expect(SEND_RULES["send.level"].value).toBe(FADER_LEVEL_RULE);
+    expect(BUS_RULES["bus.balance"].value).toBe(PAN_RULE);
+    expect(SEND_RULES["send.pan"].value).toBe(PAN_RULE);
+    expect([FADER_LEVEL_RULE.min, FADER_LEVEL_RULE.max, FADER_LEVEL_RULE.sentinel.raw]).toEqual([FADER_DB.min, FADER_DB.max, FADER_NEGATIVE_INFINITY_RAW]);
+    expect([PAN_RULE.min, PAN_RULE.max]).toEqual([PAN_RANGE.min, PAN_RANGE.max]);
+  });
 });
+

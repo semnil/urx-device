@@ -4,7 +4,7 @@
 // the STREAM identity another slot (y 1): their writes await F03-G evidence
 // and stay unbound. The channel STEREO assignment is a channel setting.
 
-import { CHANNEL_COLORS, NAME_MAX_CODE_POINTS } from "./channels.js";
+import { CHANNEL_COLORS, FADER_LEVEL_RULE, NAME_MAX_CODE_POINTS, PAN_RULE } from "./channels.js";
 import { frozen } from "./frozen.js";
 import type { BusSettingRule, ChannelSettingRule, ValueRule } from "./rules.js";
 
@@ -36,12 +36,10 @@ const bus = (address: { [B in Bus]?: At }, value: ValueRule): BusSettingRule => 
   value,
 });
 
-const LEVEL: ValueRule = { kind: "grid", unit: "dB", min: -96, max: 10, scale: 100, sentinel: { value: "-inf", raw: "-32768" } };
-
 export const BUS_RULES = frozen({
   "bus.on": bus(master(582, 675, 338, false), { kind: "switch" }),
-  "bus.fader": bus(master(581, 674, 337, false), LEVEL),
-  "bus.balance": bus(master(583, 676, 339, false), { kind: "grid", unit: null, min: -63, max: 63, scale: 1 }),
+  "bus.fader": bus(master(581, 674, 337, false), FADER_LEVEL_RULE),
+  "bus.balance": bus(master(583, 676, 339, false), PAN_RULE),
   "bus.type": bus(mixOnly(587, false), { kind: "choice", choices: ["vari", "fixed"] }),
   "bus.pan-link": bus(mixOnly(589, true), { kind: "switch" }),
   "bus.stereo-assign": bus(

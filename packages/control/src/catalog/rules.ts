@@ -167,7 +167,8 @@ export interface SendSettingRule {
 export interface BusSettingRule {
   readonly target: "bus";
   readonly known: readonly string[];
-  readonly address: { readonly [bus: string]: { readonly paramId: number; readonly y: number; readonly write: boolean } };
+  /** Undefined for a known bus without the setting. */
+  readonly address: { readonly [bus: string]: { readonly paramId: number; readonly y: number; readonly write: boolean } | undefined };
   readonly value: ValueRule;
 }
 
