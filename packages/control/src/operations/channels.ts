@@ -12,15 +12,14 @@ import {
   MONO_PAIRS,
   PAIR_PARAMS,
   CHANNEL_PARAMS,
-  FADER_DB,
-  FADER_NEGATIVE_INFINITY_RAW,
-  PAN_RANGE,
+  FADER_LEVEL_RULE,
+  PAN_RULE,
   channelIndex,
   type ChannelIndex,
 } from "../catalog/channels.js";
-import { decodeInteger, decodeSwitch, encodeSwitch, planOnGrid } from "../catalog/codecs.js";
+import { decodeInteger, decodeSwitch, encodeSwitch } from "../catalog/codecs.js";
 import { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "../catalog/ports.js";
-import { formatI64, type I64Text } from "../catalog/i64.js";
+import type { I64Text } from "../catalog/i64.js";
 import type {
   ChannelColor,
   ChannelName,
@@ -33,6 +32,7 @@ import type {
 } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
+import { codecOf } from "./rules.js";
 import { address, modelOf, readDecoded, readName, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
@@ -97,43 +97,24 @@ export function channelSetting<V>(
   };
 }
 
-function decodeFader(raw: I64Text): FaderLevel | undefined {
-  if (raw === FADER_NEGATIVE_INFINITY_RAW) {
-    return "-inf";
-  }
-  const value = decodeInteger(raw, FADER_DB.min * 100, FADER_DB.max * 100);
-  return value === undefined ? undefined : value / 100;
-}
-
-function planFader(value: unknown): { planned: FaderLevel; raw: I64Text } | undefined {
-  if (value === "-inf") {
-    return { planned: "-inf", raw: FADER_NEGATIVE_INFINITY_RAW };
-  }
-  if (typeof value !== "number") {
-    return undefined;
-  }
-  const planned = planOnGrid(value, FADER_DB.min, FADER_DB.max, 100);
-  return planned === undefined ? undefined : { planned, raw: formatI64(BigInt(Math.round(planned * 100))) as I64Text };
-}
-
-function planPan(value: unknown): { planned: number; raw: I64Text } | undefined {
-  if (typeof value !== "number") {
-    return undefined;
-  }
-  const planned = planOnGrid(value, PAN_RANGE.min, PAN_RANGE.max, 1);
-  return planned === undefined ? undefined : { planned, raw: `${planned}` };
-}
+/** The shared level and PAN/BAL codecs: the same rule objects the bus and send handlers use. */
+const faderCodec = codecOf(FADER_LEVEL_RULE);
+const panCodec = codecOf(PAN_RULE);
 
 export function planSwitch(value: unknown): { planned: boolean; raw: I64Text } | undefined {
   return typeof value === "boolean" ? { planned: value, raw: encodeSwitch(value) } : undefined;
 }
 
 export const channelOn = channelSetting(CHANNEL_PARAMS.on, decodeSwitch, planSwitch);
-export const channelFader = channelSetting(CHANNEL_PARAMS.fader, decodeFader, planFader);
-export const channelPan = channelSetting(
+export const channelFader = channelSetting<FaderLevel>(
+  CHANNEL_PARAMS.fader,
+  (raw) => faderCodec.decode(raw) as FaderLevel | undefined,
+  (value) => faderCodec.plan(value) as { planned: FaderLevel; raw: I64Text } | undefined,
+);
+export const channelPan = channelSetting<number>(
   CHANNEL_PARAMS.pan,
-  (raw) => decodeInteger(raw, PAN_RANGE.min, PAN_RANGE.max),
-  planPan,
+  (raw) => panCodec.decode(raw) as number | undefined,
+  (value) => panCodec.plan(value) as { planned: number; raw: I64Text } | undefined,
 );
 
 function decodePolarity(raw: I64Text): Polarity | undefined {
