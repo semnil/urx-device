@@ -383,3 +383,20 @@ fn a_failed_or_unanswered_unregistration_refuses_every_later_activation() {
         }
     }
 }
+
+#[test]
+fn finishing_a_release_does_not_take_another_tokens_unanswered_unregistration() {
+    for address in [p(1), m(1)] {
+        let mut ledger = Ledger::new();
+        let live = active(&mut ledger, &[address]);
+        let unregister = ledger.begin_release(live);
+        assert_eq!(unregister, [address]);
+        let provisional = ledger.admit(&[address]).unwrap();
+        assert!(ledger.begin_release(provisional).is_empty());
+        ledger.finish(provisional);
+        ledger.unregistered(address, Verdict::Accepted);
+        ledger.finish(live);
+        let next = ledger.admit(&[address]).unwrap();
+        assert_eq!(ledger.start(next), Ok(vec![address]), "{address:?}");
+    }
+}

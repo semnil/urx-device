@@ -107,8 +107,9 @@ pub struct Ledger {
     entries: HashMap<SubscriptionAddress, Entry>,
     memberships: usize,
     next: u64,
-    /// Unregistrations named by a release and not yet answered.
-    unanswered: HashSet<SubscriptionAddress>,
+    /// Unregistrations named by a release and not yet answered, with the
+    /// token whose release named each.
+    unanswered: HashMap<SubscriptionAddress, TokenId>,
     /// Set once an unregistration fails or a release finishes unanswered.
     unusable: bool,
 }
@@ -252,7 +253,7 @@ impl Ledger {
                 entry.holders -= 1;
                 if entry.holders == 0 && entry.registration != Registration::NotRegistered {
                     unregister.push(*address);
-                    self.unanswered.insert(*address);
+                    self.unanswered.insert(*address, id);
                     continue;
                 }
             }
@@ -289,12 +290,15 @@ impl Ledger {
 
     /// Forgets a token whose release has finished, freeing its capacity. An
     /// unregistration it named that was never answered makes the ledger
-    /// unusable for further activations.
+    /// unusable for further activations; one another token's release named
+    /// is that token's to finish.
     pub fn finish(&mut self, token: TokenId) {
-        if let Some(token) = self.tokens.remove(&token) {
+        let id = token;
+        if let Some(token) = self.tokens.remove(&id) {
             self.memberships -= token.addresses.len();
             for address in &token.addresses {
-                if self.unanswered.remove(address) {
+                if self.unanswered.get(address) == Some(&id) {
+                    self.unanswered.remove(address);
                     self.unusable = true;
                 }
             }
