@@ -130,4 +130,29 @@ describe("basic channel controls (F03-H)", () => {
     }
     expect(transport.calls).toEqual([]);
   });
+
+  it("round values just above a midpoint up and the midpoint itself down", () => {
+    const fader = (value: number) => previewSetting("URX44", "channel.fader", { channel: 1 }, value).planned;
+    const pan = (value: number) => previewSetting("URX44", "channel.pan", { channel: 1 }, value).planned;
+    expect(fader(-15.004999999999)).toBe(-15);
+    expect(fader(-15.005)).toBe(-15.01);
+    expect(fader(0.005)).toBe(0);
+    expect(fader(0.0050000001)).toBe(0.01);
+    expect(pan(0.5000000001)).toBe(1);
+    expect(pan(0.5)).toBe(0);
+    expect(pan(-0.4999999999)).toBe(0);
+  });
+
+  it("type a whole-channel target without a side", () => {
+    const context = new OperationContext(new FakeTransport(), "URX44");
+    const polarityTarget = { channel: 5, side: "left" } as const;
+    const checks = () => {
+      // @ts-expect-error a side for a whole-channel setting
+      void readSetting(context, "channel.fader", polarityTarget);
+      // @ts-expect-error a side for a whole-channel write
+      void writeSetting(context, "channel.on", { channel: 5, side: "left" }, true);
+      void readSetting(context, "channel.polarity", polarityTarget);
+    };
+    expect(typeof checks).toBe("function");
+  });
 });

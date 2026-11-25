@@ -47,13 +47,18 @@ export interface SourceTarget {
   readonly source: SourceToken;
 }
 
-/** A channel by its C12 number: mono n, or a fixed stereo pair's first number. */
+/**
+ * A whole channel by its C12 number: mono n, or a fixed stereo pair's first
+ * number. It takes no side.
+ */
 export interface ChannelTarget {
   readonly channel: number;
+  readonly side?: undefined;
 }
 
 /** A channel with a side, required for side-specific fixed stereo settings. */
-export interface ChannelSideTarget extends ChannelTarget {
+export interface ChannelSideTarget {
+  readonly channel: number;
   readonly side?: "left" | "right";
 }
 

@@ -59,12 +59,11 @@ export function planOnGrid(requested: number, min: number, max: number, unitsPer
   if (!Number.isFinite(requested) || requested < min || requested > max) {
     return undefined;
   }
-  const scaled = requested * unitsPerOne;
-  const floor = Math.floor(scaled);
-  // A tie within the float error of the scaling goes down, like an exact one.
-  const fraction = scaled - floor;
-  const up = fraction > 0.5 && Math.abs(fraction - 0.5) > 1e-9;
-  const units = up ? floor + 1 : floor;
+  const floor = Math.floor(requested * unitsPerOne);
+  // Compared with the midpoint in the request's own unit, so only a value
+  // above it goes up; the midpoint itself goes down.
+  const midpoint = (floor + 0.5) / unitsPerOne;
+  const units = requested > midpoint ? floor + 1 : floor;
   const planned = units / unitsPerOne;
   return Object.is(planned, -0) ? 0 : planned;
 }
