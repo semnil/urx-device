@@ -1363,3 +1363,38 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
         CloseOutcome::Closed
     );
 }
+
+#[test]
+fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
+    // A thread-local destructor blocks the thread's exit after its body
+    // returned, so the thread reports finished while join() would block.
+    struct Blocks(mpsc::Receiver<()>);
+    impl Drop for Blocks {
+        fn drop(&mut self) {
+            let _ = self.0.recv_timeout(Duration::from_secs(2));
+        }
+    }
+    thread_local! {
+        static HOLD: std::cell::RefCell<Option<Blocks>> = const { std::cell::RefCell::new(None) };
+    }
+    let (release, hold) = mpsc::channel();
+    let stuck = thread::spawn(move || HOLD.with(|slot| *slot.borrow_mut() = Some(Blocks(hold))));
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    assert_eq!(
+        super::wait_for(
+            [Some(stuck), None, None],
+            Instant::now() + Duration::from_millis(100)
+        ),
+        CloseOutcome::Incomplete(Failure::Cause {
+            code: Cause::TeardownTimeout,
+            phase: Phase::Teardown
+        })
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(release);
+}

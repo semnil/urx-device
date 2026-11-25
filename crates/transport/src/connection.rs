@@ -459,28 +459,29 @@ impl Connection {
     }
 }
 
-/// `Closed` only when every thread is seen finished at a time before `end`;
-/// otherwise `Incomplete`, even if a thread finishes later.
+/// `Closed` only when every thread has been joined before `end`; otherwise
+/// `Incomplete`, even if the threads finish later. The joins run on their own
+/// thread, so a thread whose exit (its thread-local destructors included)
+/// does not finish cannot hold this past `end`.
 fn wait_for(threads: [Option<JoinHandle<()>>; 3], end: Instant) -> CloseOutcome {
     let incomplete =
         CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
-    for thread in threads.into_iter().flatten() {
-        loop {
-            let finished = thread.is_finished();
-            // Read after the check: a thread seen finished before this
-            // reading finished no later than it.
-            let now = Instant::now();
-            if now >= end {
-                return incomplete;
-            }
-            if finished {
-                break;
-            }
-            thread::sleep((end - now).min(Duration::from_millis(1)));
+    let (joined, all_joined) = mpsc::channel();
+    thread::spawn(move || {
+        for thread in threads.into_iter().flatten() {
+            let _ = thread.join();
         }
-        let _ = thread.join();
+        let _ = joined.send(());
+    });
+    let remaining = end.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return incomplete;
     }
-    CloseOutcome::Closed
+    match all_joined.recv_timeout(remaining) {
+        // Read after the joins: they completed no later than this reading.
+        Ok(()) if Instant::now() < end => CloseOutcome::Closed,
+        _ => incomplete,
+    }
 }
 
 /// Teardown budget a dropped connection uses when it was never closed.
