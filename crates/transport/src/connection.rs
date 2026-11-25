@@ -124,6 +124,9 @@ struct State {
     closing: bool,
     /// Whether the worker holds a request it has not yet settled.
     active: bool,
+    /// Whether the worker runs a lifecycle job: a close lets it finish, its
+    /// started cleanup included, before the teardown budget starts.
+    job: bool,
     terminal: Option<RequestCause>,
     cancelled_owners: Vec<u64>,
     next_owner: u64,
@@ -640,7 +643,7 @@ impl Connection {
         });
         {
             let mut state = self.shared.lock();
-            while state.active {
+            while state.active || state.job {
                 state = self
                     .shared
                     .settled
@@ -1327,13 +1330,17 @@ fn serve(
             let mut state = shared.lock();
             let job = state.jobs.pop_front();
             state.active |= job.is_some();
+            state.job = job.is_some();
             job
         };
         if let Some(job) = job {
             let (deliveries, fatal) = run_job(&mut sock, &inbox, &shared, &options, job);
             let ended = fatal.map(|cause| mark_ended(&shared, cause));
             {
-                shared.lock().active = false;
+                let mut state = shared.lock();
+                state.active = false;
+                state.job = false;
+                drop(state);
                 shared.settled.notify_all();
             }
             for (done, outcome) in deliveries {
@@ -1657,6 +1664,21 @@ impl Io<'_> {
     /// One registration or unregistration POST. With `stop`, it does not
     /// start once `stop` holds for the state.
     fn post(&mut self, request: wire::Request, stop: &dyn Fn(&State) -> bool) -> Posted {
+        self.post_with(request, stop, false)
+    }
+
+    /// An unregistration of owned cleanup: once started, the cleanup goes on
+    /// although a close is marked; the close waits for its job (K10, K37).
+    fn post_cleanup(&mut self, request: wire::Request) -> Posted {
+        self.post_with(request, &|_| false, true)
+    }
+
+    fn post_with(
+        &mut self,
+        request: wire::Request,
+        stop: &dyn Fn(&State) -> bool,
+        cleanup: bool,
+    ) -> Posted {
         let refused = |verdict, cause, ends| Posted::Refused {
             verdict,
             cause,
@@ -1670,7 +1692,7 @@ impl Io<'_> {
         let send_end = Instant::now() + self.options.send_deadline;
         let send_end = cap.map_or(send_end, |cap| send_end.min(cap));
         let unstarted = |state: &State| {
-            if state.closing && cap.is_none() {
+            if state.closing && cap.is_none() && !cleanup {
                 Some(Stop::Closing)
             } else if stop(state) {
                 Some(Stop::Cancelled)
@@ -1890,7 +1912,7 @@ impl Io<'_> {
     fn unregister_remaining(&mut self) -> Option<Failure> {
         let addresses = self.shared.lock().ledger.remaining_registrations();
         for address in addresses {
-            let posted = self.post(unregister(address), &|_| false);
+            let posted = self.post_cleanup(unregister(address));
             let (verdict, cause) = match posted {
                 Posted::Accepted => (Verdict::Accepted, None),
                 Posted::Refused { verdict, cause, .. } => (verdict, Some(cause)),
@@ -1909,7 +1931,7 @@ impl Io<'_> {
     fn unregister_owned(&mut self, token: TokenId) -> (Cleanup, Option<RequestCause>) {
         let addresses = self.shared.lock().ledger.begin_release(token);
         for address in addresses {
-            let posted = self.post(unregister(address), &|_| false);
+            let posted = self.post_cleanup(unregister(address));
             let (verdict, cause, ends) = match posted {
                 Posted::Accepted => (Verdict::Accepted, None, None),
                 Posted::Refused {

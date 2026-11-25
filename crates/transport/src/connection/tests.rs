@@ -2087,6 +2087,84 @@ mod lifecycle {
         );
     }
 
+    /// Closes on another thread once the unit has received `count` POSTs.
+    fn close_after(
+        connection: &Arc<Connection>,
+        peer: &Peer,
+        count: usize,
+    ) -> thread::JoinHandle<CloseOutcome> {
+        super::wait_until(|| posts(peer).len() == count);
+        let connection = Arc::clone(connection);
+        thread::spawn(move || connection.close(TEARDOWN))
+    }
+
+    #[test]
+    fn a_release_under_way_when_closing_unregisters_every_address() {
+        let peer = unit(Duration::from_millis(150), |_| Some(200));
+        let connection = Arc::new(connect(&peer));
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        let released = release(&token);
+        let closer = close_after(&connection, &peer, 3);
+        assert_eq!(settled(&released), Ok(()));
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1), unreg(2)]);
+    }
+
+    #[test]
+    fn the_teardown_budget_starts_after_a_release_under_way() {
+        let peer = unit(Duration::from_millis(150), |_| Some(200));
+        let connection = Arc::new(connect(&peer));
+        let token = connection
+            .prepare_subscription(&[p(1), p(2), p(3)])
+            .unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        let released = release(&token);
+        super::wait_until(|| posts(&peer).len() == 4);
+        let closing = Arc::clone(&connection);
+        let closer = thread::spawn(move || closing.close(Duration::from_millis(200)));
+        assert_eq!(
+            settled(&released),
+            Ok(()),
+            "its unregistrations outlast 200 ms"
+        );
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(posts(&peer)[3..], [unreg(1), unreg(2), unreg(3)]);
+    }
+
+    #[test]
+    fn a_failed_activations_cleanup_under_way_when_closing_finishes() {
+        let peer = unit(Duration::from_millis(150), |uri| {
+            Some(if uri == reg(2) { 400 } else { 200 })
+        });
+        let connection = Arc::new(connect(&peer));
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        let activated = activate(&connection, &token);
+        let closer = close_after(&connection, &peer, 3);
+        assert_eq!(
+            settled(&activated),
+            failed(Cause::DeviceRejected, Cleanup::COMPLETE)
+        );
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1)]);
+    }
+
+    #[test]
+    fn a_close_stops_an_acquisition_and_its_cleanup_still_runs() {
+        let peer = unit(Duration::from_millis(150), |_| Some(200));
+        let connection = Arc::new(connect(&peer));
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        let activated = activate(&connection, &token);
+        let closer = close_after(&connection, &peer, 1);
+        assert!(settled(&activated).is_err());
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(
+            posts(&peer),
+            [reg(1), unreg(1)],
+            "no registration after the close; the accepted one is released once"
+        );
+    }
+
     #[test]
     fn a_close_after_the_link_ended_sends_nothing() {
         let peer = Peer::serve(|request| match uri_of(request) {
