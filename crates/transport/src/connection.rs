@@ -603,10 +603,13 @@ impl Subscription {
         // check below and the queueing are one step under the state lock, so
         // an end or a close either comes first and refuses this release or
         // comes after and completes it.
-        let _gate = shared.link_end();
+        let gate = shared.link_end();
         let mut state = shared.lock();
         if state.closing || state.terminal.is_some() {
+            // The callback runs with neither lock held: it may release,
+            // cancel or close in turn.
             drop(state);
+            drop(gate);
             return done(Err(not_connected(Phase::Subscription)));
         }
         let done: LifecycleDone = Box::new(done);
@@ -621,7 +624,7 @@ impl Subscription {
         });
         state.jobs.push_back(Job::Release { token: self.token });
         drop(state);
-        drop(_gate);
+        drop(gate);
         let _ = self.events.send(Event::Wake);
     }
 }

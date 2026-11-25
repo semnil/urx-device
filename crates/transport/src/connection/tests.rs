@@ -1856,6 +1856,29 @@ mod lifecycle {
     }
 
     #[test]
+    fn a_refused_release_callback_can_release_cancel_and_close_again() {
+        let peer = accepting();
+        let connection = Arc::new(connect(&peer));
+        let token = Arc::new(connection.prepare_subscription(&[p(1)]).unwrap());
+        let other = Arc::new(connection.prepare_subscription(&[p(2)]).unwrap());
+        let operation = Arc::new(connection.create_operation().unwrap());
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        let (tx, finished) = mpsc::channel();
+        let (again, then) = (Arc::clone(&token), Arc::clone(&other));
+        let (op, conn) = (Arc::clone(&operation), Arc::clone(&connection));
+        token.release(move |_| {
+            again.release(|_| {});
+            then.release(|_| {});
+            op.cancel();
+            let _ = tx.send(conn.close(TEARDOWN));
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(CloseOutcome::Closed)
+        );
+    }
+
+    #[test]
     fn a_release_after_the_connection_ended_is_refused_without_a_job() {
         let peer = accepting();
         let connection = connect(&peer);
