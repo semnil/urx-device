@@ -1,0 +1,6 @@
+{
+  "note": "The status checks the main ruleset makes a merge condition. Every context is reported by a job in a workflow that triggers on pull_request with no trigger filter, so it reports on every pull request.",
+  "integration_id": 15368,
+  "integration_id_note": "GitHub Actions' app id. A ruleset entry matches on the app as well as the context name.",
+  "contexts": ["ci-required"]
+}
