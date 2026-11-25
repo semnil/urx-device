@@ -91,7 +91,7 @@ fn submit(
     request: Request,
 ) -> Receiver<Outcome> {
     let (tx, rx) = mpsc::channel();
-    connection.submit(operation, request, move |outcome| {
+    connection.submit_adopted(operation, request, move |outcome| {
         let _ = tx.send(outcome);
     });
     rx
@@ -786,7 +786,7 @@ fn an_outcome_that_ends_the_connection_is_delivered_after_the_end_is_recorded() 
     let operation = connection.create_operation().unwrap();
     let (tx, rx) = mpsc::channel();
     let observer = Arc::clone(&connection);
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::GetNumeric(address(1)),
         move |outcome| {
@@ -810,7 +810,7 @@ fn a_panicking_callback_does_not_stop_other_completions() {
     let peer = unit(plain);
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
-    connection.submit(&operation, Request::GetNumeric(address(1)), |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), |_| {
         panic!("callback failure")
     });
     let next = submit(&connection, &operation, Request::GetNumeric(address(2)));
@@ -829,10 +829,10 @@ fn a_panicking_callback_does_not_stop_other_completions() {
     )
     .unwrap();
     let operation = connection.create_operation().unwrap();
-    connection.submit(&operation, Request::GetNumeric(address(1)), |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), |_| {
         panic!("callback failure")
     });
-    connection.submit(&operation, Request::GetNumeric(address(2)), |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(2)), |_| {
         panic!("callback failure")
     });
     let last = submit(&connection, &operation, Request::GetNumeric(address(3)));
@@ -864,7 +864,7 @@ fn releasing_the_connection_from_a_completion_callback_does_not_deadlock() {
         let (tx, rx) = mpsc::channel();
         let last = Arc::clone(&connection);
         let waiting = submit(&connection, &operation, Request::GetNumeric(address(9)));
-        connection.submit(
+        connection.submit_adopted(
             &operation,
             Request::GetNumeric(address(1)),
             move |outcome| {
@@ -905,7 +905,7 @@ fn cancelling_or_closing_after_the_end_does_not_change_how_waiting_requests_end(
     let other = connection.create_operation().unwrap();
     let canceller = Arc::clone(&operation);
     let (tx, active) = mpsc::channel();
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::GetNumeric(address(1)),
         move |outcome| {
@@ -950,7 +950,7 @@ fn no_write_starts_after_the_link_is_reported_lost() {
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
     let (tx, first) = mpsc::channel();
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::SetNumeric(address(1), 1),
         move |outcome| {
@@ -1018,6 +1018,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             settled: std::sync::Condvar::new(),
+            advance: std::sync::Condvar::new(),
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
@@ -1149,7 +1150,7 @@ fn a_close_started_from_a_callback_finishes_for_other_callers() {
     let operation = connection.create_operation().unwrap();
     let (tx, started) = mpsc::channel();
     let closer = Arc::clone(&connection);
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let _ = tx.send(closer.close(TEARDOWN));
     });
     assert_eq!(
@@ -1166,7 +1167,7 @@ fn a_second_close_from_the_same_callback_does_not_wait_for_its_own_worker() {
     let operation = connection.create_operation().unwrap();
     let (tx, outcomes) = mpsc::channel();
     let closer = Arc::clone(&connection);
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let first = closer.close(TEARDOWN);
         let second = closer.close(TEARDOWN);
         let _ = tx.send((first, second));
@@ -1222,7 +1223,7 @@ fn a_waiting_request_callback_that_closes_does_not_hold_the_close_up() {
     wait_until(|| parameter_uris(&peer).len() == 1);
     let (tx, inner) = mpsc::channel();
     let again = Arc::clone(&connection);
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::SetNumeric(address(2), 1),
         move |outcome| {
@@ -1255,7 +1256,7 @@ fn a_callback_that_outlasts_the_teardown_budget_makes_the_close_incomplete() {
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
     let (tx, delivered) = mpsc::channel();
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let _ = tx.send(());
         thread::sleep(Duration::from_millis(600));
     });
@@ -1289,7 +1290,7 @@ fn a_slow_waiting_request_callback_is_bounded_by_the_teardown_budget() {
     let operation = connection.create_operation().unwrap();
     let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
     wait_until(|| parameter_uris(&peer).len() == 1);
-    connection.submit(&operation, Request::SetNumeric(address(2), 1), |_| {
+    connection.submit_adopted(&operation, Request::SetNumeric(address(2), 1), |_| {
         thread::sleep(Duration::from_secs(1));
     });
     let started = Instant::now();
@@ -1327,7 +1328,7 @@ fn waiting_outcomes_are_delivered_before_closed_is_returned() {
     let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for id in [2, 3] {
         let delivered = Arc::clone(&delivered);
-        connection.submit(&operation, Request::SetNumeric(address(id), 1), move |_| {
+        connection.submit_adopted(&operation, Request::SetNumeric(address(id), 1), move |_| {
             thread::sleep(Duration::from_millis(50));
             delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
@@ -1344,7 +1345,7 @@ fn closing_is_visible_only_once_new_work_is_refused() {
     let operation = connection.create_operation().unwrap();
     let (tx, seen) = mpsc::channel();
     let probe = Arc::clone(&connection);
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let outcome = probe.close(TEARDOWN);
         let _ = tx.send((outcome, probe.create_operation().is_err()));
     });
@@ -2125,13 +2126,13 @@ mod notifications {
     }
 
     #[test]
-    fn notifications_received_while_a_request_waits_are_delivered() {
+    fn a_result_waits_for_the_notifications_received_before_it() {
         let (port, push) = pushing_unit(Duration::from_millis(200));
         let (connection, batches) = connect(port);
         let _token = activate(&connection, &[p(1)]);
         let operation = connection.create_operation().unwrap();
         let (tx, done) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
             let _ = tx.send(outcome);
         });
         thread::sleep(Duration::from_millis(50));
@@ -2141,6 +2142,11 @@ mod notifications {
             batch.records.iter().map(numeric).collect::<Vec<_>>(),
             [(1, 7)]
         );
+        assert!(
+            done.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the reply arrived, but its prior notification is not adopted"
+        );
+        assert!(connection.adopt_notifications(batch.ticket));
         assert!(matches!(
             done.recv_timeout(Duration::from_secs(5)).unwrap(),
             Outcome::Success { .. }
@@ -2169,7 +2175,7 @@ mod notifications {
         let operation = connection.create_operation().unwrap();
         let (release, blocked) = mpsc::channel::<()>();
         let (entered_tx, entered) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |_| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |_| {
             let _ = entered_tx.send(());
             let _ = blocked.recv();
         });
@@ -2229,23 +2235,25 @@ mod notifications {
         let _token = activate(&connection, &[p(1)]);
         let operation = connection.create_operation().unwrap();
         let (tx, done) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
             let _ = tx.send(outcome);
         });
         let (later_tx, later) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(6)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(6)), move |outcome| {
             let _ = later_tx.send(outcome);
         });
         thread::sleep(Duration::from_millis(50));
         for value in 0..=(MAX_PENDING_NOTIFICATIONS as i64) {
             push.send(notify_param(1, value)).unwrap();
         }
-        assert!(
-            matches!(
-                done.recv_timeout(Duration::from_secs(5)).unwrap(),
-                Outcome::Success { .. }
+        assert_eq!(
+            done.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Outcome::failed(
+                RequestCause::NotificationOverflow,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
             ),
-            "the reply within its deadline is the evidence"
+            "the reply within its deadline is the evidence; its delivery fails"
         );
         assert!(matches!(
             later.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -2451,7 +2459,7 @@ mod notifications {
         let _token = activate(&connection, &[p(1)]);
         let operation = connection.create_operation().unwrap();
         let (tx, done) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
             let _ = tx.send(outcome);
         });
         thread::sleep(Duration::from_millis(50));
@@ -2503,7 +2511,7 @@ mod notifications {
             let (release, _) = block_worker(&connection);
             let operation = connection.create_operation().unwrap();
             let (tx, done) = mpsc::channel();
-            connection.submit(&operation, Request::GetNumeric(param(6)), move |outcome| {
+            connection.submit_adopted(&operation, Request::GetNumeric(param(6)), move |outcome| {
                 let _ = tx.send(outcome);
             });
             overflow(&connection, &push);
@@ -2524,5 +2532,168 @@ mod notifications {
                 assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
             }
         }
+    }
+
+    /// Submits a GET whose outcome and adoption are handed to the test.
+    fn submit_held(
+        connection: &Connection,
+        operation: &crate::connection::Operation,
+        param_id: u32,
+    ) -> Receiver<(Outcome, crate::connection::ResultAdoption)> {
+        let (tx, rx) = mpsc::channel();
+        connection.submit(
+            operation,
+            Request::GetNumeric(param(param_id)),
+            move |outcome, adoption| {
+                let _ = tx.send((outcome, adoption));
+            },
+        );
+        rx
+    }
+
+    #[test]
+    fn a_result_holds_the_wire_slot_until_it_is_adopted() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let operation = connection.create_operation().unwrap();
+        let first = submit_held(&connection, &operation, 5);
+        let second = submit_held(&connection, &operation, 6);
+        let (outcome, adoption) = first.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+        assert!(
+            second.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing is sent before the adoption"
+        );
+        assert!(adoption.adopt());
+        let (outcome, adoption) = second.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+        assert!(adoption.adopt());
+    }
+
+    #[test]
+    fn an_unsent_completion_holds_nothing() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let operation = connection.create_operation().unwrap();
+        operation.cancel();
+        let (outcome, adoption) = submit_held(&connection, &operation, 5)
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Failure { .. }));
+        assert!(!adoption.adopt(), "no result is held");
+        let other = connection.create_operation().unwrap();
+        let (outcome, _) = submit_held(&connection, &other, 6)
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+    }
+
+    #[test]
+    fn later_notifications_do_not_move_the_cutoff() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        // The reply arrives at about 200 ms; these arrive after it.
+        thread::sleep(Duration::from_millis(400));
+        for value in 2..6 {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert!(held.try_recv().is_err());
+        assert!(connection.adopt_notifications(first.ticket));
+        let (outcome, adoption) = held.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+        assert!(adoption.adopt());
+        let later = next(&batches);
+        assert_eq!(
+            later.records.iter().map(numeric).collect::<Vec<_>>(),
+            [(1, 2), (1, 3), (1, 4), (1, 5)],
+            "still pending, not required by the result"
+        );
+    }
+
+    #[test]
+    fn an_end_while_a_result_is_held_fails_its_delivery_with_its_evidence() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        let waiting = submit_held(&connection, &operation, 6);
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        let (outcome, adoption) = held.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::failed(
+                RequestCause::ConnectionLost,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
+            )
+        );
+        assert!(!adoption.adopt());
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap().0,
+            unsent_with(RequestCause::ConnectionLost)
+        );
+        assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    }
+
+    #[test]
+    fn a_close_does_not_wait_for_a_stalled_application() {
+        // Held for its prior notification, then for its adoption.
+        for adopt_batch in [false, true] {
+            let (port, push) = pushing_unit(Duration::from_millis(200));
+            let (connection, batches) = connect(port);
+            let _token = activate(&connection, &[p(1)]);
+            let operation = connection.create_operation().unwrap();
+            let held = submit_held(&connection, &operation, 5);
+            thread::sleep(Duration::from_millis(50));
+            push.send(notify_param(1, 1)).unwrap();
+            let first = next(&batches);
+            if adopt_batch {
+                assert!(connection.adopt_notifications(first.ticket));
+            }
+            thread::sleep(Duration::from_millis(400));
+            assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+            let (outcome, _) = held.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(outcome, Outcome::Success { .. }),
+                "an established result is not invalidated by the close"
+            );
+        }
+    }
+
+    #[test]
+    fn a_registration_waits_for_the_notifications_received_before_its_reply() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        assert!(
+            activated.recv_timeout(Duration::from_millis(500)).is_err(),
+            "accepted, but not consumed before the prior notification"
+        );
+        assert!(connection.adopt_notifications(first.ticket));
+        assert_eq!(
+            activated.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
     }
 }

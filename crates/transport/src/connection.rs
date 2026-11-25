@@ -62,7 +62,50 @@ pub struct ConnectionOptions {
     pub response_deadline: Duration,
 }
 
-type Done = Box<dyn FnOnce(Outcome) + Send>;
+type Done = Box<dyn FnOnce(Outcome, ResultAdoption) + Send>;
+
+/// The acknowledgment of one app-issued request's completion (K6, K37):
+/// until it is adopted, the request keeps the connection's single wire
+/// slot, and the worker starts nothing after it. Completions that leave no
+/// result in the slot (refused, unsent or ended) carry one that adopts
+/// nothing.
+pub struct ResultAdoption {
+    shared: Weak<Shared>,
+    id: u64,
+}
+
+impl ResultAdoption {
+    fn none() -> Self {
+        ResultAdoption {
+            shared: Weak::new(),
+            id: 0,
+        }
+    }
+
+    /// Releases the slot once the result is adopted. Returns false when it
+    /// holds no result (anymore) on its own connection.
+    pub fn adopt(self) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut state = shared.lock();
+        match &mut state.result {
+            Some(held) if held.id == self.id && !held.adopted => {
+                held.adopted = true;
+                drop(state);
+                shared.advance.notify_all();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The completion in the wire slot, awaiting its adoption.
+struct HeldResult {
+    id: u64,
+    adopted: bool,
+}
 
 struct Item {
     owner: u64,
@@ -88,6 +131,12 @@ struct State {
     jobs: VecDeque<Job>,
     /// Releases asked for and not yet settled, one per token.
     releases: Vec<Release>,
+    /// The end recorded in `Shared::link_end`, mirrored for the waits that
+    /// hold the state lock (K12).
+    ended: Option<RequestCause>,
+    /// The app-issued completion holding the wire slot.
+    result: Option<HeldResult>,
+    next_result: u64,
 }
 
 /// One release of a token and every caller waiting on it.
@@ -128,6 +177,9 @@ struct Shared {
     link_end: Mutex<Option<RequestCause>>,
     /// Signalled when the worker settles its active request.
     settled: Condvar,
+    /// Signalled, with the state lock, when what a held result waits for may
+    /// have changed: a notification or result adoption, an end, a close.
+    advance: Condvar,
     /// Notifications waiting for the application (K6), when it takes them.
     notifications: Option<Mutex<Queue>>,
     /// Signalled when a batch can be formed or delivery must stop.
@@ -162,6 +214,8 @@ struct Received {
     len: usize,
     /// PC receipt time, milliseconds since the Unix epoch.
     received_at_ms: i64,
+    /// Notification records queued before it (K12's receive cutoff).
+    cutoff: u64,
 }
 
 /// Receives each notification batch; acknowledge it with
@@ -310,6 +364,7 @@ impl Connection {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
             settled: Condvar::new(),
+            advance: Condvar::new(),
             notifications: notifications
                 .as_ref()
                 .map(|_| Mutex::new(Queue::new(generation))),
@@ -390,42 +445,54 @@ impl Connection {
 
     /// Admits `request` for `operation`, or completes it at once, unsent,
     /// when it cannot be admitted. `done` runs exactly once, on the worker
-    /// thread or, for a refusal, on this thread.
+    /// thread or, for a refusal, on this thread. A result received from the
+    /// unit is passed only after every notification received before it is
+    /// adopted (K12), and it holds the wire slot until its
+    /// [`ResultAdoption`] is adopted (K6).
     pub fn submit(
         &self,
         operation: &Operation,
         request: Request,
-        done: impl FnOnce(Outcome) + Send + 'static,
+        done: impl FnOnce(Outcome, ResultAdoption) + Send + 'static,
     ) {
         let refuse = |code, phase| Outcome::failed(code, phase, Evidence::NotSent);
         let message = message_of(&request);
         let frame = match frame::encode(&message) {
             Ok(frame) => frame,
-            Err(_) => return done(refuse(RequestCause::InvalidInput, RequestPhase::Validation)),
+            Err(_) => {
+                return done(
+                    refuse(RequestCause::InvalidInput, RequestPhase::Validation),
+                    ResultAdoption::none(),
+                )
+            }
         };
         let mut state = self.shared.lock();
         let ours = operation.shared.ptr_eq(&Arc::downgrade(&self.shared));
         if !ours || state.closing || state.terminal.is_some() {
             drop(state);
-            return done(refuse(RequestCause::NotConnected, RequestPhase::Admission));
+            return done(
+                refuse(RequestCause::NotConnected, RequestPhase::Admission),
+                ResultAdoption::none(),
+            );
         }
         if state.cancelled_owners.contains(&operation.id) {
             drop(state);
-            return done(Outcome::Failure {
+            let cancelled = Outcome::Failure {
                 failure: RequestFailure::Cancelled {
                     phase: RequestPhase::Admission,
                 },
                 evidence: Evidence::NotSent,
-            });
+            };
+            return done(cancelled, ResultAdoption::none());
         }
         if state.waiting.len() >= MAX_WAITING_REQUESTS
             || state.waiting_bytes + frame.len() > MAX_WAITING_BYTES
         {
             drop(state);
-            return done(refuse(
-                RequestCause::PreconditionFailed,
-                RequestPhase::Admission,
-            ));
+            return done(
+                refuse(RequestCause::PreconditionFailed, RequestPhase::Admission),
+                ResultAdoption::none(),
+            );
         }
         state.waiting_bytes += frame.len();
         state.waiting.push_back(Item {
@@ -450,6 +517,10 @@ impl Connection {
         let adopted = lock(queue).adopt(ticket);
         if adopted {
             self.shared.deliverable.notify_all();
+            // Taken after the queue changed, so a held result checking it
+            // under the state lock either sees the change or is woken.
+            drop(self.shared.lock());
+            self.shared.advance.notify_all();
         }
         adopted
     }
@@ -520,6 +591,8 @@ impl Connection {
             (take_pending(&mut state), cause)
         };
         let (waiting, cause) = waiting;
+        // A held result stops waiting for the application.
+        self.shared.advance.notify_all();
         let _ = self.events.send(Event::Wake);
         // Waiting requests complete on their own thread, which the close
         // waits for within the budget; a close called from one of their
@@ -770,16 +843,43 @@ impl Operation {
                     evidence: Evidence::NotSent,
                 },
             };
-            deliver(item.done, outcome);
+            deliver(item.done, outcome, ResultAdoption::none());
         }
+    }
+}
+
+fn is_unsent(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Failure {
+            evidence: Evidence::NotSent,
+            ..
+        }
+    )
+}
+
+#[cfg(test)]
+impl Connection {
+    /// `submit`, adopting the result as soon as `done` has returned.
+    pub(crate) fn submit_adopted(
+        &self,
+        operation: &Operation,
+        request: Request,
+        done: impl FnOnce(Outcome) + Send + 'static,
+    ) {
+        self.submit(operation, request, move |outcome, adoption| {
+            done(outcome);
+            adoption.adopt();
+        });
     }
 }
 
 /// Runs one completion callback. A callback that panics is contained, so
 /// every other admitted request still completes and the connection still
 /// shuts down.
-fn deliver(done: Done, outcome: Outcome) {
-    let _ = panic::catch_unwind(AssertUnwindSafe(move || done(outcome)));
+/// Returns false when the callback panicked.
+fn deliver(done: Done, outcome: Outcome, adoption: ResultAdoption) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(move || done(outcome, adoption))).is_ok()
 }
 
 fn message_of(request: &Request) -> Value {
@@ -888,7 +988,7 @@ fn deliver_notifications(shared: &Shared, handler: &NotificationHandler, events:
         if panic::catch_unwind(AssertUnwindSafe(|| handler(batch))).is_err() {
             // The application can no longer adopt notifications: the
             // connection ends, and delivery stops.
-            shared.link_end().get_or_insert(RequestCause::InternalError);
+            record_end(shared, RequestCause::InternalError);
             let _ = events.send(Event::ReadFailed(RequestCause::InternalError));
             return;
         }
@@ -904,7 +1004,7 @@ fn read_frames(
     shared: Arc<Shared>,
 ) {
     let record = |cause| {
-        shared.link_end().get_or_insert(cause);
+        record_end(&shared, cause);
     };
     // After an overflow, replies to a request already sent still arrive;
     // further notifications are not queued, even once budget is released.
@@ -921,10 +1021,11 @@ fn read_frames(
                     if lost_notification(&json) {
                         record(RequestCause::ConnectionLost);
                     }
-                    let received = Received {
+                    let mut received = Received {
                         message: json,
                         len: frame.len,
                         received_at_ms: now_ms(),
+                        cutoff: 0,
                     };
                     // Recipients and budget are decided here, at receipt.
                     match route(&shared, &received, !overflowed) {
@@ -940,6 +1041,10 @@ fn read_frames(
                             continue;
                         }
                     }
+                    received.cutoff = shared
+                        .notifications
+                        .as_ref()
+                        .map_or(0, |queue| lock(queue).accepted());
                     if events.send(Event::Frame(received)).is_err() {
                         return;
                     }
@@ -1002,27 +1107,61 @@ fn serve(
             if state.closing && state.waiting.is_empty() {
                 return;
             }
-            let item = state.waiting.pop_front();
-            if let Some(item) = &item {
+            state.waiting.pop_front().map(|item| {
                 state.waiting_bytes -= item.frame.len();
                 state.active = true;
-            }
-            item
+                state.next_result += 1;
+                let id = state.next_result;
+                state.result = Some(HeldResult { id, adopted: false });
+                (item, id)
+            })
         };
         let fatal = match next {
-            Some(item) => {
+            Some((item, id)) => {
                 let (outcome, fatal) = execute(&mut sock, &inbox, &shared, &options, &item);
-                shared.lock().active = false;
+                // Only a request that may have reached the unit holds the
+                // slot for its adoption; an end releases it.
+                let holds = fatal.is_none() && !is_unsent(&outcome);
+                {
+                    let mut state = shared.lock();
+                    state.active = false;
+                    if !holds {
+                        state.result = None;
+                    }
+                }
                 shared.settled.notify_all();
                 // The end is recorded, and the waiting requests taken with it,
                 // before the outcome is delivered: whoever receives it sees
                 // the ended state, and nothing it does can change how the
                 // waiting requests end.
                 let waiting = fatal.map(|cause| mark_ended(&shared, cause));
-                deliver(item.done, outcome);
+                let adoption = if holds {
+                    ResultAdoption {
+                        shared: Arc::downgrade(&shared),
+                        id,
+                    }
+                } else {
+                    ResultAdoption::none()
+                };
+                if !deliver(item.done, outcome, adoption) && holds {
+                    // A callback that failed took its adoption with it; the
+                    // result is consumed, as the other completions are not
+                    // held up by a failed callback.
+                    if let Some(held) = shared.lock().result.as_mut() {
+                        held.adopted = true;
+                    }
+                }
                 if let Some(ended) = waiting {
                     finish(&mut sock, ended);
                     return;
+                }
+                if holds {
+                    // Nothing starts on the wire until the result is
+                    // adopted; an end or a close does not wait for it.
+                    hold(&shared, |state| {
+                        state.result.as_ref().is_none_or(|held| held.adopted)
+                    });
+                    shared.lock().result = None;
                 }
                 None
             }
@@ -1042,6 +1181,17 @@ fn serve(
     }
 }
 
+/// Records `cause` as the end of the connection unless one is recorded, and
+/// returns the recorded end.
+fn record_end(shared: &Shared, cause: RequestCause) -> RequestCause {
+    let mut link_end = shared.link_end();
+    let cause = *link_end.get_or_insert(cause);
+    shared.lock().ended = Some(cause);
+    drop(link_end);
+    shared.advance.notify_all();
+    cause
+}
+
 /// Records `cause` as the end of the connection and takes the waiting
 /// requests in the same step, so that no later cancellation or close changes
 /// how they end.
@@ -1051,10 +1201,12 @@ fn mark_ended(shared: &Shared, cause: RequestCause) -> Ended {
     let mut link_end = shared.link_end();
     let cause = *link_end.get_or_insert(cause);
     let mut state = shared.lock();
+    state.ended = Some(cause);
     state.terminal.get_or_insert(cause);
     let taken = take_pending(&mut state);
     drop(state);
     drop(link_end);
+    shared.advance.notify_all();
     Ended { taken, cause }
 }
 
@@ -1099,6 +1251,7 @@ impl Taken {
             deliver(
                 item.done,
                 Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
+                ResultAdoption::none(),
             );
         }
         for job in self.jobs {
@@ -1259,8 +1412,13 @@ impl Io<'_> {
             unstarted: &unstarted,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
-            Ok((inbound, ending)) => {
-                let reply = inbound
+            Ok(held) => {
+                let ending = match await_cutoff(self.shared, &held) {
+                    Held::Ready | Held::Closing => None,
+                    Held::Ended(cause) => Some(cause),
+                };
+                let reply = held
+                    .inbound
                     .reply(&key)
                     .expect("exchange returns the matching reply");
                 if let Some(cause) = ending {
@@ -1495,11 +1653,18 @@ fn execute(
         unstarted: &unstarted,
     };
     match exchange(sock, inbox, shared, options, outbound) {
-        Ok((inbound, ending)) => {
-            let reply = inbound
-                .reply(key)
-                .expect("exchange returns the matching reply");
-            (decode(request, reply), ending)
+        Ok(reply) => {
+            let outcome = decode(
+                request,
+                reply
+                    .inbound
+                    .reply(key)
+                    .expect("exchange returns the matching reply"),
+            );
+            match await_cutoff(shared, &reply) {
+                Held::Ready | Held::Closing => (outcome, None),
+                Held::Ended(cause) => (at_delivery(outcome, cause), Some(cause)),
+            }
         }
         Err(failed) => (
             Outcome::Failure {
@@ -1508,6 +1673,70 @@ fn execute(
             },
             failed.ends,
         ),
+    }
+}
+
+/// The matching reply of one exchange.
+struct Answer {
+    inbound: Inbound,
+    /// Notification records queued before it was received (K12).
+    cutoff: u64,
+    /// An end that came while it was awaited.
+    ending: Option<RequestCause>,
+}
+
+/// What a held result stopped waiting for.
+enum Held {
+    Ready,
+    Ended(RequestCause),
+    Closing,
+}
+
+/// Waits until `ready`, or until the connection ends or closes: fatal
+/// stopping and a close never wait for the application (K6, K12).
+fn hold(shared: &Shared, ready: impl Fn(&State) -> bool) -> Held {
+    let mut state = shared.lock();
+    loop {
+        if ready(&state) {
+            return Held::Ready;
+        }
+        if let Some(cause) = state.ended {
+            return Held::Ended(cause);
+        }
+        if state.closing {
+            return Held::Closing;
+        }
+        state = shared
+            .advance
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+/// Holds a reply until every notification record received before it is
+/// adopted (K12), or the connection ends or closes.
+fn await_cutoff(shared: &Shared, reply: &Answer) -> Held {
+    if let Some(cause) = reply.ending {
+        return Held::Ended(cause);
+    }
+    // The queue lock is taken under the state lock only here.
+    hold(shared, |_| {
+        shared
+            .notifications
+            .as_ref()
+            .is_none_or(|queue| lock(queue).has_adopted(reply.cutoff))
+    })
+}
+
+/// An established result whose normal delivery cannot complete because the
+/// connection ended: a failure at delivery keeping its evidence (K34). A
+/// rejection or a failure stays as it is.
+fn at_delivery(outcome: Outcome, cause: RequestCause) -> Outcome {
+    match outcome {
+        Outcome::Success { evidence, .. } => {
+            Outcome::failed(cause, RequestPhase::Delivery, evidence)
+        }
+        failure => failure,
     }
 }
 
@@ -1557,7 +1786,7 @@ fn exchange(
     shared: &Shared,
     options: &ConnectionOptions,
     outbound: Outbound<'_>,
-) -> Result<(Inbound, Option<RequestCause>), Failed> {
+) -> Result<Answer, Failed> {
     let Outbound {
         frame,
         key,
@@ -1600,7 +1829,7 @@ fn exchange(
     // reported instead.
     let unconfirmed = |cause: RequestCause| {
         Err(Failed::new(
-            *shared.link_end().get_or_insert(cause),
+            record_end(shared, cause),
             RequestPhase::Response,
             Evidence::Unconfirmed,
             true,
@@ -1623,7 +1852,11 @@ fn exchange(
                 }
                 let inbound = Inbound::new(received.message);
                 if inbound.reply(key).is_some() {
-                    return Ok((inbound, ending));
+                    return Ok(Answer {
+                        inbound,
+                        cutoff: received.cutoff,
+                        ending,
+                    });
                 }
             }
             Ok(Event::Wake) => {}
