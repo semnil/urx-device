@@ -81,11 +81,21 @@ struct State {
 
 struct Shared {
     state: Mutex<State>,
+    /// The end of the link as the reader detected it. The reader records it
+    /// before reporting it, and the worker starts each write while holding
+    /// this lock, so a write never starts after the end is recorded.
+    link_end: Mutex<Option<RequestCause>>,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn link_end(&self) -> MutexGuard<'_, Option<RequestCause>> {
+        self.link_end
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -176,6 +186,7 @@ impl Connection {
     ) -> std::io::Result<Connection> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
+            link_end: Mutex::new(None),
         });
         let (events, inbox) = mpsc::channel();
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -183,7 +194,8 @@ impl Connection {
             let sock = sock.try_clone()?;
             let events = events.clone();
             let stop = Arc::clone(&reader_stop);
-            thread::spawn(move || read_frames(sock, reader, events, stop))
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || read_frames(sock, reader, events, stop, shared))
         };
         let worker_thread = {
             let sock = sock.try_clone()?;
@@ -405,8 +417,13 @@ fn read_frames(
     mut reader: FrameReader,
     events: Sender<Event>,
     stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 ) {
+    let record = |cause| {
+        shared.link_end().get_or_insert(cause);
+    };
     if sock.set_read_timeout(Some(READ_POLL)).is_err() {
+        record(RequestCause::ConnectionLost);
         let _ = events.send(Event::ReadFailed(RequestCause::ConnectionLost));
         return;
     }
@@ -414,6 +431,9 @@ fn read_frames(
         match reader.read_frame(&mut sock) {
             Ok(Some(frame)) => {
                 if let Some(json) = frame.json {
+                    if lost_notification(&json) {
+                        record(RequestCause::ConnectionLost);
+                    }
                     if events.send(Event::Frame(json)).is_err() {
                         return;
                     }
@@ -426,6 +446,7 @@ fn read_frames(
                         ReadError::Oversized { .. } => RequestCause::InvalidResponse,
                         ReadError::Closed | ReadError::Io(_) => RequestCause::ConnectionLost,
                     };
+                    record(cause);
                     let _ = events.send(Event::ReadFailed(cause));
                 }
                 return;
@@ -443,7 +464,8 @@ fn serve(
     options: ConnectionOptions,
 ) {
     loop {
-        if let Some(cause) = pending_end(&inbox) {
+        let reported = *shared.link_end();
+        if let Some(cause) = reported {
             let waiting = mark_ended(&shared, cause);
             finish(&mut sock, waiting, cause);
             return;
@@ -487,22 +509,6 @@ fn serve(
             let waiting = mark_ended(&shared, cause);
             finish(&mut sock, waiting, cause);
             return;
-        }
-    }
-}
-
-/// The cause of an end the reader has already reported, if one is waiting in
-/// `inbox`. Other events are consumed: frames that answer nothing are not
-/// delivered anywhere yet.
-fn pending_end(inbox: &Receiver<Event>) -> Option<RequestCause> {
-    loop {
-        match inbox.try_recv() {
-            Ok(Event::Frame(message)) if lost_notification(&message) => {
-                return Some(RequestCause::ConnectionLost)
-            }
-            Ok(Event::ReadFailed(cause)) => return Some(cause),
-            Ok(_) => {}
-            Err(_) => return None,
         }
     }
 }
@@ -567,7 +573,7 @@ fn execute(
             None,
         );
     }
-    if let Err((cause, written)) = write_frame(sock, inbox, frame, send_end) {
+    if let Err((cause, written)) = write_frame(sock, shared, frame, send_end) {
         let evidence = if written == 0 {
             Evidence::NotSent
         } else {
@@ -635,20 +641,17 @@ fn execute(
     }
 }
 
-/// Writes `frame` by `end`, starting no write once the reader has reported
-/// the link ended. On failure, the cause and how many bytes went out.
+/// Writes `frame` by `end`, starting no write once the reader has recorded
+/// the link's end. On failure, the cause and how many bytes went out.
 fn write_frame(
     sock: &mut TcpStream,
-    inbox: &Receiver<Event>,
+    shared: &Shared,
     frame: &[u8],
     end: Instant,
 ) -> Result<(), (RequestCause, usize)> {
     debug_assert!(frame.len() <= MAX_FRAME_BYTES + 1);
     let mut written = 0;
     while written < frame.len() {
-        if let Some(cause) = pending_end(inbox) {
-            return Err((cause, written));
-        }
         let remaining = end.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err((RequestCause::SendTimeout, written));
@@ -659,7 +662,15 @@ fn write_frame(
         {
             return Err((RequestCause::ConnectionLost, written));
         }
-        match sock.write(&frame[written..]) {
+        // Held across the write: the reader cannot record an end between
+        // this check and the start of the write.
+        let link_end = shared.link_end();
+        if let Some(cause) = *link_end {
+            return Err((cause, written));
+        }
+        let outcome = sock.write(&frame[written..]);
+        drop(link_end);
+        match outcome {
             Ok(0) => return Err((RequestCause::ConnectionLost, written)),
             Ok(n) => written += n,
             Err(e)
