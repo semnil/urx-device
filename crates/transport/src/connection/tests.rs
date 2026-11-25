@@ -884,3 +884,48 @@ fn releasing_the_connection_from_a_completion_callback_does_not_deadlock() {
         );
     }
 }
+
+#[test]
+fn cancelling_or_closing_after_the_end_does_not_change_how_waiting_requests_end() {
+    let peer = unit(|_| vec![]);
+    let connection = open(
+        peer.port,
+        ID,
+        &ConnectionOptions {
+            response_deadline: Duration::from_millis(100),
+            ..options()
+        },
+        &Control::new(),
+    )
+    .unwrap();
+    let operation = Arc::new(connection.create_operation().unwrap());
+    let other = connection.create_operation().unwrap();
+    let canceller = Arc::clone(&operation);
+    let (tx, active) = mpsc::channel();
+    connection.submit(
+        &operation,
+        Request::GetNumeric(address(1)),
+        move |outcome| {
+            canceller.cancel();
+            let _ = tx.send(outcome);
+        },
+    );
+    let mine = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    let theirs = submit(&connection, &other, Request::GetNumeric(address(3)));
+    assert_eq!(
+        outcome(&active),
+        failed(
+            RequestCause::ResponseTimeout,
+            RequestPhase::Response,
+            Evidence::Unconfirmed
+        )
+    );
+    let ended = failed(
+        RequestCause::ResponseTimeout,
+        RequestPhase::Admission,
+        Evidence::NotSent,
+    );
+    assert_eq!(outcome(&mine), ended.clone(), "not cancelled after the end");
+    assert_eq!(outcome(&theirs), ended);
+    connection.close();
+}

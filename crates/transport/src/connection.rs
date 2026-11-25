@@ -457,13 +457,17 @@ fn serve(
         let fatal = match next {
             Some(item) => {
                 let (outcome, fatal) = execute(&mut sock, &inbox, &shared, &options, &item);
-                // The connection is marked ended before the outcome is
-                // delivered, so whoever receives it sees the ended state.
-                if let Some(cause) = fatal {
-                    mark_ended(&shared, cause);
-                }
+                // The end is recorded, and the waiting requests taken with it,
+                // before the outcome is delivered: whoever receives it sees
+                // the ended state, and nothing it does can change how the
+                // waiting requests end.
+                let waiting = fatal.map(|cause| mark_ended(&shared, cause));
                 deliver(item.done, outcome);
-                fatal
+                if let (Some(cause), Some(waiting)) = (fatal, waiting) {
+                    finish(&mut sock, waiting, cause);
+                    return;
+                }
+                None
             }
             None => match inbox.recv() {
                 Ok(Event::Wake) => None,
@@ -475,25 +479,25 @@ fn serve(
             },
         };
         if let Some(cause) = fatal {
-            end(&mut sock, &shared, cause);
+            let waiting = mark_ended(&shared, cause);
+            finish(&mut sock, waiting, cause);
             return;
         }
     }
 }
 
-/// Records `cause` as the end of the connection, refusing later submissions.
-fn mark_ended(shared: &Shared, cause: RequestCause) {
-    shared.lock().terminal.get_or_insert(cause);
+/// Records `cause` as the end of the connection and takes the waiting
+/// requests in the same step, so that no later cancellation or close changes
+/// how they end.
+fn mark_ended(shared: &Shared, cause: RequestCause) -> VecDeque<Item> {
+    let mut state = shared.lock();
+    state.terminal.get_or_insert(cause);
+    state.waiting_bytes = 0;
+    std::mem::take(&mut state.waiting)
 }
 
-/// Ends the connection with `cause`: waiting requests complete unsent with it.
-fn end(sock: &mut TcpStream, shared: &Shared, cause: RequestCause) {
-    let waiting = {
-        let mut state = shared.lock();
-        state.terminal.get_or_insert(cause);
-        state.waiting_bytes = 0;
-        std::mem::take(&mut state.waiting)
-    };
+/// Closes the socket and completes `waiting` unsent with `cause`.
+fn finish(sock: &mut TcpStream, waiting: VecDeque<Item>, cause: RequestCause) {
     let _ = sock.shutdown(Shutdown::Both);
     for item in waiting {
         deliver(
