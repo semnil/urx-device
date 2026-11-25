@@ -253,4 +253,58 @@ export interface FxParameterRule {
   readonly knownParameters: readonly string[];
 }
 
-export type SettingRule = ChannelSettingRule | ChannelBandSettingRule | SendSettingRule | BusSettingRule | FxParameterRule;
+/** One side of a bus: its parameter ID and the y of each side. */
+export interface BusSideAddress {
+  readonly paramId: number;
+  readonly y: { readonly left: number; readonly right: number };
+  readonly write: boolean;
+}
+
+/** A per-side bus setting: the target names a bus and a side. */
+export interface BusSideSettingRule {
+  readonly target: "bus-side";
+  readonly known: readonly string[];
+  readonly address: { readonly [bus: string]: BusSideAddress | undefined };
+  readonly value: ValueRule;
+}
+
+/**
+ * Flex12GEQ band gain (F07-G): the target names a bus, a side and a band
+ * identifier. A write first reads the bus's EQ Type (representative y), which
+ * must be `type`, then the side's Limit, whose range bounds the request
+ * before rounding to `step`. Raw = dB × scale.
+ */
+export interface GeqGainRule {
+  readonly target: "bus-side-band";
+  readonly known: readonly string[];
+  readonly bands: readonly string[];
+  readonly address: {
+    readonly [bus: string]:
+      | {
+          /** The ID of band 0; `perBand` "x" steps x by the band index, "id" steps the ID. */
+          readonly paramId: number;
+          readonly perBand: "x" | "id";
+          readonly y: { readonly left: number; readonly right: number };
+          /** The bands a write may address; the others are read-only. */
+          readonly writableBands: readonly string[];
+          readonly eqType: { readonly paramId: number; readonly y: number };
+          readonly limit: number;
+        }
+      | undefined;
+  };
+  readonly eqType: { readonly required: string; readonly choices: readonly { readonly token: string; readonly raw: string }[] };
+  readonly limits: readonly { readonly token: string; readonly min: number; readonly max: number }[];
+  readonly unit: "dB";
+  readonly scale: number;
+  readonly step: number;
+  readonly read: { readonly min: number; readonly max: number };
+}
+
+export type SettingRule =
+  | ChannelSettingRule
+  | ChannelBandSettingRule
+  | SendSettingRule
+  | BusSettingRule
+  | FxParameterRule
+  | BusSideSettingRule
+  | GeqGainRule;

@@ -1,0 +1,143 @@
+import { describe, expect, it } from "vitest";
+import { GEQ_BANDS } from "../src/catalog/output-eq.js";
+import { OperationContext } from "../src/operations/context.js";
+import { operationFailureOf } from "../src/operations/failure.js";
+import { dryRunSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { FakeTransport } from "./fake-transport.js";
+
+const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
+const readAny = (c: OperationContext, id: string, target: unknown) => readSetting(c, ...([id, target] as unknown as ReadArgs));
+const writeAny = (c: OperationContext, id: string, target: unknown, value: unknown) =>
+  writeSetting(c, ...([id, target, value] as unknown as WriteArgs));
+async function failureOf(promise: Promise<unknown>) {
+  return operationFailureOf(await promise.then(() => undefined, (error: unknown) => error));
+}
+const at = (paramId: number, y: number, x = 0) => ({ paramId, x: `${x}`, y: `${y}` });
+const BUS = {
+  stereo: { type: 497, on: 498, geqOn: 543, link: 544, limit: 893, rep: 0, left: 0, right: 1 },
+  "mix-1": { type: 590, on: 591, geqOn: 636, link: 637, limit: 894, rep: 0, left: 0, right: 1 },
+  "mix-2": { type: 590, on: 591, geqOn: 636, link: 637, limit: 894, rep: 2, left: 2, right: 3 },
+} as const;
+
+/** A gain write through replies to the type and limit reads; its result and requests. */
+async function gainWrite(bus: keyof typeof BUS, side: "left" | "right", band: string, value: unknown, type: string, limit?: string) {
+  const transport = new FakeTransport().script("getNumeric", read(type), ...(limit === undefined ? [] : [read(limit)])).script("setNumeric", accepted);
+  const outcome = await writeAny(new OperationContext(transport, "URX44"), "bus.geq.gain", { bus, side, band }, value).then(
+    (result) => ({ planned: result.planned }),
+    (error: unknown) => ({ code: operationFailureOf(error)?.code }),
+  );
+  return { outcome, calls: transport.calls.map(({ method, address, value: sent }) => ({ method, address, sent })) };
+}
+
+describe("output EQ switches and Flex12GEQ (F07-G)", () => {
+  it("read type, EQ on and Link at the representative instance; GEQ on and Limit at each side", async () => {
+    for (const [bus, ids] of Object.entries(BUS)) {
+      for (const [id, paramId, raw, value] of [
+        ["bus.eq.type", ids.type, "2", "flex12-geq"],
+        ["bus.eq.on", ids.on, "1", true],
+        ["bus.geq.link", ids.link, "2", "right-to-left"],
+      ] as const) {
+        const transport = new FakeTransport().script("getNumeric", read(raw));
+        expect((await readAny(new OperationContext(transport, "URX44"), id, { bus })).value, `${bus} ${id}`).toBe(value);
+        expect(transport.calls[0]?.address).toEqual(at(paramId, ids.rep));
+      }
+      for (const side of ["left", "right"] as const) {
+        for (const [id, paramId, raw, value, write, wire] of [
+          ["bus.geq.on", ids.geqOn, "0", false, true, "1"],
+          ["bus.geq.limit", ids.limit, "3", "minus-24-to-0", "plus-minus-6", "2"],
+        ] as const) {
+          const transport = new FakeTransport().script("getNumeric", read(raw)).script("setNumeric", accepted);
+          const c = new OperationContext(transport, "URX44");
+          expect((await readAny(c, id, { bus, side })).value, `${bus} ${side} ${id}`).toBe(value);
+          await writeAny(c, id, { bus, side }, write);
+          expect(transport.calls.map(({ address, value: sent }) => ({ address, sent }))).toEqual([
+            { address: at(paramId, ids[side]), sent: undefined },
+            { address: at(paramId, ids[side]), sent: wire },
+          ]);
+        }
+      }
+      const link = new FakeTransport().script("setNumeric", accepted);
+      await writeAny(new OperationContext(link, "URX44"), "bus.geq.link", { bus }, "left-to-right");
+      expect(link.calls.map(({ address, value }) => ({ address, value }))).toEqual([{ address: at(ids.link, ids.rep), value: "1" }]);
+    }
+    // EQ Type and EQ On writes await F03-G evidence: known read-only settings.
+    for (const id of ["bus.eq.type", "bus.eq.on"]) {
+      expect((await failureOf(writeAny(new OperationContext(new FakeTransport(), "URX44"), id, { bus: "stereo" }, id.endsWith("type") ? "peq" : true)))?.code).toBe(
+        "unsupported_operation",
+      );
+    }
+    for (const raw of ["1", "3"]) {
+      const transport = new FakeTransport().script("getNumeric", read(raw));
+      expect((await failureOf(readAny(new OperationContext(transport, "URX44"), "bus.eq.type", { bus: "stereo" })))?.code, raw).toBe("invalid_response");
+    }
+  });
+
+  it("read every band's gain at its address, keeping off-grid values", async () => {
+    for (const [bus, ids] of Object.entries(BUS)) {
+      for (const side of ["left", "right"] as const) {
+        for (const [index, band] of GEQ_BANDS.entries()) {
+          const transport = new FakeTransport().script("getNumeric", read("-1234"));
+          transport.timers = false;
+          expect((await readAny(new OperationContext(transport, "URX44"), "bus.geq.gain", { bus, side, band })).value).toBe(-12.34);
+          const expected = bus === "stereo" ? at(545, ids[side], index) : at(638 + index, ids[side]);
+          expect(transport.calls.map((call) => call.address), `${bus} ${side} ${band}`).toEqual([expected]);
+        }
+      }
+    }
+    for (const raw of ["-2401", "1501"]) {
+      const transport = new FakeTransport().script("getNumeric", read(raw));
+      expect((await failureOf(readAny(new OperationContext(transport, "URX44"), "bus.geq.gain", { bus: "mix-1", side: "left", band: "1000" })))?.code).toBe(
+        "invalid_response",
+      );
+    }
+  });
+
+  it("write a gain after the EQ Type and side Limit reads, within the current range", async () => {
+    expect(await gainWrite("mix-2", "right", "1000", -6.25, "2", "0")).toEqual({
+      outcome: { planned: -6.5 },
+      calls: [
+        { method: "getNumeric", address: at(590, 2), sent: undefined },
+        { method: "getNumeric", address: at(894, 3), sent: undefined },
+        { method: "setNumeric", address: at(638 + 17, 3), sent: "-650" },
+      ],
+    });
+    expect((await gainWrite("mix-1", "left", "20", 0.25, "2", "1")).outcome).toEqual({ planned: 0 });
+    expect((await gainWrite("mix-1", "left", "20", 0.26, "2", "1")).outcome).toEqual({ planned: 0.5 });
+    expect((await gainWrite("stereo", "right", "20", 3, "2", "2")).calls[2]).toEqual({ method: "setNumeric", address: at(545, 1, 0), sent: "300" });
+    // Outside the current Limit: refused after the reads, nothing sent.
+    const narrow = await gainWrite("mix-1", "left", "20", 7, "2", "2");
+    expect(narrow.outcome).toEqual({ code: "invalid_input" });
+    expect(narrow.calls.map((call) => call.method)).toEqual(["getNumeric", "getNumeric"]);
+    expect((await gainWrite("mix-1", "left", "20", 1, "2", "3")).outcome).toEqual({ code: "invalid_input" });
+    // PEQ selected: a failed precondition before the Limit read.
+    const peq = await gainWrite("mix-1", "left", "20", 1, "0");
+    expect(peq.outcome).toEqual({ code: "precondition_failed" });
+    expect(peq.calls.length).toBe(1);
+    for (const type of ["1", "3", "-1"]) {
+      expect((await gainWrite("mix-1", "left", "20", 1, type)).outcome, type).toEqual({ code: "invalid_response" });
+    }
+    expect((await gainWrite("mix-1", "left", "20", 1, "2", "4")).outcome).toEqual({ code: "invalid_response" });
+    // Static: outside −24…15, STEREO bands above 20 Hz, unknown bands and sides.
+    for (const [bus, side, band, value, code] of [
+      ["mix-1", "left", "20", 15.5, "invalid_input"],
+      ["mix-1", "left", "20", -24.5, "invalid_input"],
+      ["stereo", "left", "25", 0, "unsupported_operation"],
+      ["mix-1", "left", "1k", 0, "invalid_input"],
+      ["mix-1", "left", "1000.0", 0, "invalid_input"],
+      ["mix-1", "both", "20", 0, "invalid_input"],
+      ["fx-1", "left", "20", 0, "unsupported_operation"],
+    ] as const) {
+      const result = await gainWrite(bus as keyof typeof BUS, side as "left", band, value, "2", "0");
+      expect(result.outcome, `${bus} ${side} ${band} ${value}`).toEqual({ code });
+      expect(result.calls).toEqual([]);
+    }
+  });
+
+  it("dry-run a gain with the two reads and no write", async () => {
+    const transport = new FakeTransport().script("getNumeric", read("2"), read("0"));
+    const plan = await dryRunSetting(new OperationContext(transport, "URX44"), "bus.geq.gain", { bus: "mix-1", side: "left", band: "20" }, 2.75);
+    expect(plan).toEqual({ requested: 2.75, planned: 2.5 });
+    expect(transport.calls.map((call) => call.method)).toEqual(["getNumeric", "getNumeric"]);
+  });
+});

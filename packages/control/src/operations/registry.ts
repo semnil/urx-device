@@ -87,6 +87,7 @@ import {
 } from "./buses.js";
 import { busInsertFxOn, busInsertFxType, channelInsertFxOn, channelInsertFxType } from "./insert-fx.js";
 import { busFxParameter, busFxType } from "./fx-return.js";
+import { busEqOn, busEqType, busGeqGain, busGeqLimit, busGeqLink, busGeqOn } from "./output-eq.js";
 import {
   compOn,
   eqOn,
@@ -234,6 +235,12 @@ export const settingHandlers: SettingHandlers = {
   "bus.insert-fx.on": busInsertFxOn,
   "bus.fx.type": busFxType,
   "bus.fx.parameter": busFxParameter,
+  "bus.eq.type": busEqType,
+  "bus.eq.on": busEqOn,
+  "bus.geq.link": busGeqLink,
+  "bus.geq.on": busGeqOn,
+  "bus.geq.limit": busGeqLimit,
+  "bus.geq.gain": busGeqGain,
 };
 
 function unknownId(): Promise<never> {

@@ -9,8 +9,10 @@ import type {
   BusSettingRule,
   ChannelBandSettingRule,
   ChannelSettingRule,
+  BusSideSettingRule,
   ContextStopsRule,
   FxParameterRule,
+  GeqGainRule,
   GridRule,
   PortChoiceRule,
   SendSettingRule,
@@ -470,6 +472,104 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
       staticCheck(resolved.field, resolved.effect, requested);
       const result = plannedWith(await prepare(context, resolved), requested);
       return writeRaw(context, leaf(resolved), result.raw as I64Text, { requested, planned: result.planned as V });
+    },
+  };
+}
+
+const SIDES = ["left", "right"] as const;
+
+/** The bus and side a target names, and nothing else (`extra` keys allowed besides). */
+function busSide(model: string, target: unknown, known: readonly string[], extra: readonly string[] = []) {
+  modelOf(model);
+  const own = targetOf<{ bus?: unknown; side?: unknown; band?: unknown }>(target, ["bus", "side", ...extra]);
+  if (typeof own.bus !== "string" || !known.includes(own.bus) || !SIDES.includes(own.side as "left")) {
+    return refuse("invalid_input");
+  }
+  return { bus: own.bus, side: own.side as (typeof SIDES)[number], band: own.band };
+}
+
+/** A per-side bus setting whose handler is built from `rule`: the target names a bus and one side. */
+export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target, write) => {
+    const { bus, side } = busSide(model, target, rule.known);
+    const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
+    if (at === undefined || (write && !at.write)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(at.paramId, at.y[side]), codec };
+  });
+}
+
+/**
+ * Flex12GEQ band gain (F07-G): a read takes the band's address directly; a
+ * write (or dry-run) first reads the bus's EQ Type, which must be the GEQ,
+ * then the side's Limit, whose range bounds the request before rounding.
+ */
+export function geqGainSetting(rule: GeqGainRule) {
+  const resolve = (model: string, target: unknown, write: boolean) => {
+    const { bus, side, band } = busSide(model, target, rule.known, ["band"]);
+    if (typeof band !== "string" || !rule.bands.includes(band)) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
+    if (at === undefined || (write && !at.writableBands.includes(band))) {
+      return refuse("unsupported_operation");
+    }
+    const index = rule.bands.indexOf(band);
+    const leaf: ParameterAddress =
+      at.perBand === "x"
+        ? { paramId: at.paramId, x: `${index}`, y: `${at.y[side]}` }
+        : address(at.paramId + index, at.y[side]);
+    return { at, side, leaf };
+  };
+  const union = { min: Math.min(...rule.limits.map((limit) => limit.min)), max: Math.max(...rule.limits.map((limit) => limit.max)) };
+  const staticCheck = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) && value >= union.min && value <= union.max ? value : refuse("invalid_input");
+  /** The EQ Type and Limit reads; the side's current range. */
+  const prepare = async (context: OperationContext, resolved: ReturnType<typeof resolve>) => {
+    const type = await readRawValue(context, address(resolved.at.eqType.paramId, resolved.at.eqType.y));
+    const token = rule.eqType.choices.find((choice) => choice.raw === type.raw)?.token;
+    if (token === undefined) {
+      return failed("invalid_response");
+    }
+    if (token !== rule.eqType.required) {
+      return failed("precondition_failed");
+    }
+    const limit = await readRawValue(context, address(resolved.at.limit, resolved.at.y[resolved.side]));
+    const index = decodeInteger(limit.raw, 0, rule.limits.length - 1);
+    return index === undefined ? failed("invalid_response") : (rule.limits[index] as { min: number; max: number });
+  };
+  const planWithin = (range: { min: number; max: number }, value: number) => {
+    const planned = planOnGrid(value, range.min, range.max, 1 / rule.step);
+    return planned === undefined ? refuse("invalid_input") : { planned, raw: `${Math.round(planned * rule.scale)}` as I64Text };
+  };
+  return {
+    read(context: OperationContext, target: unknown): Promise<Reading<number>> {
+      const { leaf } = resolve(context.model, target, false);
+      return readDecoded(context, leaf, (raw) => {
+        const value = decodeInteger(raw, rule.read.min, rule.read.max);
+        return value === undefined ? undefined : value / rule.scale;
+      });
+    },
+    /** No static plan: the range depends on the live Limit (`dryRun` reads it). */
+    plan(model: string, target: unknown, requested: number): WritePlan<number> {
+      resolve(model, target, true);
+      staticCheck(requested);
+      return refuse("invalid_input");
+    },
+    async dryRun(context: OperationContext, target: unknown, requested: number): Promise<WritePlan<number>> {
+      const resolved = resolve(context.model, target, true);
+      const value = staticCheck(requested);
+      const { planned } = planWithin(await prepare(context, resolved), value);
+      return { requested, planned };
+    },
+    async write(context: OperationContext, target: unknown, requested: number): Promise<WriteResult<number>> {
+      const resolved = resolve(context.model, target, true);
+      // Static checks before any read.
+      const value = staticCheck(requested);
+      const { planned, raw } = planWithin(await prepare(context, resolved), value);
+      return writeRaw(context, resolved.leaf, raw, { requested, planned });
     },
   };
 }

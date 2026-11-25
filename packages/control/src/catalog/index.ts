@@ -29,6 +29,7 @@ export { SEND_RULES } from "./sends.js";
 export { BUS_RULES, BUS_TOKENS, CHANNEL_STEREO_ASSIGN_RULE } from "./buses.js";
 export { INSERT_FX_EFFECTS, INSERT_FX_RULES } from "./insert-fx.js";
 export { FX_RETURN_EFFECTS, FX_RETURN_RULES } from "./fx-return.js";
+export { GEQ_BANDS, OUTPUT_EQ_RULES } from "./output-eq.js";
 export {
   FX2_FREQUENCY_DECIHZ,
   INITIAL_DELAY_DECIMS,
@@ -51,6 +52,9 @@ export type {
   ContextStopsRule,
   FxEffectRule,
   FxParameterRule,
+  BusSideAddress,
+  BusSideSettingRule,
+  GeqGainRule,
   SendSettingRule,
   Sentinel,
   SettingRule,
@@ -102,6 +106,11 @@ export type {
   FxParameterTarget,
   FxParameterValue,
   FxReturnType,
+  BusSideBandTarget,
+  BusSideTarget,
+  GeqLimit,
+  GeqLink,
+  OutputEqType,
   SendTarget,
   EqBand,
   EqBandType,
