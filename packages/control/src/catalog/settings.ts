@@ -3,9 +3,11 @@
 // Rows are added per K35 catalog part (stages D7–D15).
 
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
+import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import type { SourceToken } from "./inputs.js";
 import type { PROCESSING_MODES } from "./processing.js";
+import type { SettingRule } from "./rules.js";
 
 /** What every setting definition states, independent of its value types. */
 export interface SettingDefinitionBase {
@@ -13,6 +15,8 @@ export interface SettingDefinitionBase {
   readonly readable: true;
   /** Whether the setting can be written. */
   readonly writable: boolean;
+  /** The target, address and value rule, for the settings that carry one (K35 metadata). */
+  readonly rule?: SettingRule;
 }
 
 /**
@@ -46,20 +50,20 @@ export const settingDefinitions = {
   "channel.ssmcs.on": { readable: true, writable: true },
   "channel.ssmcs.comp.on": { readable: true, writable: true },
   "channel.ssmcs.eq.on": { readable: true, writable: true },
-  "channel.gate.threshold": { readable: true, writable: true },
-  "channel.gate.range": { readable: true, writable: true },
-  "channel.gate.attack": { readable: true, writable: true },
-  "channel.gate.hold": { readable: true, writable: true },
-  "channel.gate.decay": { readable: true, writable: true },
-  "channel.comp.threshold": { readable: true, writable: true },
-  "channel.comp.ratio": { readable: true, writable: true },
-  "channel.comp.knee": { readable: true, writable: true },
-  "channel.comp.gain": { readable: true, writable: true },
-  "channel.comp.attack": { readable: true, writable: true },
-  "channel.comp.release": { readable: true, writable: true },
-  "channel.comp.auto-makeup": { readable: true, writable: true },
-  "channel.comp.one-knob.on": { readable: true, writable: true },
-  "channel.comp.one-knob.level": { readable: true, writable: true },
+  "channel.gate.threshold": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.threshold"] },
+  "channel.gate.range": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.range"] },
+  "channel.gate.attack": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.attack"] },
+  "channel.gate.hold": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.hold"] },
+  "channel.gate.decay": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.decay"] },
+  "channel.comp.threshold": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.threshold"] },
+  "channel.comp.ratio": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.ratio"] },
+  "channel.comp.knee": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.knee"] },
+  "channel.comp.gain": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.gain"] },
+  "channel.comp.attack": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.attack"] },
+  "channel.comp.release": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.release"] },
+  "channel.comp.auto-makeup": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.auto-makeup"] },
+  "channel.comp.one-knob.on": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.on"] },
+  "channel.comp.one-knob.level": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.level"] },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */

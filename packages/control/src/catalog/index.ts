@@ -24,6 +24,18 @@ export {
 export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
+export { DYNAMICS_RULES } from "./dynamics.js";
+export type {
+  ChannelSettingRule,
+  ChoiceRule,
+  GridRule,
+  Sentinel,
+  SettingRule,
+  StopsRule,
+  SwitchRule,
+  ValueRule,
+  ValueUnit,
+} from "./rules.js";
 export { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "./dynamics-stops.js";
 export {
   HPF_FREQUENCY_ID,
@@ -55,7 +67,7 @@ export type {
   SourceTarget,
   WritableSettingId,
 } from "./settings.js";
-export { decodeCentiDb, decodeSwitch, encodeCentiDb, encodeSwitch, planWholeDb } from "./codecs.js";
+export { decodeCentiDb, decodeSwitch, encodeCentiDb, encodeSwitch, nearestStopIndex, planWholeDb } from "./codecs.js";
 export {
   HI_Z_JACKS,
   INPUT_GAIN_DB,
