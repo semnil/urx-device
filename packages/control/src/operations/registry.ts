@@ -34,7 +34,9 @@ import {
   ssmcsEqOn,
   ssmcsOn,
 } from "./basic.js";
+import { urxfValue, type UrxfChunk } from "../catalog/urxf.js";
 import type { OperationContext } from "./context.js";
+import type { ParameterAddress } from "./transport.js";
 import { OperationFailureError } from "./failure.js";
 import {
   compAttack,
@@ -169,6 +171,8 @@ export interface ReadHandler<K extends SettingId> {
   read(context: OperationContext, target: Target<K>): Promise<Reading<Value<K>>>;
   /** The target's validation without traffic, throwing its refusal (used to refuse a write of a read-only setting). */
   check?(model: string, target: Target<K>): void;
+  /** The read address and decoder without traffic, for a stored value; absent for a setting a file value cannot stand for. */
+  locate?(model: string, target: Target<K>): { at: ParameterAddress; text: boolean; decode: (raw: string) => Value<K> | undefined };
 }
 
 export interface WriteHandler<K extends SettingId> extends ReadHandler<K> {
@@ -479,5 +483,29 @@ export function dryRunSettingAfter<A extends WriteArgs>(
     }
     return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>, affected);
   });
+}
+
+/**
+ * The value `id` has in a settings file's chunk for `target` on `model`,
+ * decoded with the same codec as a device read (F18): the stored value at
+ * the setting's address (an x axis flattened onto the ID). A missing value,
+ * a stored type unlike the setting's, or a value the codec refuses is
+ * `invalid_input`: nothing is defaulted or taken from elsewhere.
+ */
+export function decodeFileSetting<A extends ReadArgs>(chunk: UrxfChunk, model: string, ...[id, target]: A): Value<A[0]> {
+  if (!Object.hasOwn(settingDefinitions, id)) {
+    throw new OperationFailureError({ code: "invalid_input", phase: "preparation", progress: null });
+  }
+  const handler = settingHandlers[id] as unknown as ReadHandler<A[0]>;
+  if (handler.locate === undefined) {
+    throw new OperationFailureError({ code: "unsupported_operation", phase: "preparation", progress: null });
+  }
+  const { at, text, decode } = handler.locate(model, target as Target<A[0]>);
+  const stored = urxfValue(chunk, at.paramId, Number(at.x), Number(at.y));
+  const value = typeof stored === (text ? "string" : "number") ? decode(`${stored as string | number}`) : undefined;
+  if (value === undefined) {
+    throw new OperationFailureError({ code: "invalid_input", phase: "preparation", progress: null });
+  }
+  return value;
 }
 

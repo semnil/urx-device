@@ -310,6 +310,17 @@ function handler<V, I = V>(resolve: (model: string, target: unknown, write: bool
     check(model: string, target: unknown): void {
       resolve(model, target, false);
     },
+    /**
+     * The read address and decoder without traffic, for a stored value (a
+     * settings file): a name decodes from its text, others from the raw.
+     */
+    locate(model: string, target: unknown): { at: ParameterAddress; text: boolean; decode: (raw: string) => V | undefined } {
+      const { at, codec } = resolve(model, target, false);
+      if (codec.name === true) {
+        return { at, text: true, decode: (text) => ({ kind: "text", text }) as V };
+      }
+      return { at, text: codec.text, decode: (raw) => codec.decode(raw) as V | undefined };
+    },
     read(context: OperationContext, target: unknown): Promise<Reading<V>> {
       const { at, codec } = resolve(context.model, target, false);
       if (codec.name === true) {
