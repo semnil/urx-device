@@ -595,3 +595,67 @@ fn only_the_list_reply_decides_the_list() {
     });
     assert_eq!(run(&options(center.port)).unwrap().len(), 1);
 }
+
+/// A unit that answers `/vd/synchronize` online and `/vd/device` from cache,
+/// with `pushes` written after the synchronize reply, before the device reply.
+fn unplugged_while_checked(id: &'static str, pushes: Vec<Value>) -> Peer {
+    Peer::serve(move |request| match uri_of(request) {
+        "/vd/synchronize" => {
+            let mut out = vec![get_reply("/vd/synchronize", online(id))];
+            out.extend(pushes.iter().cloned().map(line));
+            out
+        }
+        "/vd/device" => vec![get_reply(
+            "/vd/device",
+            firm_list(json!([{ "firm_name": "System", "firm_version": "9.9.9" }])),
+        )],
+        _ => vec![],
+    })
+}
+
+fn sync_push(status: &str) -> Value {
+    json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": status } } })
+}
+
+#[test]
+fn a_unit_lost_after_reporting_online_fails_a_metadata_discovery() {
+    for pushes in [
+        vec![sync_push("offline")],
+        vec![sync_push("lost")],
+        vec![sync_push("offline"), sync_push("lost")],
+        vec![sync_push("lost"), sync_push("online")],
+    ] {
+        let a = unplugged_while_checked("<device-id-a>", pushes.clone());
+        let center = center(&[(a.port, "URX44V")]);
+        assert_eq!(
+            run(&metadata(options(center.port))),
+            fails_with(Cause::ConnectionLost),
+            "{pushes:?}"
+        );
+    }
+    let a = unit(online("<device-id-a>"), firm_list(json!([])));
+    let b = unplugged_while_checked("<device-id-b>", vec![sync_push("lost")]);
+    let center = center(&[(a.port, "URX44V"), (b.port, "URX22")]);
+    assert_eq!(
+        run(&metadata(options(center.port))),
+        fails_with(Cause::ConnectionLost),
+        "no partial list"
+    );
+}
+
+#[test]
+fn an_online_push_or_a_push_before_the_status_reply_does_not_fail_the_check() {
+    let online_push = unplugged_while_checked("<device-id-a>", vec![sync_push("online")]);
+    let before = Peer::serve(|request| match uri_of(request) {
+        "/vd/synchronize" => vec![
+            line(sync_push("lost")),
+            get_reply("/vd/synchronize", online("<device-id-a>")),
+        ],
+        "/vd/device" => vec![get_reply("/vd/device", firm_list(json!([])))],
+        _ => vec![],
+    });
+    for peer in [&online_push, &before] {
+        let center = center(&[(peer.port, "URX44V")]);
+        assert_eq!(run(&metadata(options(center.port))).unwrap().len(), 1);
+    }
+}

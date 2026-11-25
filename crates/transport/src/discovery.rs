@@ -127,7 +127,10 @@ fn parse_list(data: &Value) -> Result<Vec<(u16, String)>, Failure> {
 }
 
 /// The listed unit at `port` if it is online, or `None` when it reports any
-/// other link state.
+/// other link state. Once the unit has reported `online`, a
+/// device-lost push received before its firmware reply fails the check: the
+/// unit was unplugged while it was being checked, and Device Center keeps
+/// answering `/vd/device` from its cache.
 fn check(
     port: u16,
     model: String,
@@ -136,7 +139,7 @@ fn check(
     control: &Control,
 ) -> Result<Option<DeviceEntry>, Failure> {
     let mut link = Link::connect(port, budget, PHASE, control)?;
-    let synchronize = get(&mut link, Request::GetSynchronize, options, budget)?;
+    let synchronize = get(&mut link, Request::GetSynchronize, false, options, budget)?;
     let status = synchronize
         .get("sync_status")
         .and_then(Value::as_str)
@@ -151,7 +154,7 @@ fn check(
         .ok_or(Failure::cause(Cause::IdentityError, PHASE))?
         .to_string();
     let firmware = if options.metadata {
-        let device = get(&mut link, Request::GetDevice, options, budget)?;
+        let device = get(&mut link, Request::GetDevice, true, options, budget)?;
         Some(system_firmware(&device).ok_or_else(malformed)?)
     } else {
         None
@@ -164,21 +167,25 @@ fn check(
     }))
 }
 
-/// Sends a GET and returns its reply's `data`.
+/// Sends a GET and returns its reply's `data`. With `watch_lost`, a
+/// device-lost push received while waiting fails it as `connection_lost`.
 fn get(
     link: &mut Link<'_>,
     request: Request,
+    watch_lost: bool,
     options: &DiscoveryOptions,
     budget: &Budget,
 ) -> Result<Value, Failure> {
     link.send(&request.message(), options.request_deadline, budget)?;
     let key = request.reply_key();
-    let data = link.await_frame(options.request_deadline, budget, |message| {
-        Inbound::new(message.clone())
-            .reply(&key)
-            .map(|reply| Ok(reply.data().cloned()))
-    })?;
-    data.ok_or_else(malformed)
+    link.await_frame(options.request_deadline, budget, |message| {
+        let inbound = Inbound::new(message.clone());
+        if watch_lost && inbound.device_lost().is_some() {
+            return Some(Err(Failure::cause(Cause::ConnectionLost, PHASE)));
+        }
+        let reply = inbound.reply(&key)?;
+        Some(reply.data().cloned().ok_or_else(malformed))
+    })
 }
 
 /// The System entry of `/vd/device`'s `firm_list`, matched by name without
