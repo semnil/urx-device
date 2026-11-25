@@ -17,10 +17,10 @@ import {
 } from "./native.js";
 import type { ParameterAddress, Transport, TransportOperation } from "./transport.js";
 
-/** A validated record and its PC receipt time. */
+/** A validated record and its PC receipt time, absent if the clock failed. */
 export interface Received<T> {
   readonly record: T;
-  readonly observedAt: string;
+  readonly observedAt: string | undefined;
 }
 
 /** Runs `call`, turning a throw or a rejection into false. */
@@ -66,6 +66,14 @@ export class OperationContext {
   /** The current observation time, UTC ISO 8601. */
   now(): string {
     return this.#clock().toISOString();
+  }
+
+  #receiptTime(): string | undefined {
+    try {
+      return this.now();
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -148,8 +156,9 @@ export class OperationContext {
       // A rejected native promise is not evidence of anything (K33).
       throw await undelivered();
     }
-    // The PC receipt time (O5), before any wait for the adoption.
-    const observedAt = this.now();
+    // The PC receipt time (O5), before any wait for the adoption. A failing
+    // clock leaves it absent; it changes nothing about the record or slot.
+    const observedAt = this.#receiptTime();
     const record = validate(raw);
     if (record === undefined) {
       // Its claimed evidence is not adopted (K34).

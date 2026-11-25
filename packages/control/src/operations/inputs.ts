@@ -62,6 +62,10 @@ async function readRaw(context: OperationContext, at: ParameterAddress): Promise
   if (record.kind === "failure") {
     throw context.failureOf(record, null);
   }
+  if (observedAt === undefined) {
+    // The slot is already handled; a value without its time is not delivered.
+    throw new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
+  }
   return { raw: record.value, observedAt };
 }
 

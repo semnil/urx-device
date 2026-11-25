@@ -262,4 +262,31 @@ describe("review round 1 fixes", () => {
     const c = new OperationContext(transport, "URX44", () => new Date(now));
     expect((await readSetting(c, "input.gain", { input: 1 })).observedAt).toBe("2026-11-20T00:00:00.000Z");
   });
+
+  it("does not let a failing clock change a write result, a read's slot or later requests", async () => {
+    for (const clock of [() => new Date(Number.NaN), (): Date => { throw new Error("clock"); }]) {
+      const rejected = {
+        kind: "failure",
+        failure: { kind: "cause", code: "device_rejected", phase: "response" },
+        evidence: { state: "rejected", responseCode: "409" },
+      };
+      const transport = new FakeTransport()
+        .script("setNumeric", accepted, rejected)
+        .script("getNumeric", read("100"), read("200"));
+      const c = new OperationContext(transport, "URX44", clock);
+      expect((await writeSetting(c, "input.gain", { input: 1 }, 1)).outcome).toBe("accepted");
+      expect((await failureOf(writeSetting(c, "input.gain", { input: 1 }, 1)))?.progress).toMatchObject({
+        outcome: "rejected",
+        responseCode: "409",
+      });
+      expect(await failureOf(readSetting(c, "input.gain", { input: 1 }))).toEqual({
+        code: "internal_error",
+        phase: "delivery",
+        progress: null,
+      });
+      expect(transport.adopted).toEqual(["t0", "t1", "t2"]);
+      expect((await failureOf(readSetting(c, "input.gain", { input: 1 })))?.code).toBe("internal_error");
+      expect(transport.calls).toHaveLength(4);
+    }
+  });
 });
