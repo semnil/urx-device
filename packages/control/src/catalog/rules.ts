@@ -28,7 +28,8 @@ export interface ChoiceRule {
 /**
  * Numbers on a uniform grid of 1 / `scale` within [min, max]: a write is
  * range-checked first, then rounded to the grid with lower ties, raw =
- * value × scale. A read takes any integer raw in [min × scale, max × scale].
+ * value × scale + offset (offset 0 when absent). A read takes any integer
+ * raw from min × scale + offset to max × scale + offset.
  */
 export interface GridRule {
   readonly kind: "grid";
@@ -36,25 +37,42 @@ export interface GridRule {
   readonly min: number;
   readonly max: number;
   readonly scale: number;
+  readonly offset?: number;
   readonly sentinel?: Sentinel;
 }
 
 /**
- * Numbers on a nonuniform stop table, `stops` in raw units (value × scale),
+ * Numbers on a nonuniform stop table, `stops` in units of 1 / `scale`,
  * increasing: a write is range-checked against the first and last stop, then
- * goes to the nearest stop with lower ties, raw = the stop. A read takes any
- * integer raw in `read` (default: first … last stop) without snapping.
+ * goes to the nearest stop with lower ties. With `ordinal` absent, raw = the
+ * stop, and a read takes any integer raw in `read` (default: first … last
+ * stop) without snapping. With `ordinal`, raw = the stop's index + ordinal,
+ * and a read takes exactly those raw values.
  */
 export interface StopsRule {
   readonly kind: "stops";
   readonly unit: ValueUnit;
   readonly stops: readonly number[];
   readonly scale: number;
+  readonly ordinal?: number;
   readonly read?: { readonly min: number; readonly max: number };
   readonly sentinel?: Sentinel;
 }
 
-export type ValueRule = SwitchRule | ChoiceRule | GridRule | StopsRule;
+/**
+ * An integer from `min` to `max` on a string parameter as exactly `digits`
+ * ASCII digits, zero-padded; `labels[n − min]` names n for help only.
+ */
+export interface TextIndexRule {
+  readonly kind: "text-index";
+  readonly unit: null;
+  readonly min: number;
+  readonly max: number;
+  readonly digits: number;
+  readonly labels: readonly string[];
+}
+
+export type ValueRule = SwitchRule | ChoiceRule | GridRule | StopsRule | TextIndexRule;
 
 /** A whole-channel setting: its parameter ID per channel kind and its value rule. */
 export interface ChannelSettingRule {

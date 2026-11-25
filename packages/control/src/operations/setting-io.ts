@@ -4,9 +4,9 @@
 
 import type { I64Text } from "../catalog/i64.js";
 import { isModel, type Model } from "../catalog/models.js";
-import type { OperationContext } from "./context.js";
+import type { OperationContext, Received } from "./context.js";
 import { OperationFailureError, type OperationCause } from "./failure.js";
-import type { NativeFailure, NativePostResult, PostEvidence } from "./native.js";
+import type { NativeFailure, NativePostResult, NativeReadResult, PostEvidence } from "./native.js";
 import type { Reading, WriteOutcome, WritePlan, WriteProgress, WriteResult } from "./results.js";
 import type { ParameterAddress } from "./transport.js";
 
@@ -46,9 +46,12 @@ export function address(paramId: number, y: number): ParameterAddress {
   return { paramId, x: "0", y: `${y}` };
 }
 
-/** The raw value of a numeric read and its receipt time, or the failure it reports. */
-async function readRaw(context: OperationContext, at: ParameterAddress): Promise<{ raw: I64Text; observedAt: string }> {
-  const { record, observedAt } = await context.getNumeric(at);
+/** The value of a read and its receipt time, or the failure it reports. */
+async function readValue<T>(
+  context: OperationContext,
+  received: Promise<Received<NativeReadResult<T>>>,
+): Promise<{ raw: T; observedAt: string }> {
+  const { record, observedAt } = await received;
   if (record.kind === "failure") {
     throw context.failureOf(record, null);
   }
@@ -59,18 +62,31 @@ async function readRaw(context: OperationContext, at: ParameterAddress): Promise
   return { raw: record.value, observedAt };
 }
 
-export async function readDecoded<V>(
-  context: OperationContext,
-  at: ParameterAddress,
-  decode: (raw: I64Text) => V | undefined,
-): Promise<Reading<V>> {
-  const { raw, observedAt } = await readRaw(context, at);
-  const value = decode(raw);
+function decoded<V>(value: V | undefined, observedAt: string): Reading<V> {
   if (value === undefined) {
     // A raw value outside the definition is malformed, not a default.
     throw new OperationFailureError({ code: "invalid_response", phase: "response", progress: null });
   }
   return { value, observedAt };
+}
+
+export async function readDecoded<V>(
+  context: OperationContext,
+  at: ParameterAddress,
+  decode: (raw: I64Text) => V | undefined,
+): Promise<Reading<V>> {
+  const { raw, observedAt } = await readValue(context, context.getNumeric(at));
+  return decoded(decode(raw), observedAt);
+}
+
+/** The single text read of `at` (a string parameter), decoded like `readDecoded`. */
+export async function readTextDecoded<V>(
+  context: OperationContext,
+  at: ParameterAddress,
+  decode: (text: string) => V | undefined,
+): Promise<Reading<V>> {
+  const { raw, observedAt } = await readValue(context, context.getText(at));
+  return decoded(decode(raw), observedAt);
 }
 
 function outcomeOf(evidence: PostEvidence): WriteOutcome {

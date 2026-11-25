@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
 import { DYNAMICS_RULES } from "../src/catalog/dynamics.js";
 import { EQ_RULES } from "../src/catalog/eq.js";
+import { SSMCS_RULES } from "../src/catalog/ssmcs.js";
 import type { SettingRule, ValueRule } from "../src/catalog/rules.js";
 import { settingDefinitions, type SettingDefinitionBase } from "../src/catalog/settings.js";
 import { OperationContext } from "../src/operations/context.js";
@@ -17,7 +18,7 @@ const ruled = Object.entries(settingDefinitions as Record<string, SettingDefinit
   definition.rule === undefined ? [] : [[id, definition.rule] as [string, SettingRule]],
 );
 
-const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES };
+const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES };
 
 /** Each (id, target, value rule) a rule defines: one per band for a band rule. */
 const valueCases = ruled.flatMap(([id, rule]): [string, object, ValueRule][] => {
@@ -27,7 +28,8 @@ const valueCases = ruled.flatMap(([id, rule]): [string, object, ValueRule][] => 
   const value = rule.value;
   return rule.bands.flatMap((band): [string, object, ValueRule][] => {
     const each = value.kind === "by-band" ? value.rules[band] : value;
-    return each === undefined ? [] : [[`${id} ${band}`, { channel: 1, band }, each]];
+    // A band without an address lacks the setting (checked with the addresses).
+    return each === undefined || rule.address[band] === undefined ? [] : [[`${id} ${band}`, { channel: 1, band }, each]];
   });
 });
 
@@ -36,14 +38,14 @@ const idOf = (label: string) => label.split(" ")[0] as string;
 const plan = (label: string, target: object, value: unknown) =>
   previewSetting("URX44", ...([idOf(label), target, value] as unknown as WriteArgs)).planned;
 
-async function wire(label: string, target: object, value: unknown): Promise<string | undefined> {
-  const transport = new FakeTransport().script("setNumeric", accepted);
+async function wire(label: string, target: object, value: unknown, text = false): Promise<string | undefined> {
+  const transport = new FakeTransport().script(text ? "setText" : "setNumeric", accepted);
   await writeSetting(new OperationContext(transport, "URX44"), ...([idOf(label), target, value] as unknown as WriteArgs));
   return transport.calls[0]?.value;
 }
 
-async function observed(label: string, target: object, raw: string): Promise<unknown> {
-  const transport = new FakeTransport().script("getNumeric", read(raw));
+async function observed(label: string, target: object, raw: string, text = false): Promise<unknown> {
+  const transport = new FakeTransport().script(text ? "getText" : "getNumeric", read(raw));
   const result = await readSetting(new OperationContext(transport, "URX44"), ...([idOf(label), target] as unknown as ReadArgs)).then(
     (reading) => ({ value: reading.value }),
     (error: unknown) => ({ code: operationFailureOf(error)?.code }),
@@ -111,26 +113,54 @@ describe("setting rules (K35 definition metadata)", () => {
           break;
         case "grid": {
           const step = 1 / rule.scale;
-          expect([plan(id, target, rule.min), plan(id, target, rule.max), plan(id, target, rule.min + step / 2)], id).toEqual([rule.min, rule.max, rule.min]);
+          const raw = (value: number) => `${Math.round(value * rule.scale) + (rule.offset ?? 0)}`;
+          expect([plan(id, target, rule.min), plan(id, target, rule.max), plan(id, target, rule.min + step / 2)], id).toEqual([
+            rule.min,
+            rule.max,
+            rule.min,
+          ]);
           expect(() => plan(id, target, rule.min - step), id).toThrow();
           expect(() => plan(id, target, rule.max + step), id).toThrow();
-          expect(await wire(id, target, rule.max), id).toBe(`${Math.round(rule.max * rule.scale)}`);
-          expect(await observed(id, target, `${Math.round(rule.min * rule.scale)}`), id).toEqual({ value: rule.min });
-          expect(await observed(id, target, `${Math.round(rule.max * rule.scale) + 1}`), id).toEqual({ code: "invalid_response" });
+          expect([await wire(id, target, rule.min), await wire(id, target, rule.max)], id).toEqual([raw(rule.min), raw(rule.max)]);
+          expect(await observed(id, target, raw(rule.min)), id).toEqual({ value: rule.min });
+          expect(await observed(id, target, raw(rule.max)), id).toEqual({ value: rule.max });
+          expect(await observed(id, target, `${Number(raw(rule.min)) - 1}`), id).toEqual({ code: "invalid_response" });
+          expect(await observed(id, target, `${Number(raw(rule.max)) + 1}`), id).toEqual({ code: "invalid_response" });
           break;
         }
         case "stops": {
+          const lastIndex = rule.stops.length - 1;
           const first = (rule.stops[0] as number) / rule.scale;
-          const last = (rule.stops[rule.stops.length - 1] as number) / rule.scale;
+          const last = (rule.stops[lastIndex] as number) / rule.scale;
           expect([plan(id, target, first), plan(id, target, last)], id).toEqual([first, last]);
           expect(() => plan(id, target, first - 1 / rule.scale), id).toThrow();
           expect(() => plan(id, target, last + 1 / rule.scale), id).toThrow();
-          expect(await wire(id, target, last), id).toBe(`${rule.stops[rule.stops.length - 1]}`);
-          const readMax = rule.read?.max ?? (rule.stops[rule.stops.length - 1] as number);
-          expect(await observed(id, target, `${readMax}`), id).toEqual({ value: readMax / rule.scale });
-          expect(await observed(id, target, `${readMax + (rule.sentinel?.raw === `${readMax + 1}` ? 2 : 1)}`), id).toEqual({
-            code: "invalid_response",
-          });
+          // The raw read range: the indices with an ordinal, else the stop values or `read`.
+          const low = rule.ordinal ?? rule.read?.min ?? (rule.stops[0] as number);
+          const high = rule.ordinal === undefined ? (rule.read?.max ?? (rule.stops[lastIndex] as number)) : rule.ordinal + lastIndex;
+          const valueOf = (raw: number) => (rule.ordinal === undefined ? raw / rule.scale : (rule.stops[raw - rule.ordinal] as number) / rule.scale);
+          expect(await wire(id, target, last), id).toBe(`${rule.ordinal === undefined ? rule.stops[lastIndex] : high}`);
+          expect([await observed(id, target, `${low}`), await observed(id, target, `${high}`)], id).toEqual([
+            { value: valueOf(low) },
+            { value: valueOf(high) },
+          ]);
+          const beyond = rule.sentinel?.raw === `${high + 1}` ? high + 2 : high + 1;
+          expect(await observed(id, target, `${beyond}`), id).toEqual({ code: "invalid_response" });
+          expect(await observed(id, target, `${low - 1}`), id).toEqual({ code: "invalid_response" });
+          break;
+        }
+        case "text-index": {
+          const text = (value: number) => `${value}`.padStart(rule.digits, "0");
+          expect([plan(id, target, rule.min), plan(id, target, rule.max)], id).toEqual([rule.min, rule.max]);
+          for (const bad of [rule.min - 1, rule.max + 1, rule.min + 0.5, text(rule.min)]) {
+            expect(() => plan(id, target, bad), `${id} ${bad}`).toThrow();
+          }
+          expect(await wire(id, target, rule.max, true), id).toBe(text(rule.max));
+          expect(await observed(id, target, text(rule.min), true), id).toEqual({ value: rule.min });
+          for (const bad of [text(rule.max + 1), text(rule.min - 1), `${rule.min}`, ` ${text(rule.min)}`]) {
+            expect(await observed(id, target, bad, true), `${id} ${JSON.stringify(bad)}`).toEqual({ code: "invalid_response" });
+          }
+          expect(rule.labels.length, id).toBe(rule.max - rule.min + 1);
           break;
         }
       }
