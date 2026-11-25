@@ -10,6 +10,7 @@ import type {
   ChannelSettingRule,
   GridRule,
   PortChoiceRule,
+  SendSettingRule,
   StopsRule,
   TextIndexRule,
   ValueRule,
@@ -163,10 +164,10 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
   }
 }
 
-/** A handler for the address and codec `resolve` gives a target. */
-function handler<V>(resolve: (model: string, target: unknown) => { at: ParameterAddress; codec: Codec }) {
+/** A handler for the address and codec `resolve` gives a target, for a read or a write. */
+function handler<V>(resolve: (model: string, target: unknown, write: boolean) => { at: ParameterAddress; codec: Codec }) {
   const planned = (model: string, target: unknown, requested: V) => {
-    const { at, codec } = resolve(model, target);
+    const { at, codec } = resolve(model, target, true);
     const result = codec.plan(requested);
     if (result === "unsupported") {
       return refuse("unsupported_operation");
@@ -176,8 +177,12 @@ function handler<V>(resolve: (model: string, target: unknown) => { at: Parameter
       : { at, codec, raw: result.raw as I64Text, requested, planned: result.planned as V };
   };
   return {
+    /** The target's read resolution without traffic: its refusal, if any. */
+    check(model: string, target: unknown): void {
+      resolve(model, target, false);
+    },
     read(context: OperationContext, target: unknown): Promise<Reading<V>> {
-      const { at, codec } = resolve(context.model, target);
+      const { at, codec } = resolve(context.model, target, false);
       const decode = (raw: string) => codec.decode(raw) as V | undefined;
       return codec.text ? readTextDecoded(context, at, decode) : readDecoded(context, at, decode);
     },
@@ -242,3 +247,51 @@ export function bandRuleSetting<V>(rule: ChannelBandSettingRule) {
     return { at: channelAddress(model, own, ids), codec: codec as Codec };
   });
 }
+
+const SEND_SOURCE = /^(channel|fx)-([1-9][0-9]*)$/;
+const SEND_DESTINATION = /^(mix|fx)-([12])$/;
+
+/**
+ * A send setting whose handler is built from `rule`: the target names one
+ * send by its source and destination token, and takes nothing else. A known
+ * pair or channel the model or field lacks is unsupported; so is a write
+ * where the route's write is not selected.
+ */
+export function sendRuleSetting<V>(rule: SendSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target, write) => {
+    const own = targetOf<{ source?: unknown; destination?: unknown }>(target, ["source", "destination"]);
+    const known = modelOf(model);
+    if (
+      typeof own.source !== "string" ||
+      typeof own.destination !== "string" ||
+      !rule.knownSources.includes(own.source) ||
+      !rule.knownDestinations.includes(own.destination)
+    ) {
+      return refuse("invalid_input");
+    }
+    const source = SEND_SOURCE.exec(own.source);
+    const destination = SEND_DESTINATION.exec(own.destination);
+    if (source === null || destination === null) {
+      // A known bus token that is not a send source or destination.
+      return refuse("unsupported_operation");
+    }
+    let from: "mono" | "stereo" | "fx";
+    let y: number;
+    if (source[1] === "channel") {
+      const channel = channelIndex(known, Number(source[2])) ?? refuse("unsupported_operation");
+      from = channel.kind;
+      y = channel.index;
+    } else {
+      from = "fx";
+      y = Number(source[2]) - 1;
+    }
+    const to = destination[1] as "mix" | "fx";
+    const route = rule.routes.find((each) => each.from === from && each.to === to) ?? refuse("unsupported_operation");
+    if (write && !route.write) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(route.base + route.stride * (Number(destination[2]) - 1), y), codec };
+  });
+}
+

@@ -5,6 +5,7 @@
 import { frozen } from "./frozen.js";
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
 import { DUCKER_RULES } from "./ducker.js";
+import { SEND_RULES } from "./sends.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -98,6 +99,10 @@ export const settingDefinitions = frozen({
   "channel.ducker.range": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.range"] },
   "channel.ducker.attack": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.attack"] },
   "channel.ducker.decay": { readable: true, writable: true, rule: DUCKER_RULES["channel.ducker.decay"] },
+  "send.on": { readable: true, writable: true, rule: SEND_RULES["send.on"] },
+  "send.level": { readable: true, writable: true, rule: SEND_RULES["send.level"] },
+  "send.pan": { readable: true, writable: false, rule: SEND_RULES["send.pan"] },
+  "send.tap": { readable: true, writable: true, rule: SEND_RULES["send.tap"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -145,6 +150,13 @@ export interface ChannelSsmcsBandTarget {
   readonly side?: undefined;
 }
 
+/** One existing send, by source and destination token (F05-S). */
+export interface SendTarget {
+  readonly source: string;
+  readonly destination: string;
+  readonly band?: never;
+}
+
 /** A channel with a side, required for side-specific fixed stereo settings. */
 export interface ChannelSideTarget {
   readonly channel: number;
@@ -173,6 +185,9 @@ export type GateRange = number | "-inf";
 /** A compressor ratio: finite N for N:1, or infinity (F04-D). */
 export type CompRatio = number | "inf";
 export type CompKnee = "soft" | "medium" | "hard";
+
+/** A send tap point (F05-S). */
+export type SendTap = "pre" | "post";
 
 export type EqBand = (typeof EQ_BANDS)[number];
 /** A band filter type; low takes `hpf`, high `lpf` (F04-E). */
@@ -254,6 +269,10 @@ export interface SettingTypes {
   "channel.ducker.range": { target: ChannelTarget; value: number };
   "channel.ducker.attack": { target: ChannelTarget; value: number };
   "channel.ducker.decay": { target: ChannelTarget; value: number };
+  "send.on": { target: SendTarget; value: boolean };
+  "send.level": { target: SendTarget; value: FaderLevel };
+  "send.pan": { target: SendTarget; value: number };
+  "send.tap": { target: SendTarget; value: SendTap };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

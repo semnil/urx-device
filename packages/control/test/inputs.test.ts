@@ -145,8 +145,12 @@ describe("physical inputs (F02-B)", () => {
 
   it("keep the Clip Safe activity read-only", async () => {
     const { transport, context: c } = context("URX44");
+    // A known setting without a write; a malformed target is still invalid.
     const error = await failureOf(writeSetting(c, "input.clip-safe-active" as never, { input: 1 } as never, true as never));
-    expect(error?.code).toBe("invalid_input");
+    expect(error?.code).toBe("unsupported_operation");
+    const malformed = await failureOf(writeSetting(c, "input.clip-safe-active" as never, { input: 99 } as never, true as never));
+    expect(malformed?.code).toBe("invalid_input");
+    expect((await failureOf(writeSetting(c, "input.no-such" as never, { input: 1 } as never, true as never)))?.code).toBe("invalid_input");
     expect(transport.calls).toEqual([]);
   });
 

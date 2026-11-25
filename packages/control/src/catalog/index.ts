@@ -25,6 +25,7 @@ export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
 export { DUCKER_RULES } from "./ducker.js";
+export { SEND_RULES } from "./sends.js";
 export { DYNAMICS_RULES } from "./dynamics.js";
 export type {
   ByBandRule,
@@ -33,6 +34,8 @@ export type {
   ChoiceRule,
   GridRule,
   PortChoiceRule,
+  SendRoute,
+  SendSettingRule,
   Sentinel,
   SettingRule,
   StopsRule,
@@ -76,6 +79,8 @@ export type {
   ChannelBandTarget,
   ChannelSsmcsBandTarget,
   SsmcsBand,
+  SendTap,
+  SendTarget,
   EqBand,
   EqBandType,
   EqOneKnobType,

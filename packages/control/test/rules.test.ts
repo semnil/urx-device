@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
 import { DUCKER_RULES } from "../src/catalog/ducker.js";
+import { SEND_RULES } from "../src/catalog/sends.js";
 import { DYNAMICS_RULES } from "../src/catalog/dynamics.js";
 import { EQ_RULES } from "../src/catalog/eq.js";
 import { SSMCS_RULES } from "../src/catalog/ssmcs.js";
@@ -19,10 +20,13 @@ const ruled = Object.entries(settingDefinitions as Record<string, SettingDefinit
   definition.rule === undefined ? [] : [[id, definition.rule] as [string, SettingRule]],
 );
 
-const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES };
+const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES };
+
+/** The channel and band rules; send rules, addressed by route, have their own tests. */
+const addressed = ruled.flatMap(([id, rule]) => (rule.target === "send" ? [] : [[id, rule] as const]));
 
 /** Each (id, target, value rule) a rule defines: one per band for a band rule. */
-const valueCases = ruled.flatMap(([id, rule]): [string, object, ValueRule][] => {
+const valueCases = addressed.flatMap(([id, rule]): [string, object, ValueRule][] => {
   if (rule.target === "channel") {
     // URX44 channel 1 is mono, channel 5 the first fixed stereo pair.
     return [[id, { channel: rule.address.mono === undefined ? 5 : 1 }, rule.value]];
@@ -64,7 +68,7 @@ describe("setting rules (K35 definition metadata)", () => {
   });
 
   it("predict each operation's addresses from the rule alone", async () => {
-    for (const [id, rule] of ruled) {
+    for (const [id, rule] of addressed) {
       const bands = rule.target === "channel" ? [undefined] : rule.bands;
       for (const band of bands) {
         // A band rule's band without an address has no ID on any kind.

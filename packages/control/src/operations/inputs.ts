@@ -88,6 +88,9 @@ export const inputHiZ = inputSwitch(INPUT_PARAMS.hiZ, true);
 export const inputClipSafe = inputSwitch(INPUT_PARAMS.clipSafe);
 
 export const inputClipSafeActive = {
+  check(model: string, target: InputTarget): void {
+    jackOf(model, target);
+  },
   read(context: OperationContext, target: InputTarget): Promise<Reading<boolean>> {
     return readDecoded(context, address(INPUT_PARAMS.clipSafeActive, jackOf(context.model, target)), decodeSwitch);
   },

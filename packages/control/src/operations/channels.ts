@@ -212,6 +212,9 @@ function pairAddress(paramId: number, model: string, target: unknown): Parameter
  * until then.
  */
 export const channelStereoLink = {
+  check(model: string, target: ChannelTarget): void {
+    pairAddress(PAIR_PARAMS.stereoLink, model, target);
+  },
   read(context: OperationContext, target: ChannelTarget): Promise<Reading<boolean>> {
     return readDecoded(context, pairAddress(PAIR_PARAMS.stereoLink, context.model, target), decodeSwitch);
   },

@@ -121,4 +121,32 @@ export interface ChannelBandSettingRule {
   readonly value: ValueRule | ByBandRule;
 }
 
-export type SettingRule = ChannelSettingRule | ChannelBandSettingRule;
+/**
+ * One send route family: its parameter ID is base + stride × b for the
+ * zero-based destination index b, at y the source's index (mono N − 1, the
+ * fixed stereo position, or FX number − 1). `write` is false where the design
+ * leaves the write unbound (a read-only field, or a write multiplicity that
+ * awaits evidence under F03-G).
+ */
+export interface SendRoute {
+  readonly from: "mono" | "stereo" | "fx";
+  readonly to: "mix" | "fx";
+  readonly base: number;
+  readonly stride: number;
+  readonly write: boolean;
+}
+
+/**
+ * A send setting: the target names a source and a destination token. A known
+ * token that is no send source or destination, or a pair without a route, is
+ * unsupported; an unknown token is invalid.
+ */
+export interface SendSettingRule {
+  readonly target: "send";
+  readonly knownSources: readonly string[];
+  readonly knownDestinations: readonly string[];
+  readonly routes: readonly SendRoute[];
+  readonly value: ValueRule;
+}
+
+export type SettingRule = ChannelSettingRule | ChannelBandSettingRule | SendSettingRule;
