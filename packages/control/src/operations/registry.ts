@@ -89,6 +89,16 @@ import { busInsertFxOn, busInsertFxType, channelInsertFxOn, channelInsertFxType 
 import { busFxParameter, busFxType } from "./fx-return.js";
 import { busEqOn, busEqType, busGeqGain, busGeqLimit, busGeqLink, busGeqOn } from "./output-eq.js";
 import {
+  busPeqBandFrequency,
+  busPeqBandGain,
+  busPeqBandOn,
+  busPeqBandQ,
+  busPeqBandType,
+  busPeqOneKnobLevel,
+  busPeqOneKnobOn,
+  busPeqOneKnobType,
+} from "./output-peq.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -241,6 +251,14 @@ export const settingHandlers: SettingHandlers = {
   "bus.geq.on": busGeqOn,
   "bus.geq.limit": busGeqLimit,
   "bus.geq.gain": busGeqGain,
+  "bus.peq.band.on": busPeqBandOn,
+  "bus.peq.band.type": busPeqBandType,
+  "bus.peq.band.q": busPeqBandQ,
+  "bus.peq.band.frequency": busPeqBandFrequency,
+  "bus.peq.band.gain": busPeqBandGain,
+  "bus.peq.one-knob.on": busPeqOneKnobOn,
+  "bus.peq.one-knob.type": busPeqOneKnobType,
+  "bus.peq.one-knob.level": busPeqOneKnobLevel,
 };
 
 function unknownId(): Promise<never> {

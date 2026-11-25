@@ -30,6 +30,7 @@ export { BUS_RULES, BUS_TOKENS, CHANNEL_STEREO_ASSIGN_RULE } from "./buses.js";
 export { INSERT_FX_EFFECTS, INSERT_FX_RULES } from "./insert-fx.js";
 export { FX_RETURN_EFFECTS, FX_RETURN_RULES } from "./fx-return.js";
 export { GEQ_BANDS, OUTPUT_EQ_RULES } from "./output-eq.js";
+export { OUTPUT_PEQ_RULES } from "./output-peq.js";
 export {
   FX2_FREQUENCY_DECIHZ,
   INITIAL_DELAY_DECIMS,
@@ -52,6 +53,7 @@ export type {
   ContextStopsRule,
   FxEffectRule,
   FxParameterRule,
+  BusBandSettingRule,
   BusSideAddress,
   BusSideSettingRule,
   GeqGainRule,
@@ -106,6 +108,7 @@ export type {
   FxParameterTarget,
   FxParameterValue,
   FxReturnType,
+  BusBandTarget,
   BusSideBandTarget,
   BusSideTarget,
   GeqLimit,

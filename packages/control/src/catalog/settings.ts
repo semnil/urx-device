@@ -10,6 +10,7 @@ import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE, type BUS_TOKENS } from "./buses.
 import { INSERT_FX_RULES, type INSERT_FX_EFFECTS } from "./insert-fx.js";
 import { FX_RETURN_RULES, type FX_RETURN_EFFECTS } from "./fx-return.js";
 import { OUTPUT_EQ_RULES, type GEQ_BANDS } from "./output-eq.js";
+import { OUTPUT_PEQ_RULES } from "./output-peq.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -128,6 +129,14 @@ export const settingDefinitions = frozen({
   "bus.geq.on": { readable: true, writable: true, rule: OUTPUT_EQ_RULES["bus.geq.on"] },
   "bus.geq.limit": { readable: true, writable: true, rule: OUTPUT_EQ_RULES["bus.geq.limit"] },
   "bus.geq.gain": { readable: true, writable: true, rule: OUTPUT_EQ_RULES["bus.geq.gain"] },
+  "bus.peq.band.on": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.on"] },
+  "bus.peq.band.type": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.type"] },
+  "bus.peq.band.q": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.q"] },
+  "bus.peq.band.frequency": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.frequency"] },
+  "bus.peq.band.gain": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.gain"] },
+  "bus.peq.one-knob.on": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.on"] },
+  "bus.peq.one-knob.type": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.type"] },
+  "bus.peq.one-knob.level": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.level"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -188,6 +197,13 @@ export interface BusSideTarget {
   readonly bus: (typeof BUS_TOKENS)[number];
   readonly side: "left" | "right";
   readonly band?: never;
+}
+
+/** One output PEQ band of a bus (F07-P). It takes no side. */
+export interface BusBandTarget {
+  readonly bus: (typeof BUS_TOKENS)[number];
+  readonly band: EqBand;
+  readonly side?: undefined;
 }
 
 /** One Flex12GEQ band of one side of an output bus, by its exact Hz identifier (F07-G). */
@@ -367,6 +383,14 @@ export interface SettingTypes {
   "bus.geq.on": { target: BusSideTarget; value: boolean };
   "bus.geq.limit": { target: BusSideTarget; value: GeqLimit };
   "bus.geq.gain": { target: BusSideBandTarget; value: number };
+  "bus.peq.band.on": { target: BusBandTarget; value: boolean };
+  "bus.peq.band.type": { target: BusBandTarget; value: EqBandType };
+  "bus.peq.band.q": { target: BusBandTarget; value: number };
+  "bus.peq.band.frequency": { target: BusBandTarget; value: number };
+  "bus.peq.band.gain": { target: BusBandTarget; value: number };
+  "bus.peq.one-knob.on": { target: BusTarget; value: boolean };
+  "bus.peq.one-knob.type": { target: BusTarget; value: EqOneKnobType };
+  "bus.peq.one-knob.level": { target: BusTarget; value: number };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

@@ -300,7 +300,23 @@ export interface GeqGainRule {
   readonly read: { readonly min: number; readonly max: number };
 }
 
+/**
+ * A band setting of a bus (F07-P): the target names a bus and one band. A
+ * band without an address lacks the setting; `write` false leaves the write
+ * unbound.
+ */
+export interface BusBandSettingRule {
+  readonly target: "bus-band";
+  readonly known: readonly string[];
+  readonly bands: readonly string[];
+  readonly address: {
+    readonly [bus: string]: { readonly [band: string]: { readonly paramId: number; readonly y: number; readonly write: boolean } | undefined } | undefined;
+  };
+  readonly value: ValueRule | ByBandRule;
+}
+
 export type SettingRule =
+  | BusBandSettingRule
   | ChannelSettingRule
   | ChannelBandSettingRule
   | SendSettingRule

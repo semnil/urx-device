@@ -9,6 +9,7 @@ import type {
   BusSettingRule,
   ChannelBandSettingRule,
   ChannelSettingRule,
+  BusBandSettingRule,
   BusSideSettingRule,
   ContextStopsRule,
   FxParameterRule,
@@ -572,5 +573,36 @@ export function geqGainSetting(rule: GeqGainRule) {
       return writeRaw(context, resolved.leaf, raw, { requested, planned });
     },
   };
+}
+
+/** A bus band setting whose handler is built from `rule`: the target names a bus and one band. */
+export function busBandRuleSetting<V>(rule: BusBandSettingRule) {
+  const value = rule.value;
+  const codecs = new Map<string, Codec>(
+    value.kind === "by-band"
+      ? Object.entries(value.rules).flatMap(([band, each]) => (each === undefined ? [] : [[band, codecOf(each)] as const]))
+      : rule.bands.map((band) => [band, codecOf(value)]),
+  );
+  return handler<V>((model, target, write) => {
+    modelOf(model);
+    // A side key is taken only as undefined, as for the channel band targets.
+    const own = targetOf<{ bus?: unknown; band?: unknown; side?: unknown }>(target, ["bus", "band", "side"]);
+    if (
+      own.side !== undefined ||
+      typeof own.bus !== "string" ||
+      !rule.known.includes(own.bus) ||
+      typeof own.band !== "string" ||
+      !rule.bands.includes(own.band)
+    ) {
+      return refuse("invalid_input");
+    }
+    const bands = Object.hasOwn(rule.address, own.bus) ? rule.address[own.bus] : undefined;
+    const at = bands !== undefined && Object.hasOwn(bands, own.band) ? bands[own.band] : undefined;
+    const codec = codecs.get(own.band);
+    if (at === undefined || codec === undefined || (write && !at.write)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(at.paramId, at.y), codec };
+  });
 }
 
