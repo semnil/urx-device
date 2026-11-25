@@ -924,8 +924,10 @@ struct ExpiryPool {
     /// stay charged to the waiting-request limits until then.
     charged: usize,
     charged_bytes: usize,
-    /// Threads waiting for a request.
+    /// Threads waiting for a request, and threads started that have not yet
+    /// taken one: both will take a queued request without a new thread.
     idle: usize,
+    starting: usize,
     threads: Vec<JoinHandle<()>>,
     /// Identities of every thread started, kept for the connection's life.
     ids: Vec<ThreadId>,
@@ -944,8 +946,9 @@ impl Expiry {
             pool.charged_bytes += item.frame.len();
             pool.queue.push_back(item);
         }
-        let starting = pool.queue.len().saturating_sub(pool.idle);
-        for _ in 0..starting {
+        let needed = pool.queue.len().saturating_sub(pool.idle + pool.starting);
+        for _ in 0..needed {
+            pool.starting += 1;
             let expiry = Arc::clone(self);
             // Registered before it can run: it waits for this lock first.
             let thread = thread::spawn(move || expiry.complete());
@@ -960,6 +963,7 @@ impl Expiry {
     /// with none left.
     fn complete(&self) {
         let mut pool = lock(&self.pool);
+        pool.starting -= 1;
         loop {
             if let Some(item) = pool.queue.pop_front() {
                 drop(pool);
