@@ -37,16 +37,17 @@ import type { Reading, WritePlan, WriteResult } from "./results.js";
 import { address, modelOf, readDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
-function channelOf(model: string, target: unknown): ChannelIndex {
+/** The channel a target names and its side, each read once from the target's own values. */
+function selectionOf(model: string, target: unknown): { channel: ChannelIndex; side: unknown } {
   const own = targetOf<ChannelSideTarget>(target, ["channel", "side"]);
   const channel = channelIndex(modelOf(model), own.channel);
-  return channel ?? refuse("invalid_input");
+  return channel === undefined ? refuse("invalid_input") : { channel, side: own.side };
 }
 
 /** A pair-wide or mono setting: a side selector is refused. */
 function wholeChannel(model: string, target: unknown): ChannelIndex {
-  const channel = channelOf(model, target);
-  return (target as ChannelSideTarget).side === undefined ? channel : refuse("invalid_input");
+  const { channel, side } = selectionOf(model, target);
+  return side === undefined ? channel : refuse("invalid_input");
 }
 
 function wholeAddress(ids: { mono: number; stereo: number }, channel: ChannelIndex): ParameterAddress {
@@ -55,8 +56,7 @@ function wholeAddress(ids: { mono: number; stereo: number }, channel: ChannelInd
 
 /** A side-specific setting's address: a side is required for fixed stereo, refused for mono. */
 function sideAddress(ids: { mono: number; left: number; right: number }, model: string, target: unknown): ParameterAddress {
-  const channel = channelOf(model, target);
-  const side = (target as ChannelSideTarget).side;
+  const { channel, side } = selectionOf(model, target);
   if (channel.kind === "mono") {
     return side === undefined ? address(ids.mono, channel.index) : refuse("invalid_input");
   }
@@ -193,8 +193,8 @@ export const channelSource = {
 /** A mono pair's primary address; the secondary is not an alias, fixed stereo has no pair. */
 function pairAddress(paramId: number, model: string, target: unknown): ParameterAddress {
   const known = modelOf(model);
-  const channel = channelOf(model, target);
-  if ((target as ChannelSideTarget).side !== undefined) {
+  const { channel, side } = selectionOf(model, target);
+  if (side !== undefined) {
     return refuse("invalid_input");
   }
   if (channel.kind === "stereo") {

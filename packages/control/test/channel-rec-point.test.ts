@@ -79,3 +79,21 @@ describe("target shapes", () => {
     );
   });
 });
+
+describe("selectors read once", () => {
+  it("use the side the check saw, even if the target's getter changes it", async () => {
+    let reads = 0;
+    const flipping = {
+      channel: 5,
+      get side() {
+        reads += 1;
+        return reads === 1 ? "left" : "right";
+      },
+    };
+    const transport = new FakeTransport().script("setNumeric", accepted);
+    const c = new OperationContext(transport, "URX44");
+    await writeSetting(c, "channel.source", flipping as never, "aux-left");
+    expect(transport.calls[0]?.address).toEqual({ paramId: 209, x: "0", y: "0" });
+    expect(reads).toBe(1);
+  });
+});
