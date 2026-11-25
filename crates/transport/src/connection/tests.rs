@@ -1032,6 +1032,33 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
 }
 
 #[test]
+fn a_write_does_not_start_once_waiting_for_the_state_used_up_its_budget() {
+    let frame = vec![b'x'; 30];
+    let mut sock = scripted(None);
+    let shared = Arc::clone(&sock.shared);
+    let (held_tx, held) = mpsc::channel();
+    let holder = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            let _state = shared.lock();
+            held_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        })
+    };
+    held.recv().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        Err(super::WriteError::Failed {
+            cause: RequestCause::SendTimeout,
+            written: 0
+        })
+    );
+    assert!(sock.written.is_empty());
+    holder.join().unwrap();
+}
+
+#[test]
 fn a_write_never_starts_after_the_reader_records_the_end() {
     let frame = vec![b'x'; 30];
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1744,7 +1771,11 @@ mod lifecycle {
                 ..
             })
         ));
-        assert_eq!(posts(&peer), [reg(1)]);
+        assert_eq!(
+            posts(&peer),
+            [reg(1), unreg(1)],
+            "nothing for the waiting call; the close releases the accepted registration"
+        );
     }
 
     #[test]
@@ -1927,6 +1958,326 @@ mod lifecycle {
                 ..
             })
         ));
+    }
+
+    fn unreg_of(uri: &str) -> String {
+        uri.replace("operation=regist", "operation=unregist")
+    }
+
+    #[test]
+    fn a_close_unregisters_the_remaining_ownership_once_per_address() {
+        let peer = accepting();
+        let connection = connect(&peer);
+        let a = connection.prepare_subscription(&[p(2), p(1)]).unwrap();
+        let b = connection.prepare_subscription(&[p(2), m(1)]).unwrap();
+        let _never = connection.prepare_subscription(&[p(3)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &a)), Ok(()));
+        assert_eq!(settled(&activate(&connection, &b)), Ok(()));
+        let registered = posts(&peer);
+        assert_eq!(registered.len(), 3, "{registered:?}");
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        let mut expected = vec![unreg(1), unreg(2)];
+        expected.push(unreg_of(&registered[2]));
+        assert_eq!(
+            posts(&peer)[3..],
+            expected,
+            "each registered address once, in address order; nothing for a token that never started"
+        );
+    }
+
+    #[test]
+    fn a_rejected_unregistration_at_close_fails_it_and_stops_the_rest() {
+        let peer = unit(Duration::ZERO, |uri| {
+            Some(if uri == "/vd/parameters/1:0:0?operation=unregist" {
+                409
+            } else {
+                200
+            })
+        });
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert_eq!(
+            connection.close(TEARDOWN),
+            CloseOutcome::Failed(Failure::Cause {
+                code: Cause::DeviceRejected,
+                phase: Phase::Teardown
+            })
+        );
+        assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1)]);
+        assert_eq!(
+            connection.close(TEARDOWN),
+            CloseOutcome::Failed(Failure::Cause {
+                code: Cause::DeviceRejected,
+                phase: Phase::Teardown
+            }),
+            "a repeated close shares the outcome and sends nothing"
+        );
+        assert_eq!(posts(&peer).len(), 3);
+    }
+
+    #[test]
+    fn unregistrations_at_close_stop_at_the_teardown_budget() {
+        let peer = unit(Duration::from_millis(400), |_| Some(200));
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            connection.close(Duration::from_millis(200)),
+            CloseOutcome::Incomplete(Failure::Cause {
+                code: Cause::TeardownTimeout,
+                phase: Phase::Teardown
+            })
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "{:?}",
+            started.elapsed()
+        );
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            posts(&peer),
+            [reg(1), reg(2), unreg(1)],
+            "nothing is sent after the budget"
+        );
+    }
+
+    #[test]
+    fn the_worker_stops_waiting_for_an_unregistration_at_the_budget() {
+        let peer = unit(Duration::ZERO, |uri| {
+            (!uri.contains("unregist")).then_some(200)
+        });
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert_eq!(
+            connection.close(Duration::from_millis(200)),
+            CloseOutcome::Incomplete(Failure::Cause {
+                code: Cause::TeardownTimeout,
+                phase: Phase::Teardown
+            })
+        );
+        let started = std::time::Instant::now();
+        super::wait_until(|| connection.shared.lock().teardown.is_some());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            connection.shared.lock().teardown,
+            Some(Some(Failure::Cause {
+                code: Cause::TeardownTimeout,
+                phase: Phase::Teardown
+            }))
+        );
+    }
+
+    #[test]
+    fn an_empty_teardown_budget_sends_no_unregistration() {
+        let peer = accepting();
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert!(matches!(
+            connection.close(Duration::ZERO),
+            CloseOutcome::Incomplete(_)
+        ));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(posts(&peer), [reg(1)]);
+    }
+
+    #[test]
+    fn an_unregistration_response_deadline_before_the_budget_fails_the_close() {
+        let peer = unit(Duration::ZERO, |uri| {
+            (!uri.contains("unregist")).then_some(200)
+        });
+        let connection = open(
+            peer.port,
+            ID,
+            &ConnectionOptions {
+                response_deadline: Duration::from_millis(150),
+                ..super::options()
+            },
+            &crate::lifecycle::Control::new(),
+        )
+        .unwrap();
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert_eq!(
+            connection.close(Duration::from_millis(1200)),
+            CloseOutcome::Failed(Failure::Cause {
+                code: Cause::ResponseTimeout,
+                phase: Phase::Teardown
+            })
+        );
+    }
+
+    /// Closes on another thread once the unit has received `count` POSTs.
+    fn close_after(
+        connection: &Arc<Connection>,
+        peer: &Peer,
+        count: usize,
+    ) -> thread::JoinHandle<CloseOutcome> {
+        super::wait_until(|| posts(peer).len() == count);
+        let connection = Arc::clone(connection);
+        thread::spawn(move || connection.close(TEARDOWN))
+    }
+
+    #[test]
+    fn a_release_under_way_when_closing_unregisters_every_address() {
+        let peer = unit(Duration::from_millis(150), |_| Some(200));
+        let connection = Arc::new(connect(&peer));
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        let released = release(&token);
+        let closer = close_after(&connection, &peer, 3);
+        assert_eq!(settled(&released), Ok(()));
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1), unreg(2)]);
+    }
+
+    #[test]
+    fn the_teardown_budget_starts_after_a_release_under_way() {
+        let peer = unit(Duration::from_millis(150), |_| Some(200));
+        let connection = Arc::new(connect(&peer));
+        let token = connection
+            .prepare_subscription(&[p(1), p(2), p(3)])
+            .unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        let released = release(&token);
+        super::wait_until(|| posts(&peer).len() == 4);
+        let closing = Arc::clone(&connection);
+        let closer = thread::spawn(move || closing.close(Duration::from_millis(200)));
+        assert_eq!(
+            settled(&released),
+            Ok(()),
+            "its unregistrations outlast 200 ms"
+        );
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(posts(&peer)[3..], [unreg(1), unreg(2), unreg(3)]);
+    }
+
+    #[test]
+    fn a_cleanup_failing_after_the_close_fails_the_close() {
+        for activation in [false, true] {
+            let peer = unit(Duration::from_millis(150), move |uri| {
+                Some(if uri == unreg(2) || (activation && uri == reg(3)) {
+                    409
+                } else {
+                    200
+                })
+            });
+            let connection = Arc::new(connect(&peer));
+            let token = if activation {
+                connection
+                    .prepare_subscription(&[p(1), p(2), p(3)])
+                    .unwrap()
+            } else {
+                let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+                assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+                token
+            };
+            let outcome = if activation {
+                activate(&connection, &token)
+            } else {
+                release(&token)
+            };
+            // The close comes while the first cleanup unregistration is sent.
+            let before = if activation { 3 } else { 2 };
+            let closer = close_after(&connection, &peer, before + 1);
+            assert!(settled(&outcome).is_err());
+            let closed = closer.join().unwrap();
+            assert_eq!(
+                closed,
+                CloseOutcome::Failed(Failure::Cause {
+                    code: Cause::DeviceRejected,
+                    phase: Phase::Teardown
+                }),
+                "activation: {activation}"
+            );
+            assert_eq!(connection.close(TEARDOWN), closed, "the same outcome again");
+            assert_eq!(
+                posts(&peer).last(),
+                Some(&unreg(2)),
+                "nothing after the failed unregistration"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_activations_cleanup_under_way_when_closing_finishes() {
+        let peer = unit(Duration::from_millis(150), |uri| {
+            Some(if uri == reg(2) { 400 } else { 200 })
+        });
+        let connection = Arc::new(connect(&peer));
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        let activated = activate(&connection, &token);
+        let closer = close_after(&connection, &peer, 3);
+        assert_eq!(
+            settled(&activated),
+            failed(Cause::DeviceRejected, Cleanup::COMPLETE)
+        );
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1)]);
+    }
+
+    #[test]
+    fn a_close_stops_an_acquisition_and_its_cleanup_still_runs() {
+        let peer = unit(Duration::from_millis(150), |_| Some(200));
+        let connection = Arc::new(connect(&peer));
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        let activated = activate(&connection, &token);
+        let closer = close_after(&connection, &peer, 1);
+        assert!(settled(&activated).is_err());
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+        assert_eq!(
+            posts(&peer),
+            [reg(1), unreg(1)],
+            "no registration after the close; the accepted one is released once"
+        );
+    }
+
+    #[test]
+    fn a_close_after_the_link_ended_sends_nothing() {
+        let peer = Peer::serve(|request| match uri_of(request) {
+            "/vd/synchronize" => vec![get_reply("/vd/synchronize", online(ID))],
+            "/vd/device" => vec![get_reply("/vd/device", firmware())],
+            uri => vec![
+                line(
+                    json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": 200 } } }),
+                ),
+                line(
+                    json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "lost" } } }),
+                ),
+            ],
+        });
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        let _ = settled(&activate(&connection, &token));
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        assert_eq!(posts(&peer), [reg(1)]);
+    }
+
+    #[test]
+    fn a_close_from_a_lifecycle_callback_still_unregisters() {
+        let peer = accepting();
+        let connection = Arc::new(connect(&peer));
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, inner) = mpsc::channel();
+        let closing = Arc::clone(&connection);
+        token.activate(&operation, move |_| {
+            let _ = tx.send(closing.close(TEARDOWN));
+        });
+        assert_eq!(
+            inner.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        assert_eq!(posts(&peer), [reg(1), unreg(1)]);
     }
 }
 
