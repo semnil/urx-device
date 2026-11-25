@@ -63,6 +63,11 @@ pub struct Queue {
     pending_bytes: usize,
     in_delivery: Option<InDelivery>,
     next_ticket: u64,
+    /// Records queued so far, and records acknowledged so far (K12). The
+    /// queue is in receive order, so the first `adopted` of the first
+    /// `accepted` records are exactly the adopted ones.
+    accepted: u64,
+    adopted: u64,
 }
 
 impl Queue {
@@ -75,6 +80,8 @@ impl Queue {
             pending_bytes: 0,
             in_delivery: None,
             next_ticket: 0,
+            accepted: 0,
+            adopted: 0,
         }
     }
 
@@ -89,6 +96,7 @@ impl Queue {
         }
         self.pending.push_back((record, bytes));
         self.pending_bytes += bytes;
+        self.accepted += 1;
         Ok(())
     }
 
@@ -143,11 +151,24 @@ impl Queue {
     pub fn adopt(&mut self, ticket: BatchTicket) -> bool {
         match &self.in_delivery {
             Some(batch) if batch.ticket == ticket => {
+                self.adopted += batch.records as u64;
                 self.in_delivery = None;
                 true
             }
             _ => false,
         }
+    }
+
+    /// Records queued so far on this connection: the receive cutoff of a
+    /// reply received now (K12).
+    pub fn accepted(&self) -> u64 {
+        self.accepted
+    }
+
+    /// Whether every record queued before `cutoff` was taken has been
+    /// acknowledged.
+    pub fn has_adopted(&self, cutoff: u64) -> bool {
+        self.adopted >= cutoff
     }
 
     pub fn is_idle(&self) -> bool {
