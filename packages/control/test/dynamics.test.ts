@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "../src/catalog/dynamics-stops.js";
+import { MONO_CHANNELS } from "../src/catalog/channels.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { previewSetting, readSetting, writeSetting, type WriteArgs } from "../src/operations/registry.js";
@@ -188,5 +189,69 @@ describe("GATE and COMP (F04-D)", () => {
     expect(plan("channel.gate.threshold", -2.375)).toBe(-2.38);
     expect(plan("channel.gate.range", -0.005)).toBe(-0.01);
   });
-});
 
+  it("write each setting once, at the target channel's address, in its design wire unit", async () => {
+    // [id, paramId, value, raw] from the F04-D table.
+    const writes = [
+      ["channel.gate.threshold", 29, -12.34, "-1234"],
+      ["channel.gate.range", 30, -40.5, "-4050"],
+      ["channel.gate.range", 30, "-inf", "-32768"],
+      ["channel.gate.attack", 31, 0.1, "100"],
+      ["channel.gate.hold", 32, 1960, "196000"],
+      ["channel.gate.decay", 33, 9.3, "93"],
+      ["channel.comp.threshold", 35, -54, "-5400"],
+      ["channel.comp.ratio", 36, 2.5, "250"],
+      ["channel.comp.ratio", 36, "inf", "65535"],
+      ["channel.comp.knee", 37, "soft", "0"],
+      ["channel.comp.knee", 37, "medium", "1"],
+      ["channel.comp.knee", 37, "hard", "2"],
+      ["channel.comp.gain", 38, 7.06, "706"],
+      ["channel.comp.attack", 39, 80, "80000"],
+      ["channel.comp.release", 40, 999, "9990"],
+      ["channel.comp.auto-makeup", 41, true, "1"],
+      ["channel.comp.auto-makeup", 41, false, "0"],
+      ["channel.comp.one-knob.on", 42, true, "1"],
+      ["channel.comp.one-knob.on", 42, false, "0"],
+      ["channel.comp.one-knob.level", 43, 37, "37"],
+    ] as const;
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      for (const channel of MONO_CHANNELS[model]) {
+        for (const [id, paramId, value, raw] of writes) {
+          const transport = new FakeTransport().script("setNumeric", accepted);
+          transport.timers = false;
+          const target = { channel };
+          const preview = previewSetting(model, ...([id, target, value] as unknown as WriteArgs));
+          expect(transport.calls, `${id} preview`).toEqual([]);
+          const result = await writeSetting(new OperationContext(transport, model), ...([id, target, value] as unknown as WriteArgs));
+          expect(result.planned, `${model} ${channel} ${id}`).toBe(preview.planned);
+          expect(
+            transport.calls.map(({ method, address, value: sent }) => ({ method, address, value: sent })),
+            `${model} ${channel} ${id} ${String(value)}`,
+          ).toEqual([{ method: "setNumeric", address: { paramId, x: "0", y: `${channel - 1}` }, value: raw }]);
+        }
+      }
+    }
+  });
+
+  it("keep time and ratio reads that fall between write stops", async () => {
+    for (const [id, raw, value] of [
+      ["channel.gate.attack", "101", 0.101],
+      ["channel.comp.attack", "79999", 79.999],
+      ["channel.gate.hold", "3", 0.03],
+      ["channel.gate.decay", "94", 9.4],
+      ["channel.comp.release", "9989", 998.9],
+      ["channel.comp.ratio", "101", 1.01],
+    ] as const) {
+      const stops = id.endsWith("attack")
+        ? ATTACK_STOPS_RAW
+        : id.endsWith("hold")
+          ? HOLD_STOPS_RAW
+          : id.endsWith("ratio")
+            ? RATIO_STOPS_RAW
+            : RELEASE_STOPS_RAW;
+      expect(stops.includes(Number(raw)), `${id} ${raw} lies between stops`).toBe(false);
+      const transport = new FakeTransport().script("getNumeric", read(raw));
+      expect((await readSetting(new OperationContext(transport, "URX44"), id, { channel: 2 })).value, `${id} ${raw}`).toBe(value);
+    }
+  });
+});
