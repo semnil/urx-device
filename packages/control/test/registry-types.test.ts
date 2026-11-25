@@ -11,9 +11,10 @@ import { previewSetting, readSetting, writeSetting, type ReadArgs } from "../src
 import { FakeTransport } from "./fake-transport.js";
 
 // Type-level checks: each line marked @ts-expect-error must fail to compile.
-type ChannelId = Extract<SettingId, `channel.${string}`>;
-// The catalog's channel settings, filtered by name only: every one accepts a plain channel target.
-const channelIds = settingIds().filter((id): id is ChannelId => id.startsWith("channel."));
+type ChannelId = Exclude<Extract<SettingId, `channel.${string}`>, `${string}.band.${string}`>;
+// The catalog's channel settings, filtered by name only (band settings take a band):
+// every one accepts a plain channel target.
+const channelIds = settingIds().filter((id): id is ChannelId => id.startsWith("channel.") && !id.includes(".band."));
 
 describe("registry argument types", () => {
   it("bind each ID to its own target and value", () => {

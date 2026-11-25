@@ -3,8 +3,13 @@
 
 import { decodeInteger, decodeSwitch, nearestStopIndex, planOnGrid } from "../catalog/codecs.js";
 import type { I64Text } from "../catalog/i64.js";
-import type { ChannelSettingRule, ValueRule } from "../catalog/rules.js";
+import { channelIndex } from "../catalog/channels.js";
+import type { ChannelBandSettingRule, ChannelSettingRule, ValueRule } from "../catalog/rules.js";
 import { channelSetting, planSwitch } from "./channels.js";
+import type { OperationContext } from "./context.js";
+import type { Reading, WritePlan, WriteResult } from "./results.js";
+import { address, modelOf, readDecoded, refuse, targetOf, writeRaw } from "./setting-io.js";
+import type { ParameterAddress } from "./transport.js";
 
 type Codec = {
   decode: (raw: I64Text) => unknown;
@@ -81,3 +86,52 @@ export function ruleSetting<V>(rule: ChannelSettingRule) {
     codec.plan as (value: unknown) => { planned: V; raw: I64Text } | undefined,
   );
 }
+
+/**
+ * A band setting whose handler is built from `rule`: the target names a
+ * channel and exactly one band, and takes no side.
+ */
+export function bandRuleSetting<V>(rule: ChannelBandSettingRule) {
+  const value = rule.value;
+  const codecs = new Map<string, Codec>(
+    value.kind === "by-band"
+      ? Object.entries(value.rules).map(([band, each]) => [band, codecOf(each)])
+      : rule.bands.map((band) => [band, codecOf(value)]),
+  );
+  const resolve = (model: string, target: unknown): { at: ParameterAddress; codec: Codec } => {
+    // A side key is taken only as undefined, as for whole-channel targets.
+    const own = targetOf<{ channel: unknown; band: unknown; side: unknown }>(target, ["channel", "band", "side"]);
+    const channel = channelIndex(modelOf(model), own.channel) ?? refuse("invalid_input");
+    if (own.side !== undefined || typeof own.band !== "string" || !rule.bands.includes(own.band)) {
+      return refuse("invalid_input");
+    }
+    // A band or channel kind without an ID lacks the setting.
+    const paramId = Object.hasOwn(rule.address, own.band) ? rule.address[own.band]?.[channel.kind] : undefined;
+    const codec = codecs.get(own.band);
+    return paramId === undefined || codec === undefined
+      ? refuse("unsupported_operation")
+      : { at: address(paramId, channel.index), codec };
+  };
+  const planned = (model: string, target: unknown, requested: V) => {
+    const { at, codec } = resolve(model, target);
+    const result = codec.plan(requested);
+    return result === undefined
+      ? refuse("invalid_input")
+      : { at, raw: result.raw, requested, planned: result.planned as V };
+  };
+  return {
+    read(context: OperationContext, target: unknown): Promise<Reading<V>> {
+      const { at, codec } = resolve(context.model, target);
+      return readDecoded(context, at, codec.decode as (raw: I64Text) => V | undefined);
+    },
+    plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      const { requested: r, planned: p } = planned(model, target, requested);
+      return { requested: r, planned: p };
+    },
+    write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      const { at, raw, requested: r, planned: p } = planned(context.model, target, requested);
+      return writeRaw(context, at, raw, { requested: r, planned: p });
+    },
+  };
+}
+

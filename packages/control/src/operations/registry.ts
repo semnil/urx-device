@@ -38,6 +38,16 @@ import {
   gateThreshold,
 } from "./dynamics.js";
 import {
+  eqBandFrequency,
+  eqBandGain,
+  eqBandOn,
+  eqBandQ,
+  eqBandType,
+  eqOneKnobLevel,
+  eqOneKnobOn,
+  eqOneKnobType,
+} from "./eq.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -123,6 +133,14 @@ export const settingHandlers: SettingHandlers = {
   "channel.comp.auto-makeup": compAutoMakeup,
   "channel.comp.one-knob.on": compOneKnobOn,
   "channel.comp.one-knob.level": compOneKnobLevel,
+  "channel.eq.band.on": eqBandOn,
+  "channel.eq.band.type": eqBandType,
+  "channel.eq.band.q": eqBandQ,
+  "channel.eq.band.frequency": eqBandFrequency,
+  "channel.eq.band.gain": eqBandGain,
+  "channel.eq.one-knob.on": eqOneKnobOn,
+  "channel.eq.one-knob.type": eqOneKnobType,
+  "channel.eq.one-knob.level": eqOneKnobLevel,
 };
 
 function unknownId(): Promise<never> {

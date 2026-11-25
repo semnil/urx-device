@@ -26,6 +26,8 @@ export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
 export { DYNAMICS_RULES } from "./dynamics.js";
 export type {
+  ByBandRule,
+  ChannelBandSettingRule,
   ChannelSettingRule,
   ChoiceRule,
   GridRule,
@@ -36,6 +38,7 @@ export type {
   ValueRule,
   ValueUnit,
 } from "./rules.js";
+export { EQ_BANDS, EQ_ONE_KNOB_TYPES, EQ_RULES } from "./eq.js";
 export { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "./dynamics-stops.js";
 export {
   HPF_FREQUENCY_ID,
@@ -54,6 +57,10 @@ export type {
   ChannelName,
   CompKnee,
   CompRatio,
+  ChannelBandTarget,
+  EqBand,
+  EqBandType,
+  EqOneKnobType,
   GateRange,
   ProcessingMode,
   RecPoint,
