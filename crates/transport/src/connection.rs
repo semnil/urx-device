@@ -1332,7 +1332,7 @@ fn serve(
     loop {
         let reported = *shared.link_end();
         if let Some(cause) = reported {
-            finish(&mut sock, &shared, mark_ended(&shared, cause));
+            finish(&mut sock, mark_ended(&shared, cause));
             return;
         }
         let job = {
@@ -1356,7 +1356,7 @@ fn serve(
                 deliver_lifecycle(done, outcome);
             }
             if let Some(ended) = ended {
-                finish(&mut sock, &shared, ended);
+                finish(&mut sock, ended);
                 return;
             }
             continue;
@@ -1413,7 +1413,7 @@ fn serve(
                     }
                 }
                 if let Some(ended) = waiting {
-                    finish(&mut sock, &shared, ended);
+                    finish(&mut sock, ended);
                     return;
                 }
                 if holds {
@@ -1439,7 +1439,7 @@ fn serve(
             },
         };
         if let Some(cause) = fatal {
-            finish(&mut sock, &shared, mark_ended(&shared, cause));
+            finish(&mut sock, mark_ended(&shared, cause));
             return;
         }
     }
@@ -1486,6 +1486,9 @@ fn mark_ended(shared: &Shared, cause: RequestCause) -> Ended {
     shared.advance.notify_all();
     // A close waiting for the teardown stops waiting: there is none.
     shared.settled.notify_all();
+    // No hold follows the end: the expiry threads end once nothing is
+    // queued, without waiting for the completions the end still runs.
+    shared.expiry.stop();
     Ended { taken, cause }
 }
 
@@ -1547,11 +1550,9 @@ impl Taken {
 }
 
 /// Closes the socket and completes what the end took with its cause.
-fn finish(sock: &mut TcpStream, shared: &Shared, ended: Ended) {
+fn finish(sock: &mut TcpStream, ended: Ended) {
     let _ = sock.shutdown(Shutdown::Both);
     ended.taken.complete(ended.cause);
-    // No hold follows: the expiry threads end once nothing is queued.
-    shared.expiry.stop();
 }
 
 /// The outcomes a lifecycle job settled, to deliver once the end (if any) is

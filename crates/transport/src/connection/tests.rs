@@ -3514,4 +3514,28 @@ mod notifications {
         release.send(()).unwrap();
         super::wait_until(|| connection.shared.expiry.charged().0 == 0);
     }
+
+    #[test]
+    fn the_expiry_threads_end_without_waiting_for_the_ends_completions() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let release = blocked_expiry(&connection, &push, &batches, || {});
+        release.send(()).unwrap();
+        super::wait_until(|| connection.shared.expiry.charged().0 == 0);
+        // A waiting request whose completion, run by the end, blocks.
+        let operation = connection.create_operation().unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (unblock, blocked) = mpsc::channel::<()>();
+        connection.submit(&operation, Request::GetNumeric(param(8)), move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = blocked.recv();
+        });
+        push.send(lost()).unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        super::wait_until(|| {
+            let pool = crate::connection::lock(&connection.shared.expiry.pool);
+            !pool.threads.is_empty() && pool.threads.iter().all(|thread| thread.is_finished())
+        });
+        unblock.send(()).unwrap();
+    }
 }
