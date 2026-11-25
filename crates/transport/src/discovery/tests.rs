@@ -705,3 +705,21 @@ fn firmware_rows_that_cannot_be_read_or_disagree_are_invalid_in_any_order() {
         Some(SystemFirmware::Version("9.9.9".into()))
     );
 }
+
+#[test]
+fn only_a_notification_with_a_status_reports_the_unit_lost() {
+    for push in [
+        json!({ "vdp": { "method": "get", "uri": "/vd/synchronize", "data": { "sync_status": "lost" } } }),
+        json!({ "vdp": { "method": "post", "uri": "/vd/synchronize", "data": { "sync_status": "lost" } } }),
+        json!({ "vdp": { "uri": "/vd/synchronize", "data": { "sync_status": "lost" } } }),
+        sync_push(""),
+    ] {
+        let a = unplugged_while_checked("<device-id-a>", vec![push.clone()]);
+        let center = center(&[(a.port, "URX44V")]);
+        assert_eq!(
+            run(&metadata(options(center.port))).unwrap().len(),
+            1,
+            "{push}"
+        );
+    }
+}

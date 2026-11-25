@@ -169,7 +169,9 @@ fn check(
 }
 
 /// Sends a GET and returns its reply's `data`. With `watch_lost`, a
-/// device-lost push received while waiting fails it as `connection_lost`.
+/// `/vd/synchronize` notification whose nonempty status is not `online`,
+/// received while waiting, fails it as `connection_lost`; replies and
+/// notifications without a readable status do not.
 fn get(
     link: &mut Link<'_>,
     request: Request,
@@ -181,7 +183,17 @@ fn get(
     let key = request.reply_key();
     link.await_frame(options.request_deadline, budget, |message| {
         let inbound = Inbound::new(message.clone());
-        if watch_lost && inbound.device_lost().is_some() {
+        let notification = message
+            .get("vdp")
+            .and_then(|vdp| vdp.get("method"))
+            .and_then(Value::as_str)
+            == Some("notify");
+        if watch_lost
+            && notification
+            && inbound
+                .device_lost()
+                .is_some_and(|status| !status.is_empty())
+        {
             return Some(Err(Failure::cause(Cause::ConnectionLost, PHASE)));
         }
         let reply = inbound.reply(&key)?;
