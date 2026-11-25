@@ -394,6 +394,22 @@ fn notifications_and_other_replies_do_not_answer_a_request() {
 }
 
 /// A unit that answers each parameter request `delay` after receiving it.
+/// A unit that holds every answer until the returned sender is used (or
+/// dropped), so a test decides when the worker can move on.
+fn gated() -> (Peer, std::sync::mpsc::Sender<()>) {
+    let (open, gate) = mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let opened = std::sync::atomic::AtomicBool::new(false);
+    let peer = unit(move |request| {
+        if !opened.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = gate.lock().unwrap().recv();
+            opened.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        plain(request)
+    });
+    (peer, open)
+}
+
 fn slow(delay: Duration) -> Peer {
     unit(move |request| {
         thread::sleep(delay);
@@ -423,7 +439,9 @@ fn requests_run_one_at_a_time_in_admission_order() {
 
 #[test]
 fn the_waiting_queue_admits_exactly_its_count_limit() {
-    let peer = slow(Duration::from_millis(300));
+    // The active request is answered only once the test says so: the worker
+    // takes nothing from the queue while the limit is checked.
+    let (peer, open) = gated();
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
     let active = submit(&connection, &operation, Request::GetNumeric(address(1)));
@@ -446,6 +464,7 @@ fn the_waiting_queue_admits_exactly_its_count_limit() {
             Evidence::NotSent
         )
     );
+    drop(open);
     drop(admitted);
     drop(active);
     assert_eq!(
@@ -458,9 +477,9 @@ fn the_waiting_queue_admits_exactly_its_count_limit() {
 
 #[test]
 fn the_waiting_queue_admits_exactly_its_byte_limit() {
-    // The active request is answered only after every admission below, so
-    // the worker frees no queue room meanwhile, however slow the machine.
-    let peer = slow(Duration::from_secs(2));
+    // The active request is answered only once the test says so: the worker
+    // frees no queue room while the limit is checked.
+    let (peer, open) = gated();
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
     let active = submit(&connection, &operation, Request::GetNumeric(address(1)));
@@ -511,6 +530,7 @@ fn the_waiting_queue_admits_exactly_its_byte_limit() {
         ),
         "nothing fits once the limit is full"
     );
+    drop(open);
     drop((admitted, active));
     assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
 }
