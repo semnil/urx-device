@@ -6,6 +6,7 @@ import { frozen } from "./frozen.js";
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
+import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
 import type { SourceToken } from "./inputs.js";
 import type { PROCESSING_MODES } from "./processing.js";
 import type { SettingRule } from "./rules.js";
@@ -65,6 +66,14 @@ export const settingDefinitions = frozen({
   "channel.comp.auto-makeup": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.auto-makeup"] },
   "channel.comp.one-knob.on": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.on"] },
   "channel.comp.one-knob.level": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.level"] },
+  "channel.eq.band.on": { readable: true, writable: true, rule: EQ_RULES["channel.eq.band.on"] },
+  "channel.eq.band.type": { readable: true, writable: true, rule: EQ_RULES["channel.eq.band.type"] },
+  "channel.eq.band.q": { readable: true, writable: true, rule: EQ_RULES["channel.eq.band.q"] },
+  "channel.eq.band.frequency": { readable: true, writable: true, rule: EQ_RULES["channel.eq.band.frequency"] },
+  "channel.eq.band.gain": { readable: true, writable: true, rule: EQ_RULES["channel.eq.band.gain"] },
+  "channel.eq.one-knob.on": { readable: true, writable: true, rule: EQ_RULES["channel.eq.one-knob.on"] },
+  "channel.eq.one-knob.type": { readable: true, writable: true, rule: EQ_RULES["channel.eq.one-knob.type"] },
+  "channel.eq.one-knob.level": { readable: true, writable: true, rule: EQ_RULES["channel.eq.one-knob.level"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -78,11 +87,14 @@ export type WritableSettingId = {
 /** A physical MIC/LINE jack, numbered from 1 (F02-B). */
 export interface InputTarget {
   readonly input: number;
+  /** Bands belong to band targets only. */
+  readonly band?: never;
 }
 
 /** A digital input source (F03-G). */
 export interface SourceTarget {
   readonly source: SourceToken;
+  readonly band?: never;
 }
 
 /**
@@ -92,12 +104,21 @@ export interface SourceTarget {
 export interface ChannelTarget {
   readonly channel: number;
   readonly side?: undefined;
+  readonly band?: never;
+}
+
+/** A whole channel and one EQ band (F04-E). It takes no side. */
+export interface ChannelBandTarget {
+  readonly channel: number;
+  readonly band: EqBand;
+  readonly side?: undefined;
 }
 
 /** A channel with a side, required for side-specific fixed stereo settings. */
 export interface ChannelSideTarget {
   readonly channel: number;
   readonly side?: "left" | "right";
+  readonly band?: never;
 }
 
 /** A fader level: finite dB, or negative infinity. */
@@ -121,6 +142,11 @@ export type GateRange = number | "-inf";
 /** A compressor ratio: finite N for N:1, or infinity (F04-D). */
 export type CompRatio = number | "inf";
 export type CompKnee = "soft" | "medium" | "hard";
+
+export type EqBand = (typeof EQ_BANDS)[number];
+/** A band filter type; low takes `hpf`, high `lpf` (F04-E). */
+export type EqBandType = "peaking" | "shelving" | "hpf" | "lpf";
+export type EqOneKnobType = (typeof EQ_ONE_KNOB_TYPES)[number];
 
 /**
  * Each setting's target, observed value and requested value types (K35:
@@ -166,6 +192,14 @@ export interface SettingTypes {
   "channel.comp.auto-makeup": { target: ChannelTarget; value: boolean };
   "channel.comp.one-knob.on": { target: ChannelTarget; value: boolean };
   "channel.comp.one-knob.level": { target: ChannelTarget; value: number };
+  "channel.eq.band.on": { target: ChannelBandTarget; value: boolean };
+  "channel.eq.band.type": { target: ChannelBandTarget; value: EqBandType };
+  "channel.eq.band.q": { target: ChannelBandTarget; value: number };
+  "channel.eq.band.frequency": { target: ChannelBandTarget; value: number };
+  "channel.eq.band.gain": { target: ChannelBandTarget; value: number };
+  "channel.eq.one-knob.on": { target: ChannelTarget; value: boolean };
+  "channel.eq.one-knob.type": { target: ChannelTarget; value: EqOneKnobType };
+  "channel.eq.one-knob.level": { target: ChannelTarget; value: number };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

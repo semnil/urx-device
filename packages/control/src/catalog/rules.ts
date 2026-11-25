@@ -6,7 +6,7 @@
 import type { ChannelKind } from "./channels.js";
 
 /** A public unit; null for unitless numbers. */
-export type ValueUnit = "dB" | "ms" | "ratio" | null;
+export type ValueUnit = "dB" | "ms" | "Hz" | "%" | "ratio" | null;
 
 /** A named value outside the finite range, with its exact raw value. */
 export interface Sentinel {
@@ -63,4 +63,27 @@ export interface ChannelSettingRule {
   readonly value: ValueRule;
 }
 
-export type SettingRule = ChannelSettingRule;
+/** A value rule for each band that has the setting. */
+export interface ByBandRule {
+  readonly kind: "by-band";
+  /** Undefined for a band without the setting. */
+  readonly rules: { readonly [band: string]: ValueRule | undefined };
+}
+
+/** A band's parameter ID per channel kind; a kind without one lacks the setting. */
+export type BandAddress = { readonly [K in ChannelKind]?: number };
+
+/**
+ * A setting of one band of a channel: the target names a channel and exactly
+ * one of `bands`. A band with no address, or a channel kind with no ID for
+ * it, lacks the setting.
+ */
+export interface ChannelBandSettingRule {
+  readonly target: "channel-band";
+  readonly bands: readonly string[];
+  /** Undefined for a band without the setting. */
+  readonly address: { readonly [band: string]: BandAddress | undefined };
+  readonly value: ValueRule | ByBandRule;
+}
+
+export type SettingRule = ChannelSettingRule | ChannelBandSettingRule;
