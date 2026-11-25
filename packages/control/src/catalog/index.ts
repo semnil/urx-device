@@ -24,6 +24,7 @@ export {
 export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
+export { ATTACK_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "./dynamics-stops.js";
 export {
   HPF_FREQUENCY_ID,
   HPF_READ_RAW,
@@ -39,6 +40,9 @@ export type {
   ChannelTarget,
   ChannelColor,
   ChannelName,
+  CompKnee,
+  CompRatio,
+  GateRange,
   ProcessingMode,
   RecPoint,
   FaderLevel,

@@ -22,6 +22,22 @@ import {
   channelStereoLink,
 } from "./channels.js";
 import {
+  compAttack,
+  compAutoMakeup,
+  compGain,
+  compKnee,
+  compOneKnobLevel,
+  compOneKnobOn,
+  compRatio,
+  compRelease,
+  compThreshold,
+  gateAttack,
+  gateDecay,
+  gateHold,
+  gateRange,
+  gateThreshold,
+} from "./dynamics.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -93,6 +109,20 @@ export const settingHandlers: SettingHandlers = {
   "channel.ssmcs.on": ssmcsOn,
   "channel.ssmcs.comp.on": ssmcsCompOn,
   "channel.ssmcs.eq.on": ssmcsEqOn,
+  "channel.gate.threshold": gateThreshold,
+  "channel.gate.range": gateRange,
+  "channel.gate.attack": gateAttack,
+  "channel.gate.hold": gateHold,
+  "channel.gate.decay": gateDecay,
+  "channel.comp.threshold": compThreshold,
+  "channel.comp.ratio": compRatio,
+  "channel.comp.knee": compKnee,
+  "channel.comp.gain": compGain,
+  "channel.comp.attack": compAttack,
+  "channel.comp.release": compRelease,
+  "channel.comp.auto-makeup": compAutoMakeup,
+  "channel.comp.one-knob.on": compOneKnobOn,
+  "channel.comp.one-knob.level": compOneKnobLevel,
 };
 
 function unknownId(): Promise<never> {
