@@ -3,9 +3,12 @@
 //! unregistrations their lifecycle needs. This module performs no I/O; the
 //! worker sends the requests it names and reports their verdicts back.
 //!
-//! An address is registered with Device Center for its first owner and
-//! unregistered after its last owner is gone, so tokens that share an address
-//! cause one registration between them. A token's address set never changes:
+//! A token admitted but not yet activating already receives notifications
+//! and counts against the limits, but it takes no part in registration: an
+//! address is registered for the first token that starts activating with it
+//! and unregistered after the last such token is gone, so tokens that share
+//! an address cause one registration between them, and releasing a token
+//! that never started sends nothing. A token's address set never changes:
 //! a consumer replaces a token by acquiring a new one and then releasing the
 //! old one.
 
@@ -55,8 +58,10 @@ pub enum Verdict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenState {
-    /// Admitted, owning its addresses, not yet fully registered.
+    /// Admitted and receiving; it has not started registering.
     Provisional,
+    /// Activation started: it holds its addresses' registrations.
+    Registering,
     Active,
     /// Owning nothing any more; still counted until its release finishes.
     Releasing,
@@ -78,8 +83,10 @@ enum Registration {
 
 #[derive(Debug)]
 struct Entry {
-    /// Provisional and active tokens holding the address, in admission order.
+    /// Tokens that receive the address's notifications, in admission order.
     owners: Vec<TokenId>,
+    /// How many of them started activating: they keep the registration.
+    holders: usize,
     registration: Registration,
 }
 
@@ -124,6 +131,7 @@ impl Ledger {
                 .entry(*address)
                 .or_insert(Entry {
                     owners: Vec::new(),
+                    holders: 0,
                     registration: Registration::NotRegistered,
                 })
                 .owners
@@ -140,20 +148,31 @@ impl Ledger {
         Ok(id)
     }
 
-    /// The addresses `token` needs registered: those of its addresses that no
-    /// registration covers yet, in the token's order. Addresses already
-    /// registered for another owner, or possibly registered, are not sent
-    /// again.
-    pub fn to_register(&self, token: TokenId) -> Vec<SubscriptionAddress> {
-        let Some(token) = self.tokens.get(&token) else {
+    /// Starts `token`'s activation and returns the addresses it needs
+    /// registered: those of its addresses no registration covers yet, in the
+    /// token's order. Addresses registered or possibly registered for another
+    /// activating or active token are not sent again. Only a provisional token
+    /// starts; any other returns nothing.
+    pub fn start(&mut self, token: TokenId) -> Vec<SubscriptionAddress> {
+        let Some(token) = self.tokens.get_mut(&token) else {
             return Vec::new();
         };
-        token
-            .addresses
-            .iter()
-            .copied()
-            .filter(|address| self.entries[address].registration == Registration::NotRegistered)
-            .collect()
+        if token.state != TokenState::Provisional {
+            return Vec::new();
+        }
+        token.state = TokenState::Registering;
+        let mut needed = Vec::new();
+        for address in &token.addresses {
+            let entry = self
+                .entries
+                .get_mut(address)
+                .expect("an owned address has an entry");
+            entry.holders += 1;
+            if entry.registration == Registration::NotRegistered {
+                needed.push(*address);
+            }
+        }
+        needed
     }
 
     /// Records the verdict of a registration sent for `address`.
@@ -167,17 +186,19 @@ impl Ledger {
         }
     }
 
-    /// Marks `token` active once all its registrations were accepted.
+    /// Marks an activating `token` active once all its registrations were
+    /// accepted.
     pub fn activate(&mut self, token: TokenId) {
         if let Some(token) = self.tokens.get_mut(&token) {
-            if token.state == TokenState::Provisional {
+            if token.state == TokenState::Registering {
                 token.state = TokenState::Active;
             }
         }
     }
 
     /// Ends `token`'s ownership and returns the addresses to unregister: those
-    /// it was the last owner of that are registered or possibly registered.
+    /// it was the last activating or active holder of that are registered or
+    /// possibly registered. A token that never started returns nothing.
     /// The token stays counted against the limits until [`Ledger::finish`].
     /// Used both for a release and for the cleanup of a failed or cancelled
     /// acquisition. A token already releasing, or unknown, returns nothing.
@@ -189,6 +210,7 @@ impl Ledger {
         if token.state == TokenState::Releasing {
             return Vec::new();
         }
+        let held = token.state != TokenState::Provisional;
         token.state = TokenState::Releasing;
         let mut unregister = Vec::new();
         for address in &token.addresses {
@@ -197,13 +219,15 @@ impl Ledger {
                 .get_mut(address)
                 .expect("an owned address has an entry");
             entry.owners.retain(|owner| *owner != id);
-            if entry.owners.is_empty() {
-                match entry.registration {
-                    Registration::NotRegistered => {
-                        self.entries.remove(address);
-                    }
-                    Registration::Registered | Registration::Unknown => unregister.push(*address),
+            if held {
+                entry.holders -= 1;
+                if entry.holders == 0 && entry.registration != Registration::NotRegistered {
+                    unregister.push(*address);
+                    continue;
                 }
+            }
+            if entry.owners.is_empty() && entry.registration == Registration::NotRegistered {
+                self.entries.remove(address);
             }
         }
         unregister
@@ -219,7 +243,7 @@ impl Ledger {
         match verdict {
             Verdict::Accepted => {
                 entry.registration = Registration::NotRegistered;
-                if entry.owners.is_empty() {
+                if entry.owners.is_empty() && entry.holders == 0 {
                     self.entries.remove(&address);
                 }
             }
@@ -235,9 +259,8 @@ impl Ledger {
         }
     }
 
-    /// The provisional and active tokens holding `address`, in admission
-    /// order: the recipients of a notification for it. Releasing tokens are
-    /// not recipients.
+    /// The tokens holding `address` that are not releasing, in admission
+    /// order: the recipients of a notification for it.
     pub fn recipients(&self, address: SubscriptionAddress) -> &[TokenId] {
         self.entries
             .get(&address)

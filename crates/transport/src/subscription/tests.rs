@@ -19,7 +19,7 @@ fn m(meter_id: u32) -> SubscriptionAddress {
 /// Admits `addresses` and accepts every registration the token needs.
 fn active(ledger: &mut Ledger, addresses: &[SubscriptionAddress]) -> super::TokenId {
     let token = ledger.admit(addresses).unwrap();
-    for address in ledger.to_register(token) {
+    for address in ledger.start(token) {
         ledger.registered(address, Verdict::Accepted);
     }
     ledger.activate(token);
@@ -40,18 +40,14 @@ fn release(ledger: &mut Ledger, token: super::TokenId) -> Vec<SubscriptionAddres
 fn a_shared_address_is_registered_once_and_unregistered_after_its_last_owner() {
     let mut ledger = Ledger::new();
     let a = ledger.admit(&[p(1), p(2)]).unwrap();
-    assert_eq!(ledger.to_register(a), [p(1), p(2)]);
+    assert_eq!(ledger.start(a), [p(1), p(2)]);
     ledger.registered(p(1), Verdict::Accepted);
     ledger.registered(p(2), Verdict::Accepted);
     ledger.activate(a);
     assert!(ledger.is_active(a));
 
     let b = ledger.admit(&[p(2), p(3)]).unwrap();
-    assert_eq!(
-        ledger.to_register(b),
-        [p(3)],
-        "p2 is already registered for a"
-    );
+    assert_eq!(ledger.start(b), [p(3)], "p2 is already registered for a");
     ledger.registered(p(3), Verdict::Accepted);
     ledger.activate(b);
 
@@ -77,11 +73,7 @@ fn a_failed_replacement_keeps_the_old_set_and_releases_only_its_own_additions() 
     let mut ledger = Ledger::new();
     let old = active(&mut ledger, &[pp, q]);
     let new = ledger.admit(&[q, r, s]).unwrap();
-    assert_eq!(
-        ledger.to_register(new),
-        [r, s],
-        "q is never registered again"
-    );
+    assert_eq!(ledger.start(new), [r, s], "q is never registered again");
     ledger.registered(r, Verdict::Accepted);
     ledger.registered(s, Verdict::Rejected);
     assert_eq!(
@@ -101,12 +93,13 @@ fn a_failed_replacement_keeps_the_old_set_and_releases_only_its_own_additions() 
 fn a_registration_with_an_unknown_result_is_cleaned_up_as_possibly_registered() {
     let mut ledger = Ledger::new();
     let token = ledger.admit(&[p(1), p(2)]).unwrap();
+    assert_eq!(ledger.start(token), [p(1), p(2)]);
     ledger.registered(p(1), Verdict::Unknown);
     assert_eq!(ledger.begin_release(token), [p(1)], "p2 was never sent");
     // A token admitted meanwhile does not register an address that may still
     // be registered.
     let other = ledger.admit(&[p(1)]).unwrap();
-    assert_eq!(ledger.to_register(other), []);
+    assert_eq!(ledger.start(other), []);
 }
 
 #[test]
@@ -118,7 +111,7 @@ fn an_address_taken_by_a_new_owner_during_its_unregistration_is_registered_again
     let new = ledger.admit(&[p(1)]).unwrap();
     ledger.unregistered(p(1), Verdict::Accepted);
     ledger.finish(old);
-    assert_eq!(ledger.to_register(new), [p(1)]);
+    assert_eq!(ledger.start(new), [p(1)]);
     assert_eq!(ledger.recipients(p(1)), [new]);
 }
 
@@ -127,7 +120,7 @@ fn an_unchanged_replacement_needs_no_traffic() {
     let mut ledger = Ledger::new();
     let old = active(&mut ledger, &[p(1), m(1)]);
     let new = ledger.admit(&[m(1), p(1)]).unwrap();
-    assert_eq!(ledger.to_register(new), []);
+    assert_eq!(ledger.start(new), []);
     ledger.activate(new);
     assert_eq!(release(&mut ledger, old), []);
 }
@@ -136,14 +129,14 @@ fn an_unchanged_replacement_needs_no_traffic() {
 fn a_parameter_and_a_meter_with_the_same_numbers_are_different_addresses() {
     let mut ledger = Ledger::new();
     let token = ledger.admit(&[p(5), m(5)]).unwrap();
-    assert_eq!(ledger.to_register(token), [p(5), m(5)]);
+    assert_eq!(ledger.start(token), [p(5), m(5)]);
 }
 
 #[test]
 fn duplicates_are_owned_once_but_count_against_the_input_limit() {
     let mut ledger = Ledger::new();
     let token = ledger.admit(&[p(1), p(1), p(2), p(1)]).unwrap();
-    assert_eq!(ledger.to_register(token), [p(1), p(2)]);
+    assert_eq!(ledger.start(token), [p(1), p(2)]);
     assert_eq!(ledger.membership_count(), 2);
     assert_eq!(
         ledger.admit(&vec![p(1); MAX_ADDRESSES_PER_ACQUISITION + 1]),
@@ -255,4 +248,60 @@ fn repeated_or_unknown_releases_send_nothing_and_identities_are_not_reused() {
         "an old identity cannot release new ownership"
     );
     assert_eq!(ledger.recipients(p(1)), [b]);
+}
+
+#[test]
+fn a_token_that_never_started_neither_keeps_nor_inherits_a_registration() {
+    for meter in [false, true] {
+        let address = if meter { m(1) } else { p(1) };
+        let mut ledger = Ledger::new();
+        let first = active(&mut ledger, &[address]);
+        let waiting = ledger.admit(&[address]).unwrap();
+        // The last activating holder leaves: it unregisters, though a
+        // provisional token still receives the address.
+        assert_eq!(release(&mut ledger, first), [address]);
+        assert_eq!(ledger.recipients(address), [waiting]);
+        // Releasing the token that never started sends nothing.
+        assert_eq!(ledger.begin_release(waiting), []);
+        ledger.finish(waiting);
+        assert_eq!(ledger.token_count(), 0);
+
+        // Started later instead, it registers the address itself.
+        let first = active(&mut ledger, &[address]);
+        let waiting = ledger.admit(&[address]).unwrap();
+        assert_eq!(release(&mut ledger, first), [address]);
+        assert_eq!(ledger.start(waiting), [address]);
+    }
+}
+
+#[test]
+fn a_failed_acquisition_cleans_up_what_it_registered_even_with_a_provisional_owner() {
+    for verdict in [Verdict::Accepted, Verdict::Unknown] {
+        let mut ledger = Ledger::new();
+        let failing = ledger.admit(&[p(1), p(2)]).unwrap();
+        let waiting = ledger.admit(&[p(1)]).unwrap();
+        assert_eq!(ledger.start(failing), [p(1), p(2)]);
+        ledger.registered(p(1), verdict);
+        ledger.registered(p(2), Verdict::Rejected);
+        assert_eq!(ledger.begin_release(failing), [p(1)], "{verdict:?}");
+        ledger.unregistered(p(1), Verdict::Accepted);
+        ledger.finish(failing);
+        assert_eq!(ledger.start(waiting), [p(1)], "it registers on its own");
+        ledger.registered(p(1), Verdict::Accepted);
+        ledger.activate(waiting);
+        assert!(ledger.is_active(waiting));
+    }
+}
+
+#[test]
+fn only_an_activating_token_becomes_active() {
+    let mut ledger = Ledger::new();
+    let token = ledger.admit(&[p(1)]).unwrap();
+    ledger.activate(token);
+    assert!(!ledger.is_active(token), "not started");
+    ledger.start(token);
+    assert_eq!(ledger.start(token), [], "starting twice sends nothing more");
+    ledger.registered(p(1), Verdict::Accepted);
+    ledger.activate(token);
+    assert!(ledger.is_active(token));
 }
