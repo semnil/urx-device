@@ -374,6 +374,10 @@ impl Connection {
         options: &ConnectionOptions,
         notifications: Option<NotificationHandler>,
     ) -> std::io::Result<Connection> {
+        // Every fallible step comes before any thread starts, so a failure
+        // leaves nothing running.
+        let reader_sock = sock.try_clone()?;
+        let worker_sock = sock.try_clone()?;
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         let (expired, expiring) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -400,14 +404,14 @@ impl Connection {
         };
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_thread = {
-            let sock = sock.try_clone()?;
+            let sock = reader_sock;
             let events = events.clone();
             let stop = Arc::clone(&reader_stop);
             let shared = Arc::clone(&shared);
             thread::spawn(move || read_frames(sock, reader, events, stop, shared))
         };
         let worker_thread = {
-            let sock = sock.try_clone()?;
+            let sock = worker_sock;
             let shared = Arc::clone(&shared);
             let options = *options;
             thread::spawn(move || serve(sock, inbox, shared, options))
@@ -1124,7 +1128,7 @@ fn serve(
     loop {
         let reported = *shared.link_end();
         if let Some(cause) = reported {
-            finish(&mut sock, mark_ended(&shared, cause));
+            finish(&mut sock, &shared, mark_ended(&shared, cause));
             return;
         }
         let job = {
@@ -1144,7 +1148,7 @@ fn serve(
                 deliver_lifecycle(done, outcome);
             }
             if let Some(ended) = ended {
-                finish(&mut sock, ended);
+                finish(&mut sock, &shared, ended);
                 return;
             }
             continue;
@@ -1199,7 +1203,7 @@ fn serve(
                     }
                 }
                 if let Some(ended) = waiting {
-                    finish(&mut sock, ended);
+                    finish(&mut sock, &shared, ended);
                     return;
                 }
                 if holds {
@@ -1225,7 +1229,7 @@ fn serve(
             },
         };
         if let Some(cause) = fatal {
-            finish(&mut sock, mark_ended(&shared, cause));
+            finish(&mut sock, &shared, mark_ended(&shared, cause));
             return;
         }
     }
@@ -1331,9 +1335,12 @@ impl Taken {
 }
 
 /// Closes the socket and completes what the end took with its cause.
-fn finish(sock: &mut TcpStream, ended: Ended) {
+fn finish(sock: &mut TcpStream, shared: &Shared, ended: Ended) {
     let _ = sock.shutdown(Shutdown::Both);
     ended.taken.complete(ended.cause);
+    // No hold follows: the expiry thread ends once it has completed what
+    // was sent to it.
+    let _ = lock(&shared.expired).send(None);
 }
 
 /// The outcomes a lifecycle job settled, to deliver once the end (if any) is
