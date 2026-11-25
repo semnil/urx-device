@@ -1019,7 +1019,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             link_end: std::sync::Mutex::new(None),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
-            expiries: std::sync::Mutex::new(Vec::new()),
+            expired: std::sync::Mutex::new(std::sync::mpsc::channel().0),
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
@@ -1364,11 +1364,7 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
     }
     let past = Instant::now() - Duration::from_millis(1);
     assert_eq!(
-        super::wait_for(
-            [Some(finished), None, None, None],
-            &scripted(None).shared,
-            past
-        ),
+        super::wait_for([Some(finished), None, None, None], past),
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
             phase: Phase::Teardown
@@ -1378,7 +1374,6 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
     assert_eq!(
         super::wait_for(
             [Some(done), None, None, None],
-            &scripted(None).shared,
             Instant::now() + Duration::from_secs(1)
         ),
         CloseOutcome::Closed
@@ -1405,7 +1400,6 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
     assert_eq!(
         super::wait_for(
             [Some(stuck), None, None, None],
-            &scripted(None).shared,
             Instant::now() + Duration::from_millis(100)
         ),
         CloseOutcome::Incomplete(Failure::Cause {
@@ -1946,6 +1940,7 @@ fn a_write_whose_operation_was_cancelled_before_its_first_byte_is_not_started() 
 
 mod notifications {
     use super::{firmware, online, options, ID, TEARDOWN};
+    use crate::connection::MAX_WAITING_REQUESTS;
     use crate::connection::{open_with, CloseOutcome, Connection, NotificationHandler};
     use crate::delivery::{NotificationBatch, MAX_PENDING_NOTIFICATIONS};
     use crate::lifecycle::{Cause, Control, Failure, Phase};
@@ -3016,5 +3011,101 @@ mod notifications {
         assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
         release.send(()).unwrap();
         assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    /// Holds a GET for its cutoff, then submits one whose expiry callback
+    /// blocks until the returned sender is used.
+    fn blocked_expiry(
+        connection: &Arc<Connection>,
+        push: &Sender<Vec<u8>>,
+        batches: &Receiver<NotificationBatch>,
+        on_release: impl FnOnce() + Send + 'static,
+    ) -> Sender<()> {
+        let _token = activate(connection, &[p(1)]);
+        std::mem::forget(_token);
+        let operation = connection.create_operation().unwrap();
+        let _held = submit_held(connection, &operation, 5);
+        std::mem::forget(_held);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(batches);
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        connection.submit(&other, Request::GetNumeric(param(6)), move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = blocked.recv();
+            on_release();
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        release
+    }
+
+    #[test]
+    fn an_expiry_callback_joining_a_running_close_does_not_wait_for_itself() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let (tx, inner) = mpsc::channel();
+        let joining = Arc::clone(&connection);
+        let release = blocked_expiry(&connection, &push, &batches, move || {
+            let _ = tx.send(joining.close(TEARDOWN));
+        });
+        let closer = {
+            let connection = Arc::clone(&connection);
+            thread::spawn(move || connection.close(TEARDOWN))
+        };
+        super::wait_until(|| connection.shared.lock().closing);
+        release.send(()).unwrap();
+        assert_eq!(
+            inner.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn expired_requests_stay_charged_until_completed() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let release = blocked_expiry(&connection, &push, &batches, || {});
+        let operation = connection.create_operation().unwrap();
+        let (tx, completed) = mpsc::channel();
+        for id in 0..(MAX_WAITING_REQUESTS - 1) as u32 {
+            let tx = tx.clone();
+            connection.submit(
+                &operation,
+                Request::GetNumeric(param(100 + id)),
+                move |outcome, _| {
+                    let _ = tx.send(outcome);
+                },
+            );
+        }
+        super::wait_until(|| connection.shared.lock().expiring == MAX_WAITING_REQUESTS);
+        let (refused_tx, refused) = mpsc::channel();
+        connection.submit(
+            &operation,
+            Request::GetNumeric(param(99)),
+            move |outcome, _| {
+                let _ = refused_tx.send(outcome);
+            },
+        );
+        assert_eq!(
+            refused.recv_timeout(Duration::from_secs(1)).unwrap(),
+            unsent_with(RequestCause::PreconditionFailed),
+            "the expired ones still count against the queue"
+        );
+        release.send(()).unwrap();
+        for _ in 0..MAX_WAITING_REQUESTS - 1 {
+            assert_eq!(
+                completed.recv_timeout(Duration::from_secs(2)).unwrap(),
+                unsent_with(RequestCause::SendTimeout)
+            );
+        }
+        assert!(
+            completed.recv_timeout(Duration::from_millis(100)).is_err(),
+            "once each"
+        );
+        super::wait_until(|| connection.shared.lock().expiring == 0);
     }
 }
