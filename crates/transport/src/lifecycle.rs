@@ -23,6 +23,8 @@ pub enum Cause {
     ResponseTimeout,
     /// A response was malformed, undecodable or larger than a frame may be.
     InvalidResponse,
+    /// Closing did not finish within its teardown budget.
+    TeardownTimeout,
     /// Identity was missing or ambiguous after otherwise successful queries.
     IdentityError,
     /// An unexpected internal failure.

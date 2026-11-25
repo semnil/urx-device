@@ -27,8 +27,8 @@ use std::net::{Shutdown, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 /// Waiting requests, excluding the active one (K6).
@@ -107,7 +107,8 @@ enum Event {
     ReadFailed(RequestCause),
 }
 
-/// An open connection to one unit.
+/// An open connection to one unit. It is shared by reference: closing takes
+/// `&self`, and every call to [`Connection::close`] joins the same close.
 pub struct Connection {
     generation: u64,
     firmware: SystemFirmware,
@@ -115,8 +116,46 @@ pub struct Connection {
     events: Sender<Event>,
     sock: TcpStream,
     reader_stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-    reader: Option<JoinHandle<()>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    /// Kept apart from the handle, which a close takes.
+    worker_id: ThreadId,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    close: Arc<CloseCell>,
+}
+
+/// The one close of a connection, shared with the helper that finishes a
+/// close started from a completion callback.
+struct CloseCell {
+    state: Mutex<CloseState>,
+    done: Condvar,
+}
+
+impl CloseCell {
+    fn record(&self, outcome: CloseOutcome) {
+        *lock(&self.state) = CloseState::Done(outcome);
+        self.done.notify_all();
+    }
+}
+
+/// How a close ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// Both threads finished and the socket is closed.
+    Closed,
+    /// Called from a completion callback, which runs on the worker: closing
+    /// has started and finishes once the callback returns. Callers on other
+    /// threads wait for and receive the final outcome.
+    Started,
+    /// The reader did not finish within the teardown budget. The connection
+    /// is unusable; its socket is shut down and its threads are left to end.
+    Incomplete(Failure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseState {
+    Open,
+    Closing,
+    Done(CloseOutcome),
 }
 
 /// The owner of one logical operation's requests. Cancelling it completes
@@ -210,8 +249,13 @@ impl Connection {
             events,
             sock,
             reader_stop,
-            worker: Some(worker_thread),
-            reader: Some(reader_thread),
+            worker_id: worker_thread.thread().id(),
+            worker: Mutex::new(Some(worker_thread)),
+            reader: Mutex::new(Some(reader_thread)),
+            close: Arc::new(CloseCell {
+                state: Mutex::new(CloseState::Open),
+                done: Condvar::new(),
+            }),
         })
     }
 
@@ -300,13 +344,34 @@ impl Connection {
     }
 
     /// Refuses new work, completes waiting requests unsent as
-    /// `not_connected`, lets the active request settle, then stops both
-    /// threads and closes the socket.
-    pub fn close(mut self) {
-        self.shut();
-    }
-
-    fn shut(&mut self) {
+    /// `not_connected`, waits for the active request to settle under its own
+    /// deadlines, then stops the reader and closes the socket within
+    /// `teardown`. Repeated and concurrent calls share the first call's close
+    /// and return its outcome; none starts a second shutdown or sends
+    /// anything.
+    pub fn close(&self, teardown: Duration) -> CloseOutcome {
+        {
+            let mut close = lock(&self.close.state);
+            loop {
+                match *close {
+                    CloseState::Open => {
+                        *close = CloseState::Closing;
+                        break;
+                    }
+                    CloseState::Done(outcome) => return outcome,
+                    CloseState::Closing => {
+                        if self.on_worker() {
+                            return CloseOutcome::Started;
+                        }
+                        close = self
+                            .close
+                            .done
+                            .wait(close)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+            }
+        }
         let waiting = {
             let mut state = self.shared.lock();
             state.closing = true;
@@ -324,28 +389,91 @@ impl Connection {
             );
         }
         let _ = self.events.send(Event::Wake);
-        if let Some(worker) = self.worker.take() {
-            // Closing from a completion callback runs on the worker itself,
-            // which cannot wait for its own end: it stops on its own once
-            // the callback returns and it finds the connection closing.
-            if worker.thread().id() != thread::current().id() {
-                let _ = worker.join();
-            }
+        if self.on_worker() {
+            // A completion callback cannot wait for the worker it runs on.
+            // The worker stops once the callback returns and it finds the
+            // connection closing; a helper finishes the close from there.
+            let worker = lock(&self.worker).take();
+            let reader = lock(&self.reader).take();
+            let (sock, stop) = (self.sock.try_clone(), Arc::clone(&self.reader_stop));
+            let finish = Finish {
+                worker,
+                reader,
+                sock,
+                stop,
+                teardown,
+            };
+            let cell = Arc::clone(&self.close);
+            thread::spawn(move || cell.record(finish.run()));
+            return CloseOutcome::Started;
         }
-        self.reader_stop.store(true, Ordering::SeqCst);
-        let _ = self.sock.shutdown(Shutdown::Both);
-        if let Some(reader) = self.reader.take() {
+        let finish = Finish {
+            worker: lock(&self.worker).take(),
+            reader: lock(&self.reader).take(),
+            sock: self.sock.try_clone(),
+            stop: Arc::clone(&self.reader_stop),
+            teardown,
+        };
+        let outcome = finish.run();
+        self.close.record(outcome);
+        outcome
+    }
+
+    fn on_worker(&self) -> bool {
+        self.worker_id == thread::current().id()
+    }
+}
+
+/// The part of a close after the waiting requests are completed.
+struct Finish {
+    worker: Option<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
+    sock: std::io::Result<TcpStream>,
+    stop: Arc<AtomicBool>,
+    teardown: Duration,
+}
+
+impl Finish {
+    fn run(self) -> CloseOutcome {
+        if let Some(worker) = self.worker {
+            let _ = worker.join();
+        }
+        let end = Instant::now() + self.teardown;
+        self.stop.store(true, Ordering::SeqCst);
+        if let Ok(sock) = &self.sock {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+        if let Some(reader) = self.reader {
+            while !reader.is_finished() {
+                if Instant::now() >= end {
+                    return CloseOutcome::Incomplete(Failure::cause(
+                        Cause::TeardownTimeout,
+                        Phase::Teardown,
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
             let _ = reader.join();
+        }
+        CloseOutcome::Closed
+    }
+}
+
+/// Teardown budget a dropped connection uses when it was never closed.
+const DROP_TEARDOWN: Duration = Duration::from_secs(2);
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if matches!(*lock(&self.close.state), CloseState::Open) {
+            self.close(DROP_TEARDOWN);
         }
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        if self.worker.is_some() || self.reader.is_some() {
-            self.shut();
-        }
-    }
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Operation {
