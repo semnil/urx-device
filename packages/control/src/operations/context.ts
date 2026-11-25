@@ -114,7 +114,7 @@ export class OperationContext {
     // when the report itself fails, the connection's end takes the slot.
     const reportUndelivered = async () => {
       if (!(await settle(() => this.transport.failDelivery(requestTicket)))) {
-        await settle(() => this.transport.terminate());
+        await settle(() => this.transport.terminate(requestTicket));
       }
     };
     const undelivered = async () => {

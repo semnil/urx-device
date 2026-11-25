@@ -63,11 +63,13 @@ export interface Transport {
    */
   failDelivery(requestTicket: RequestTicket): Promise<void>;
   /**
-   * Ends the connection under the adapter's fatal rules, when a request's
-   * slot could not be handed over otherwise. It settles once the end has
-   * taken every slot; it never needs another fallback.
+   * Ends the connection under the adapter's fatal rules if, and only if,
+   * `requestTicket` still owns a slot not yet released: its failed delivery
+   * could not be handed over otherwise. The ownership check and the move to
+   * the end are one step. It settles once the end has taken the slot (or
+   * there was none); it never needs another fallback.
    */
-  terminate(): Promise<void>;
+  terminate(requestTicket: RequestTicket): Promise<void>;
 }
 
 /** The records the methods resolve with, once validated. */
