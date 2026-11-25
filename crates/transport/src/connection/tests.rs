@@ -1007,6 +1007,11 @@ impl super::Outgoing for Scripted {
     }
 }
 
+/// The stop rule ordinary requests use, without an operation to cancel.
+fn closing_only(state: &super::State) -> Option<super::Stop> {
+    state.closing.then_some(super::Stop::Closing)
+}
+
 fn scripted(end_before_write: Option<usize>) -> Scripted {
     Scripted {
         shared: Arc::new(super::Shared {
@@ -1030,8 +1035,11 @@ fn a_write_never_starts_after_the_reader_records_the_end() {
     let mut sock = scripted(Some(0));
     let shared = Arc::clone(&sock.shared);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline),
-        Err((RequestCause::ConnectionLost, 0))
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        Err(super::WriteError::Failed {
+            cause: RequestCause::ConnectionLost,
+            written: 0
+        })
     );
     assert!(sock.written.is_empty());
 
@@ -1040,8 +1048,11 @@ fn a_write_never_starts_after_the_reader_records_the_end() {
     let mut sock = scripted(Some(1));
     let shared = Arc::clone(&sock.shared);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline),
-        Err((RequestCause::ConnectionLost, 8))
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        Err(super::WriteError::Failed {
+            cause: RequestCause::ConnectionLost,
+            written: 8
+        })
     );
     assert_eq!(sock.written.len(), 8);
 
@@ -1050,7 +1061,7 @@ fn a_write_never_starts_after_the_reader_records_the_end() {
     let mut sock = scripted(None);
     let shared = Arc::clone(&sock.shared);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline),
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
         Ok(())
     );
     assert_eq!(sock.written, frame);
@@ -1172,8 +1183,8 @@ fn a_write_not_yet_started_when_closing_begins_is_never_sent() {
     let shared = Arc::clone(&sock.shared);
     shared.lock().closing = true;
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline),
-        Err((RequestCause::NotConnected, 0))
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        Err(super::WriteError::Stopped(super::Stop::Closing))
     );
     assert!(sock.written.is_empty());
 
@@ -1193,7 +1204,7 @@ fn a_write_not_yet_started_when_closing_begins_is_never_sent() {
     }
     let mut sock = CloseAfterFirst(std::mem::replace(&mut sock, scripted(None)));
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline),
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
         Ok(())
     );
     assert_eq!(sock.0.written, frame);
@@ -1724,4 +1735,82 @@ mod lifecycle {
         ));
         assert_eq!(posts(&peer), [reg(1)]);
     }
+
+    #[test]
+    fn a_release_asked_during_a_successful_activation_still_unregisters() {
+        let peer = unit(Duration::from_millis(150), |_| Some(200));
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        let activated = activate(&connection, &token);
+        super::wait_until(|| posts(&peer).len() == 1);
+        let released = release(&token);
+        assert_eq!(
+            settled(&activated),
+            Ok(()),
+            "its only registration was already sent"
+        );
+        assert_eq!(settled(&released), Ok(()));
+        assert_eq!(posts(&peer), [reg(1), unreg(1)]);
+        assert_eq!(
+            settled(&activate(&connection, &token)),
+            failed(Cause::PreconditionFailed, Cleanup::COMPLETE),
+            "the released token cannot be activated again"
+        );
+    }
+
+    #[test]
+    fn callers_of_one_release_all_get_its_result_even_across_a_close() {
+        for code in [200, 400] {
+            let peer = unit(Duration::from_millis(150), move |uri| {
+                Some(if uri.contains("unregist") { code } else { 200 })
+            });
+            let connection = connect(&peer);
+            let token = connection.prepare_subscription(&[p(1)]).unwrap();
+            assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+            let first = release(&token);
+            super::wait_until(|| posts(&peer).len() == 2);
+            let second = release(&token);
+            if code == 200 {
+                assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+            }
+            let (a, b) = (settled(&first), settled(&second));
+            assert_eq!(a, b, "code {code}");
+            if code == 200 {
+                assert_eq!(a, Ok(()));
+            } else {
+                assert_eq!(
+                    a,
+                    failed(Cause::DeviceRejected, closed_by(Cause::DeviceRejected))
+                );
+            }
+            assert_eq!(posts(&peer), [reg(1), unreg(1)]);
+        }
+    }
+
+    #[test]
+    fn a_token_released_before_its_activation_runs_is_not_activated() {
+        let peer = accepting();
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&release(&token)), Ok(()));
+        assert_eq!(
+            settled(&activate(&connection, &token)),
+            failed(Cause::PreconditionFailed, Cleanup::COMPLETE)
+        );
+        assert!(posts(&peer).is_empty());
+    }
+}
+
+#[test]
+fn a_write_whose_operation_was_cancelled_before_its_first_byte_is_not_started() {
+    let frame = vec![b'x'; 30];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut sock = scripted(None);
+    let shared = Arc::clone(&sock.shared);
+    let cancelled = |_: &super::State| Some(super::Stop::Cancelled);
+    assert_eq!(
+        super::write_frame(&mut sock, &shared, &frame, deadline, &cancelled),
+        Err(super::WriteError::Stopped(super::Stop::Cancelled))
+    );
+    assert!(sock.written.is_empty());
 }

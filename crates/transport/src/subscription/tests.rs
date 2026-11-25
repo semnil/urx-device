@@ -319,9 +319,9 @@ fn only_an_activating_token_becomes_active() {
     assert!(!ledger.is_active(token), "not started");
     ledger.start_ok(token);
     assert_eq!(
-        ledger.start_ok(token),
-        [],
-        "starting twice sends nothing more"
+        ledger.start(token),
+        Err(StartRefusal::Gone),
+        "already activating"
     );
     ledger.registered(p(1), Verdict::Accepted);
     ledger.activate(token);
@@ -382,4 +382,20 @@ fn a_failed_or_unanswered_unregistration_refuses_every_later_activation() {
             assert!(!ledger.is_active(token));
         }
     }
+}
+
+#[test]
+fn only_a_retained_token_starts_and_an_active_one_needs_nothing() {
+    let mut ledger = Ledger::new();
+    let token = active(&mut ledger, &[p(1)]);
+    assert_eq!(ledger.start(token), Ok(vec![]), "already active");
+    assert_eq!(release(&mut ledger, token), [p(1)]);
+    assert_eq!(ledger.start(token), Err(StartRefusal::Gone), "released");
+    let releasing = active(&mut ledger, &[p(2)]);
+    let _ = ledger.begin_release(releasing);
+    assert_eq!(
+        ledger.start(releasing),
+        Err(StartRefusal::Busy),
+        "a release is unfinished"
+    );
 }
