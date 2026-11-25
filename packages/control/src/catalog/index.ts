@@ -35,6 +35,7 @@ export { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, OUTPUT_TOKENS, STREAM_DE
 export { OSCILLATOR_RULES } from "./oscillator.js";
 export { DEVICE_RULES } from "./device.js";
 export { INTEGRATION_RULES, KNOB_RULES } from "./integration-panel.js";
+export { SCENE_RECORDER_RULES } from "./scene-recorder.js";
 export {
   LEVEL_TAPS,
   METER_BUSES,
@@ -77,6 +78,7 @@ export type {
   NumericSetRule,
   FlagRule,
   KnobAssignmentRule,
+  TrackSettingRule,
   WritePrerequisite,
   BusSideAddress,
   BusSideSettingRule,
@@ -144,6 +146,8 @@ export type {
   KnobAssignmentReading,
   KnobTarget,
   SendsTarget,
+  RecorderState,
+  TrackTarget,
   DeviceLanguage,
   HdmiInputChannels,
   TimeFormat,

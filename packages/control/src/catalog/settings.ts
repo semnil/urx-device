@@ -15,6 +15,7 @@ import { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES, type
 import { OSCILLATOR_RULES } from "./oscillator.js";
 import { DEVICE_RULES } from "./device.js";
 import { INTEGRATION_RULES, KNOB_RULES } from "./integration-panel.js";
+import { SCENE_RECORDER_RULES } from "./scene-recorder.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -177,6 +178,12 @@ export const settingDefinitions = frozen({
   "integration.active": { readable: true, writable: false, rule: INTEGRATION_RULES["integration.active"] },
   "integration.post-fader-source": { readable: true, writable: true, rule: INTEGRATION_RULES["integration.post-fader-source"] },
   "panel.sends-target": { readable: true, writable: true, rule: INTEGRATION_RULES["panel.sends-target"] },
+  "scene.current": { readable: true, writable: false, rule: SCENE_RECORDER_RULES["scene.current"] },
+  "scene.cursor": { readable: true, writable: false, rule: SCENE_RECORDER_RULES["scene.cursor"] },
+  "recorder.state": { readable: true, writable: false, rule: SCENE_RECORDER_RULES["recorder.state"] },
+  "recorder.card-present": { readable: true, writable: false, rule: SCENE_RECORDER_RULES["recorder.card-present"] },
+  "recorder.track-count": { readable: true, writable: false, rule: SCENE_RECORDER_RULES["recorder.track-count"] },
+  "recorder.source": { readable: true, writable: true, rule: SCENE_RECORDER_RULES["recorder.source"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -277,6 +284,15 @@ export interface KnobAssignmentReading {
   readonly parameter1: KnobComponentReading;
   readonly parameter2: KnobComponentReading;
 }
+
+/** A recorder track 1…16 (F16-R). */
+export interface TrackTarget {
+  readonly track: number;
+  readonly band?: never;
+}
+
+/** The recorder transport state (F16-R). */
+export type RecorderState = "stopped" | "playing" | "playback-paused" | "recording" | "record-standby" | "recording-paused";
 
 /** The panel SEND display target (F13-S). */
 export type SendsTarget = "stereo" | "fx-1" | "fx-2" | "mix-1" | "mix-2";
@@ -534,6 +550,12 @@ export interface SettingTypes {
   "integration.active": { target: DeviceTarget; value: boolean };
   "integration.post-fader-source": { target: BusTarget; value: "mix-1" | "mix-2" };
   "panel.sends-target": { target: DeviceTarget; value: SendsTarget };
+  "scene.current": { target: DeviceTarget; value: string };
+  "scene.cursor": { target: DeviceTarget; value: string };
+  "recorder.state": { target: DeviceTarget; value: RecorderState };
+  "recorder.card-present": { target: DeviceTarget; value: boolean };
+  "recorder.track-count": { target: DeviceTarget; value: number };
+  "recorder.source": { target: TrackTarget; value: string };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.
