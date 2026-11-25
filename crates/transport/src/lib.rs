@@ -13,6 +13,7 @@ pub mod i64_text;
 pub mod lifecycle;
 mod link;
 pub mod request;
+pub mod subscription;
 #[cfg(test)]
 mod test_peer;
 pub mod wire;
