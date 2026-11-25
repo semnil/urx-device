@@ -1863,15 +1863,31 @@ mod lifecycle {
         let other = Arc::new(connection.prepare_subscription(&[p(2)]).unwrap());
         let operation = Arc::new(connection.create_operation().unwrap());
         assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        let (locks_tx, locks) = mpsc::channel();
         let (tx, finished) = mpsc::channel();
         let (again, then) = (Arc::clone(&token), Arc::clone(&other));
         let (op, conn) = (Arc::clone(&operation), Arc::clone(&connection));
-        token.release(move |_| {
-            again.release(|_| {});
-            then.release(|_| {});
-            op.cancel();
-            let _ = tx.send(conn.close(TEARDOWN));
+        // On its own thread, so a callback that blocks fails this test on
+        // the timeouts below instead of holding it up.
+        let releasing = Arc::clone(&token);
+        thread::spawn(move || {
+            releasing.release(move |_| {
+                let free = (
+                    conn.shared.link_end.try_lock().is_ok(),
+                    conn.shared.state.try_lock().is_ok(),
+                );
+                let _ = locks_tx.send(free);
+                again.release(|_| {});
+                then.release(|_| {});
+                op.cancel();
+                let _ = tx.send(conn.close(TEARDOWN));
+            });
         });
+        assert_eq!(
+            locks.recv_timeout(Duration::from_secs(5)),
+            Ok((true, true)),
+            "(send gate, state) are free in the callback"
+        );
         assert_eq!(
             finished.recv_timeout(Duration::from_secs(5)),
             Ok(CloseOutcome::Closed)
