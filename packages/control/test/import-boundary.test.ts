@@ -1,60 +1,110 @@
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { boundaryViolations, importSpecifiers, readSources } from "./import-boundary.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { boundaryViolations, programFiles } from "./import-boundary.js";
 
-const srcDir = fileURLToPath(new URL("../src", import.meta.url));
+const packageDir = fileURLToPath(new URL("..", import.meta.url));
+const temporary: string[] = [];
+
+// A package directory with this package's two tsconfig files, the two empty
+// entry points and the given extra files (path relative to the package).
+function fixture(files: Record<string, string>): string {
+  // Inside the package, so that `typescript` and `vitest` resolve from it.
+  const dir = mkdtempSync(join(packageDir, "test", ".fixture-"));
+  temporary.push(dir);
+  for (const config of ["tsconfig.json", "tsconfig.catalog.json"]) {
+    cpSync(join(packageDir, config), join(dir, config));
+  }
+  const all = { "src/catalog/index.ts": "export {};\n", "src/operations/index.ts": "export {};\n", ...files };
+  for (const [path, text] of Object.entries(all)) {
+    mkdirSync(dirname(join(dir, path)), { recursive: true });
+    writeFileSync(join(dir, path), text);
+  }
+  return dir;
+}
+
+afterEach(() => {
+  for (const dir of temporary.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe("control package import boundary (K1)", () => {
-  it("finds both entry points in the source tree", () => {
-    const paths = readSources(srcDir).map((file) => file.path);
-    expect(paths).toContain("catalog/index.ts");
-    expect(paths).toContain("operations/index.ts");
+  it("lists both entry points in the package program", () => {
+    const files = programFiles(join(packageDir, "tsconfig.json")).map((file) => file.split(/[\\/]/).slice(-2).join("/"));
+    expect(files).toContain("catalog/index.ts");
+    expect(files).toContain("operations/index.ts");
   });
 
-  it("has no forbidden import in the source tree", () => {
-    expect(boundaryViolations(readSources(srcDir))).toEqual([]);
+  it("has no violation in the package", () => {
+    expect(boundaryViolations(packageDir)).toEqual([]);
   });
 
-  it("reads static, type-only, side-effect, re-export and dynamic specifiers", () => {
-    const text = [
-      'import { a } from "./a.js";',
-      'import type { B } from "../b.js";',
-      'import "./c.js";',
-      'export * from "./d.js";',
-      'const e = await import("./e.js");',
-    ].join("\n");
-    expect(importSpecifiers(text)).toEqual(["./a.js", "../b.js", "./c.js", "./d.js", "./e.js"]);
+  const reachesOperations: Record<string, Record<string, string>> = {
+    "a direct re-export": { "src/catalog/a.ts": 'export * from "../operations/index.js";\n' },
+    "a re-export through a shared helper": {
+      "src/catalog/a.ts": 'export * from "../shared/helper.js";\n',
+      "src/shared/helper.ts": 'export * from "../operations/index.js";\n',
+    },
+    "an import with a comment before the specifier": {
+      "src/catalog/a.ts": 'import /* note */ "../operations/index.js";\nexport {};\n',
+    },
+    "a dynamic import with a template literal": {
+      "src/catalog/a.ts": "export const load = () => import(`../operations/index.js`);\n",
+    },
+    "a type-only import": { "src/catalog/a.ts": 'import type {} from "../operations/index.js";\nexport {};\n' },
+    "a type query import": { "src/catalog/a.ts": 'export type T = typeof import("../operations/index.js");\n' },
+    "a triple-slash path reference": { "src/catalog/a.ts": '/// <reference path="../operations/index.ts" />\nexport {};\n' },
+    "an import through an .mts module": {
+      "src/catalog/a.ts": 'export * from "../shared/helper.mjs";\n',
+      "src/shared/helper.mts": 'export * from "../operations/index.js";\n',
+    },
+    "an import-equals require through a .cts module": {
+      "src/catalog/a.ts": 'export * from "../shared/helper.cjs";\n',
+      "src/shared/helper.cts": 'import ops = require("../operations/plain.cjs");\nexport = ops;\n',
+      "src/operations/plain.cts": "export = {};\n",
+    },
+  };
+
+  for (const [name, files] of Object.entries(reachesOperations)) {
+    it(`rejects operations reached from the catalog by ${name}`, () => {
+      const violations = boundaryViolations(fixture(files));
+      expect(violations.some((line) => line.startsWith("reached from catalog: src/operations/"))).toBe(true);
+    });
+  }
+
+  it("rejects a declaration file outside src", () => {
+    const dir = fixture({
+      "src/catalog/a.ts": '/// <reference path="../../types/extra.d.ts" />\nexport {};\n',
+      "types/extra.d.ts": "declare const extra: number;\n",
+    });
+    expect(boundaryViolations(dir)).toEqual(["outside src: types/extra.d.ts"]);
   });
 
-  it("rejects platform and package imports", () => {
-    const files = [
-      { path: "operations/x.ts", text: 'import { readFile } from "node:fs";' },
-      { path: "catalog/y.ts", text: 'import type { Window } from "@tauri-apps/api/window";' },
-    ];
-    expect(boundaryViolations(files)).toEqual([
-      'operations/x.ts: non-relative import "node:fs"',
-      'catalog/y.ts: non-relative import "@tauri-apps/api/window"',
-    ]);
+  it("rejects a package type reference", () => {
+    const violations = boundaryViolations(fixture({ "src/operations/a.ts": 'import type { Mock } from "vitest";\nexport type M = Mock;\n' }));
+    expect(violations.length).toBeGreaterThan(0);
+    expect(violations.every((line) => line.startsWith("outside src: "))).toBe(true);
   });
 
-  it("rejects a catalog-to-operations edge, including a type-only one", () => {
-    const files = [
-      { path: "catalog/a.ts", text: 'import type { Op } from "../operations/index.js";' },
-      { path: "catalog/sub/b.ts", text: 'import { run } from "../../operations/run.js";' },
-    ];
-    expect(boundaryViolations(files)).toEqual([
-      'catalog/a.ts: catalog imports operations through "../operations/index.js"',
-      'catalog/sub/b.ts: catalog imports operations through "../../operations/run.js"',
-    ]);
+  it("ignores comments and strings that only look like imports", () => {
+    const dir = fixture({
+      "src/catalog/a.ts": [
+        '// import { x } from "../operations/index.js";',
+        'export const label = \'connect from "Device Center"\';',
+        'export const note = "import(\\"../operations/index.js\\")";',
+      ].join("\n"),
+    });
+    expect(boundaryViolations(dir)).toEqual([]);
   });
 
-  it("allows operations to import the catalog", () => {
-    const files = [{ path: "operations/a.ts", text: 'import { x } from "../catalog/index.js";' }];
-    expect(boundaryViolations(files)).toEqual([]);
-  });
-
-  it("rejects an import that leaves src", () => {
-    const files = [{ path: "catalog/a.ts", text: 'import { x } from "../../test/x.js";' }];
-    expect(boundaryViolations(files)).toEqual(['catalog/a.ts: import "../../test/x.js" leaves src']);
+  it("allows operations to import the catalog and both to share a helper", () => {
+    const dir = fixture({
+      "src/operations/a.ts": 'export * from "../catalog/index.js";\nexport * from "../shared/helper.js";\n',
+      "src/catalog/b.ts": 'export * from "../shared/helper.js";\n',
+      "src/shared/helper.ts": "export const shared = 1;\n",
+    });
+    expect(boundaryViolations(dir)).toEqual([]);
   });
 });

@@ -29,7 +29,7 @@ A local verification names every one of these commands; a command left out is na
 ## Boundaries
 
 - **What belongs here is device semantics, not application policy.** GUI plans, undo history, rendering and GUI restoration policy stay in urx-router; command parsing, terminal output, exit codes and process lifecycle stay in urx-cli. An operation does not discover devices, select a device, or read process-global current-device state
-- **The control package imports nothing but its own relative paths.** No Node built-ins, DOM, Tauri or package dependency in `src/`; `tsconfig.json` loads no Node or DOM types, and `test/import-boundary.test.ts` rejects the edge. A test may use Node
+- **The control package imports nothing but its own relative paths.** No Node built-ins, DOM, Tauri or package dependency in `src/`; `tsconfig.json` loads no Node or DOM types, and `test/import-boundary.test.ts` lists the files TypeScript loads for `tsconfig.json` and `tsconfig.catalog.json` and rejects any outside `src`, or under `src/operations` when loaded from the catalog. A test may use Node
 - **The transport crate depends on neither Tauri nor Node-API.** Each application wraps it in its own adapter in its own repository
 - **One definition per fact.** Ranges, units, rounding and capabilities are defined once in the catalog and referenced by operations and by the applications' bindings. No second value table, no copy of a codec in Rust
 - **The setting registry is closed and static.** No runtime plug-in registration, declarative operation language, dependency-graph scheduler or general workflow engine. A composition is an explicit function calling individual operations in a fixed order
