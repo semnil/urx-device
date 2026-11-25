@@ -84,8 +84,43 @@ describe("control package import boundary (K1)", () => {
 
   it("rejects a package type reference", () => {
     const violations = boundaryViolations(fixture({ "src/operations/a.ts": 'import type { Mock } from "vitest";\nexport type M = Mock;\n' }));
-    expect(violations.length).toBeGreaterThan(0);
-    expect(violations.every((line) => line.startsWith("outside src: "))).toBe(true);
+    expect(violations).toContain('non-relative specifier "vitest": src/operations/a.ts');
+    expect(violations.some((line) => line.startsWith("outside src: "))).toBe(true);
+  });
+
+  const computed: Record<string, Record<string, string>> = {
+    "a variable": { "src/catalog/a.ts": 'const path = "../operations/index.js";\nexport const load = () => import(path);\n' },
+    "string concatenation": { "src/catalog/a.ts": 'export const load = () => import("../" + "operations/index.js");\n' },
+    "a template literal with a substitution": {
+      "src/catalog/a.ts": 'const dir = "operations";\nexport const load = () => import(`../${dir}/index.js`);\n',
+    },
+    "a variable in a shared helper": {
+      "src/catalog/a.ts": 'export * from "../shared/helper.js";\n',
+      "src/shared/helper.ts": 'const path = "../operations/index.js";\nexport const load = () => import(path);\n',
+    },
+  };
+
+  for (const [name, files] of Object.entries(computed)) {
+    it(`rejects a dynamic import computed from ${name}`, () => {
+      const violations = boundaryViolations(fixture(files));
+      expect(violations.some((line) => line.startsWith("computed specifier: src/"))).toBe(true);
+    });
+  }
+
+  it("rejects a package.json subpath import", () => {
+    const dir = fixture({
+      "package.json": '{"type":"module","imports":{"#local-codec":"./src/shared/codec.ts"}}\n',
+      "src/catalog/a.ts": 'export * from "#local-codec";\n',
+      "src/shared/codec.ts": "export const codec = 1;\n",
+    });
+    expect(boundaryViolations(dir)).toContain('non-relative specifier "#local-codec": src/catalog/a.ts');
+  });
+
+  it("rejects node: and package imports", () => {
+    const dir = fixture({ "src/operations/a.ts": 'import "node:fs";\nexport * from "some-package";\n' });
+    expect(boundaryViolations(dir)).toEqual(
+      expect.arrayContaining(['non-relative specifier "node:fs": src/operations/a.ts', 'non-relative specifier "some-package": src/operations/a.ts']),
+    );
   });
 
   it("ignores comments and strings that only look like imports", () => {
