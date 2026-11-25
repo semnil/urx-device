@@ -115,7 +115,8 @@ export interface SelectorRule {
   readonly known: readonly string[];
   readonly choices: readonly { readonly token: string; readonly raw: string }[];
   /**
-   * The defined limits of `none` and of each choice, by token, for help. A
+   * The defined limits of each choice and of `none` where the selector has
+   * one, by token, for help. A
    * definition, not a measurement; nothing reads the rate, link or slot state
    * to check them. Undefined for a token this target does not take.
    */

@@ -66,6 +66,20 @@ describe("FX returns (F06-F, F06-V)", () => {
     );
   });
 
+  it("carry F06-F's rate limit for help: FX2 to 96 kHz, FX1 without a ceiling, no slot", () => {
+    const rule = FX_RETURN_RULES["bus.fx.type"];
+    for (const [bus, maxRateHz] of [["fx-1", null], ["fx-2", 96000]] as const) {
+      const menu = rule.address[bus]?.value;
+      expect(menu?.kind).toBe("selector");
+      if (menu?.kind !== "selector") continue;
+      const limits = menu.choices.map(({ token }) => [token, { maxRateHz, monoOnly: false, slot: null }]);
+      expect(menu.limits, bus).toEqual(Object.fromEntries(limits));
+      for (const token of [...Object.getOwnPropertyNames(Object.prototype), "none", bus === "fx-1" ? "rev-r3-hall" : "rev-x-hall"]) {
+        expect(menu.limits?.[token], `${bus} ${token}`).toBeUndefined();
+      }
+    }
+  });
+
   it("read a parameter after one selector read of its own bus, and stop on a mismatch or a bad selector", async () => {
     expect(await parameter("fx-1", "rev-x-hall", "decay", "0", "40")).toEqual({ result: { value: 40 }, addresses: [at(679), at(681, 15)] });
     expect(await parameter("fx-2", "mono-delay", "bpm", "1024", "120")).toEqual({ result: { value: 120 }, addresses: [at(683), at(685, 3)] });

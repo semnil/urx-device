@@ -3,7 +3,7 @@
 // a shared public name is resolved by the exact effect.
 
 import { BUS_TOKENS } from "./buses.js";
-import { frozen } from "./frozen.js";
+import { byToken, frozen } from "./frozen.js";
 import {
   FX2_FREQUENCY_DECIHZ,
   INITIAL_DELAY_DECIMS,
@@ -45,14 +45,23 @@ const SELECTORS: { readonly [E in (typeof FX_RETURN_EFFECTS)[number]]: { "fx-1"?
   "ping-pong": { "fx-1": "1025", "fx-2": "1025" },
 };
 
+/**
+ * F06-F's existing rate limit, for help: FX2 is not run above 96 kHz; FX1 has
+ * no ceiling. A definition, not a measurement; nothing reads the rate.
+ */
+const RATE_CEILING_HZ = { "fx-1": null, "fx-2": 96000 } as const;
+
 function menu(bus: "fx-1" | "fx-2"): SelectorRule {
+  const choices = FX_RETURN_EFFECTS.flatMap((token) => {
+    const raw = SELECTORS[token][bus];
+    return raw === undefined ? [] : [{ token, raw }];
+  });
+  const limits = { maxRateHz: RATE_CEILING_HZ[bus], monoOnly: false, slot: null };
   return {
     kind: "selector",
     known: FX_RETURN_EFFECTS,
-    choices: FX_RETURN_EFFECTS.flatMap((token) => {
-      const raw = SELECTORS[token][bus];
-      return raw === undefined ? [] : [{ token, raw }];
-    }),
+    choices,
+    limits: byToken(Object.fromEntries(choices.map(({ token }) => [token, limits]))),
   };
 }
 
