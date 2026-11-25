@@ -22,6 +22,17 @@ import {
   channelStereoLink,
 } from "./channels.js";
 import {
+  compOn,
+  eqOn,
+  gateOn,
+  hpfFrequency,
+  hpfOn,
+  processingMode,
+  ssmcsCompOn,
+  ssmcsEqOn,
+  ssmcsOn,
+} from "./processing.js";
+import {
   inputClipSafe,
   inputClipSafeActive,
   inputGain,
@@ -73,6 +84,15 @@ export const settingHandlers: SettingHandlers = {
   "channel.name": channelName,
   "channel.color": channelColor,
   "channel.rec-point": channelRecPoint,
+  "channel.processing-mode": processingMode,
+  "channel.hpf.on": hpfOn,
+  "channel.hpf.frequency": hpfFrequency,
+  "channel.gate.on": gateOn,
+  "channel.comp.on": compOn,
+  "channel.eq.on": eqOn,
+  "channel.ssmcs.on": ssmcsOn,
+  "channel.ssmcs.comp.on": ssmcsCompOn,
+  "channel.ssmcs.eq.on": ssmcsEqOn,
 };
 
 function unknownId(): Promise<never> {

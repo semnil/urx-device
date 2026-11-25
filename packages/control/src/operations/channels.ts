@@ -50,8 +50,10 @@ function wholeChannel(model: string, target: unknown): ChannelIndex {
   return side === undefined ? channel : refuse("invalid_input");
 }
 
-function wholeAddress(ids: { mono: number; stereo: number }, channel: ChannelIndex): ParameterAddress {
-  return address(channel.kind === "mono" ? ids.mono : ids.stereo, channel.index);
+/** A whole-channel setting's address; a kind without an ID lacks the setting. */
+function wholeAddress(ids: { mono?: number; stereo?: number }, channel: ChannelIndex): ParameterAddress {
+  const paramId = channel.kind === "mono" ? ids.mono : ids.stereo;
+  return paramId === undefined ? refuse("unsupported_operation") : address(paramId, channel.index);
 }
 
 /** A side-specific setting's address: a side is required for fixed stereo, refused for mono. */
@@ -71,8 +73,8 @@ function polarityAddress(model: string, target: unknown): ParameterAddress {
 }
 
 /** A whole-channel setting with its codec. */
-function channelSetting<V>(
-  ids: { mono: number; stereo: number },
+export function channelSetting<V>(
+  ids: { mono?: number; stereo?: number },
   decode: (raw: I64Text) => V | undefined,
   plan: (value: unknown) => { planned: V; raw: I64Text } | undefined,
 ) {
@@ -123,7 +125,7 @@ function planPan(value: unknown): { planned: number; raw: I64Text } | undefined 
   return planned === undefined ? undefined : { planned, raw: `${planned}` };
 }
 
-function planSwitch(value: unknown): { planned: boolean; raw: I64Text } | undefined {
+export function planSwitch(value: unknown): { planned: boolean; raw: I64Text } | undefined {
   return typeof value === "boolean" ? { planned: value, raw: encodeSwitch(value) } : undefined;
 }
 
