@@ -99,7 +99,28 @@ export interface NameRule {
   readonly maxCodePoints: number;
 }
 
-export type ValueRule = SwitchRule | ChoiceRule | GridRule | StopsRule | TextIndexRule | PortChoiceRule | NameRule;
+/**
+ * A selector on an unsigned 32-bit value: each token this target takes with
+ * its exact raw value, and `none` as the exact sentinel. `known` lists every
+ * token any target of the setting takes: one of them this target lacks is
+ * unsupported, anything else invalid. A read takes only the listed raw values.
+ */
+export interface SelectorRule {
+  readonly kind: "selector";
+  readonly none: Sentinel;
+  readonly known: readonly string[];
+  readonly choices: readonly { readonly token: string; readonly raw: string }[];
+}
+
+export type ValueRule =
+  | SwitchRule
+  | ChoiceRule
+  | GridRule
+  | StopsRule
+  | TextIndexRule
+  | PortChoiceRule
+  | NameRule
+  | SelectorRule;
 
 /** A whole-channel setting: its parameter ID per channel kind and its value rule. */
 export interface ChannelSettingRule {

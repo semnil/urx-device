@@ -27,6 +27,7 @@ export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
 export { DUCKER_RULES } from "./ducker.js";
 export { SEND_RULES } from "./sends.js";
 export { BUS_RULES, BUS_TOKENS, CHANNEL_STEREO_ASSIGN_RULE } from "./buses.js";
+export { INSERT_FX_EFFECTS, INSERT_FX_RULES } from "./insert-fx.js";
 export { DYNAMICS_RULES } from "./dynamics.js";
 export type {
   ByBandRule,
@@ -38,6 +39,7 @@ export type {
   SendRoute,
   BusSettingRule,
   NameRule,
+  SelectorRule,
   SendSettingRule,
   Sentinel,
   SettingRule,
@@ -85,6 +87,7 @@ export type {
   SendTap,
   BusTarget,
   BusType,
+  InsertFxType,
   SendTarget,
   EqBand,
   EqBandType,
