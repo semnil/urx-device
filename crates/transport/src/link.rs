@@ -1,15 +1,24 @@
 //! A blocking request/response exchange over one loopback TCP connection,
 //! bounded by an enclosing budget and per-request deadlines and stopped by a
 //! [`Control`].
+//!
+//! Every blocking step returns to the caller at least every [`POLL`], and the
+//! stop conditions (cancellation, then the earliest expired bound) are checked
+//! before each step and again before its outcome is used, so a condition that
+//! holds first is reported even when a reply, a close or an oversized frame
+//! arrives after it.
 
 use crate::frame::{self, FrameReader, ReadError};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use serde_json::Value;
 use std::io::{ErrorKind, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
-/// Longest a blocking socket call runs before cancellation is checked again.
+/// Longest a blocking socket call runs before the stop conditions are checked
+/// again.
 const POLL: Duration = Duration::from_millis(50);
 
 /// The end of an enclosing budget, and the cause reported when it is reached.
@@ -29,14 +38,46 @@ impl Budget {
 
     /// The earlier of this budget's end and `deadline` from now, with the
     /// cause to report when that end is reached.
-    fn bound(&self, deadline: Duration, own: Cause) -> (Instant, Cause) {
+    fn bound(&self, deadline: Duration, own: Cause) -> Bound {
         let individual = Instant::now() + deadline;
         if self.end <= individual {
-            (self.end, self.expired)
+            Bound {
+                end: self.end,
+                expired: self.expired,
+            }
         } else {
-            (individual, own)
+            Bound {
+                end: individual,
+                expired: own,
+            }
         }
     }
+
+    fn whole(&self) -> Bound {
+        Bound {
+            end: self.end,
+            expired: self.expired,
+        }
+    }
+}
+
+/// The end one step must finish by, and the cause reported when it does not.
+#[derive(Debug, Clone, Copy)]
+struct Bound {
+    end: Instant,
+    expired: Cause,
+}
+
+/// Cancellation, then expiry of `bound`; otherwise the time left in it.
+fn stop(control: &Control, bound: &Bound, phase: Phase) -> Result<Duration, Failure> {
+    if control.is_cancelled() {
+        return Err(Failure::Cancelled { phase });
+    }
+    let remaining = bound.end.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Failure::cause(bound.expired, phase));
+    }
+    Ok(remaining)
 }
 
 pub(crate) struct Link<'a> {
@@ -47,29 +88,36 @@ pub(crate) struct Link<'a> {
 }
 
 impl<'a> Link<'a> {
-    /// Connects to `port` on the loopback interface within `budget`.
+    /// Connects to `port` on the loopback interface within `budget`. The one
+    /// connection attempt runs on its own thread so that cancellation and
+    /// expiry are seen while it is pending; an attempt still pending when the
+    /// call stops ends within the budget, and its socket is closed unused.
     pub fn connect(
         port: u16,
         budget: &Budget,
         phase: Phase,
         control: &'a Control,
     ) -> Result<Self, Failure> {
-        if control.is_cancelled() {
-            return Err(Failure::Cancelled { phase });
-        }
-        let remaining = budget.end.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Failure::cause(budget.expired, phase));
-        }
+        let bound = budget.whole();
+        let remaining = stop(control, &bound, phase)?;
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let sock = TcpStream::connect_timeout(&addr, remaining).map_err(|e| {
-            let code = if e.kind() == ErrorKind::TimedOut && Instant::now() >= budget.end {
-                budget.expired
-            } else {
-                Cause::ConnectionFailed
-            };
-            Failure::cause(code, phase)
-        })?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(TcpStream::connect_timeout(&addr, remaining));
+        });
+        let sock = loop {
+            let remaining = stop(control, &bound, phase)?;
+            match rx.recv_timeout(remaining.min(POLL)) {
+                Ok(result) => {
+                    stop(control, &bound, phase)?;
+                    break result.map_err(|_| Failure::cause(Cause::ConnectionFailed, phase))?;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Failure::cause(Cause::InternalError, phase))
+                }
+            }
+        };
         sock.set_nodelay(true)
             .map_err(|_| Failure::cause(Cause::ConnectionFailed, phase))?;
         Ok(Link {
@@ -80,14 +128,6 @@ impl<'a> Link<'a> {
         })
     }
 
-    fn cancelled(&self) -> Result<(), Failure> {
-        if self.control.is_cancelled() {
-            Err(Failure::Cancelled { phase: self.phase })
-        } else {
-            Ok(())
-        }
-    }
-
     /// Writes `message` as one frame within `deadline` and the budget.
     pub fn send(
         &mut self,
@@ -95,21 +135,19 @@ impl<'a> Link<'a> {
         deadline: Duration,
         budget: &Budget,
     ) -> Result<(), Failure> {
-        self.cancelled()?;
+        let bound = budget.bound(deadline, Cause::SendTimeout);
+        stop(self.control, &bound, self.phase)?;
         let bytes =
             frame::encode(message).map_err(|_| Failure::cause(Cause::InternalError, self.phase))?;
-        let (end, expired) = budget.bound(deadline, Cause::SendTimeout);
         let mut written = 0;
         while written < bytes.len() {
-            self.cancelled()?;
-            let remaining = end.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Failure::cause(expired, self.phase));
-            }
+            let remaining = stop(self.control, &bound, self.phase)?;
             self.sock
                 .set_write_timeout(Some(remaining.min(POLL)))
                 .map_err(|_| Failure::cause(Cause::ConnectionLost, self.phase))?;
-            match self.sock.write(&bytes[written..]) {
+            let outcome = self.sock.write(&bytes[written..]);
+            stop(self.control, &bound, self.phase)?;
+            match outcome {
                 Ok(0) => return Err(Failure::cause(Cause::ConnectionLost, self.phase)),
                 Ok(n) => written += n,
                 Err(e)
@@ -123,29 +161,27 @@ impl<'a> Link<'a> {
         Ok(())
     }
 
-    /// Reads frames until `answer` accepts one, within `deadline` from now and
-    /// the budget. Frames `answer` declines, and lines that are not JSON, are
-    /// skipped.
+    /// Reads frames until `answer` decides one, within `deadline` from now and
+    /// the budget. `answer` returns `None` to skip a frame, `Some(Ok)` to
+    /// accept it and `Some(Err)` to fail; lines that are not JSON are skipped.
     pub fn await_frame<T>(
         &mut self,
         deadline: Duration,
         budget: &Budget,
-        mut answer: impl FnMut(&Value) -> Option<T>,
+        mut answer: impl FnMut(&Value) -> Option<Result<T, Failure>>,
     ) -> Result<T, Failure> {
-        let (end, expired) = budget.bound(deadline, Cause::ResponseTimeout);
+        let bound = budget.bound(deadline, Cause::ResponseTimeout);
         loop {
-            self.cancelled()?;
-            let remaining = end.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Failure::cause(expired, self.phase));
-            }
+            let remaining = stop(self.control, &bound, self.phase)?;
             self.sock
                 .set_read_timeout(Some(remaining.min(POLL)))
                 .map_err(|_| Failure::cause(Cause::ConnectionLost, self.phase))?;
-            match self.reader.read_frame(&mut self.sock) {
+            let outcome = self.reader.read_once(&mut self.sock);
+            stop(self.control, &bound, self.phase)?;
+            match outcome {
                 Ok(Some(frame)) => {
-                    if let Some(found) = frame.json.as_ref().and_then(&mut answer) {
-                        return Ok(found);
+                    if let Some(decided) = frame.json.as_ref().and_then(&mut answer) {
+                        return decided;
                     }
                 }
                 Ok(None) => {}

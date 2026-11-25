@@ -22,6 +22,14 @@ struct Peer {
 
 impl Peer {
     fn serve(respond: impl Fn(&Value) -> Vec<Vec<u8>> + Send + Sync + 'static) -> Peer {
+        Peer::serve_paced(Duration::ZERO, respond)
+    }
+
+    /// Like [`Peer::serve`], waiting `pace` after writing each piece.
+    fn serve_paced(
+        pace: Duration,
+        respond: impl Fn(&Value) -> Vec<Vec<u8>> + Send + Sync + 'static,
+    ) -> Peer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let uris = Arc::new(Mutex::new(Vec::new()));
@@ -32,7 +40,7 @@ impl Peer {
                 let Ok(stream) = stream else { return };
                 let respond = Arc::clone(&respond);
                 let seen = Arc::clone(&seen);
-                thread::spawn(move || answer(stream, respond, seen));
+                thread::spawn(move || answer(stream, pace, respond, seen));
             }
         });
         Peer { port, uris }
@@ -43,7 +51,7 @@ impl Peer {
     }
 }
 
-fn answer(stream: TcpStream, respond: Respond, seen: Arc<Mutex<Vec<String>>>) {
+fn answer(stream: TcpStream, pace: Duration, respond: Respond, seen: Arc<Mutex<Vec<String>>>) {
     let mut writer = stream.try_clone().unwrap();
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { return };
@@ -56,6 +64,7 @@ fn answer(stream: TcpStream, respond: Respond, seen: Arc<Mutex<Vec<String>>>) {
             if writer.write_all(&out).is_err() {
                 return;
             }
+            thread::sleep(pace);
         }
     }
 }
@@ -104,6 +113,18 @@ fn silent() -> Peer {
 /// The list endpoint, answering with `data` as the device list.
 fn center_data(data: Value) -> Peer {
     Peer::serve(move |_| vec![line(json!({ "vddp": { "data": data.clone() } }))])
+}
+
+/// `bytes` cut into pieces of `size` bytes.
+fn pieces(bytes: Vec<u8>, size: usize) -> Vec<Vec<u8>> {
+    bytes.chunks(size).map(<[u8]>::to_vec).collect()
+}
+
+fn metadata(options: DiscoveryOptions) -> DiscoveryOptions {
+    DiscoveryOptions {
+        metadata: true,
+        ..options
+    }
 }
 
 /// The list endpoint, listing `units` as `(vdp port, model)`.
@@ -432,4 +453,106 @@ fn cancellation_stops_before_starting_and_while_waiting() {
         })
     );
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// A unit whose `/vd/synchronize` and `/vd/device` replies arrive in 8-byte
+/// pieces every 20 ms, so each takes several hundred milliseconds.
+fn dribbling_unit() -> Peer {
+    Peer::serve_paced(Duration::from_millis(20), |request| match uri_of(request) {
+        "/vd/synchronize" => pieces(get_reply("/vd/synchronize", online("<device-id-a>")), 8),
+        "/vd/device" => pieces(
+            get_reply(
+                "/vd/device",
+                firm_list(json!([{ "firm_name": "System", "firm_version": "9.9.9" }])),
+            ),
+            8,
+        ),
+        _ => vec![],
+    })
+}
+
+#[test]
+fn a_reply_that_keeps_arriving_in_pieces_still_stops_at_its_deadline() {
+    let a = dribbling_unit();
+    let center = center(&[(a.port, "URX44V")]);
+
+    let started = Instant::now();
+    let result = run(&DiscoveryOptions {
+        request_deadline: Duration::from_millis(100),
+        ..options(center.port)
+    });
+    assert_eq!(result, fails_with(Cause::ResponseTimeout));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let started = Instant::now();
+    let result = run(&DiscoveryOptions {
+        deadline: Duration::from_millis(100),
+        ..options(center.port)
+    });
+    assert_eq!(result, fails_with(Cause::DiscoveryTimeout));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_reply_that_keeps_arriving_in_pieces_is_cancellable() {
+    let a = dribbling_unit();
+    let center = center(&[(a.port, "URX44V")]);
+    let control = Control::new();
+    let canceller = control.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(80));
+        canceller.cancel();
+    });
+    let started = Instant::now();
+    assert_eq!(
+        discover(&options(center.port), &control),
+        Err(Failure::Cancelled {
+            phase: Phase::Discovery
+        })
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_reply_in_pieces_that_completes_in_time_is_used() {
+    let a = dribbling_unit();
+    let center = center(&[(a.port, "URX44V")]);
+    let found = run(&metadata(options(center.port))).unwrap();
+    assert_eq!(
+        found[0].firmware,
+        Some(SystemFirmware::Version("9.9.9".into()))
+    );
+}
+
+#[test]
+fn an_expired_deadline_is_reported_over_a_later_close_or_oversized_frame() {
+    let closes_late = Peer::serve(|_| {
+        thread::sleep(Duration::from_millis(300));
+        vec![]
+    });
+    let oversized_late = Peer::serve_paced(Duration::from_millis(300), |_| {
+        let mut big = vec![b'x'; crate::frame::MAX_FRAME_BYTES + 1];
+        big.push(b'\n');
+        vec![b"{".to_vec(), big]
+    });
+    for peer in [&closes_late, &oversized_late] {
+        let center = center(&[(peer.port, "URX44V")]);
+        let result = run(&DiscoveryOptions {
+            request_deadline: Duration::from_millis(100),
+            ..options(center.port)
+        });
+        assert_eq!(result, fails_with(Cause::ResponseTimeout));
+    }
 }

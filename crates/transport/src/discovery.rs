@@ -90,7 +90,7 @@ fn list(
     let request = json!({ "vddp": { "method": "get", "uri": "/vddp_srv/devices" } });
     link.send(&request, options.request_deadline, budget)?;
     let data = link.await_frame(options.request_deadline, budget, |message| {
-        message.get("vddp")?.get("data").cloned()
+        Some(Ok(message.get("vddp")?.get("data").cloned()?))
     })?;
     parse_list(&data)
 }
@@ -168,7 +168,7 @@ fn get(
     let data = link.await_frame(options.request_deadline, budget, |message| {
         Inbound::new(message.clone())
             .reply(&key)
-            .map(|reply| reply.data().cloned())
+            .map(|reply| Ok(reply.data().cloned()))
     })?;
     data.ok_or_else(malformed)
 }
