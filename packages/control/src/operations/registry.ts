@@ -135,6 +135,8 @@ import {
   deviceTimeZoneIndex,
   deviceUsbSuppression,
 } from "./device.js";
+import { integrationActive, integrationPostFaderSource, knobBank, panelSendsTarget } from "./integration-panel.js";
+import { knobAssignment } from "./knob.js";
 import {
   compOn,
   eqOn,
@@ -332,6 +334,11 @@ export const settingHandlers: SettingHandlers = {
   "device.sample-rate": deviceSampleRate,
   "device.follow-usb": deviceFollowUsb,
   "device.console-lock": deviceConsoleLock,
+  "knob.assignment": knobAssignment,
+  "knob.bank": knobBank,
+  "integration.active": integrationActive,
+  "integration.post-fader-source": integrationPostFaderSource,
+  "panel.sends-target": panelSendsTarget,
 };
 
 function unknownId(): Promise<never> {

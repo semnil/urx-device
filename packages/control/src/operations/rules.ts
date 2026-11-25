@@ -153,6 +153,12 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
 /** The codec of `rule` on `model` (only a port choice depends on the model). */
 export function codecOf(rule: ValueRule, model = ""): Codec {
   switch (rule.kind) {
+    case "flag":
+      return {
+        text: false,
+        decode: (raw) => (/^(0|-?[1-9][0-9]*)$/.test(raw) ? raw !== "0" : undefined),
+        plan: () => undefined,
+      };
     case "numeric-set":
       return {
         text: false,

@@ -145,7 +145,13 @@ export interface NumericSetRule {
   readonly values: readonly number[];
 }
 
+/** An integer flag: raw 0 is false and any other integer true (F12-I). */
+export interface FlagRule {
+  readonly kind: "flag";
+}
+
 export type ValueRule =
+  | FlagRule
   | NumericSetRule
   | SwitchRule
   | ChoiceRule
@@ -387,7 +393,21 @@ export interface DeviceSettingRule {
   readonly writePrerequisites?: readonly WritePrerequisite[];
 }
 
+/**
+ * A knob assignment (F12-K): the target names a bank 1…`banks` and a knob;
+ * y = (bank − 1) × knobs + knob index. Its value is three strings, read and
+ * written in order at `components`; a write must be one of `triples`.
+ */
+export interface KnobAssignmentRule {
+  readonly target: "knob";
+  readonly banks: number;
+  readonly knobs: readonly string[];
+  readonly components: readonly { readonly name: string; readonly paramId: number }[];
+  readonly triples: readonly (readonly [string, string, string])[];
+}
+
 export type SettingRule =
+  | KnobAssignmentRule
   | DeviceSettingRule
   | OutputSettingRule
   | OutputSideSettingRule

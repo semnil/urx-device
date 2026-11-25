@@ -46,9 +46,20 @@ export interface VerifiedPlan<V> extends WritePlan<V> {
   readonly unverified: readonly UnverifiedCondition[];
 }
 
+/** One component write of a composite setting, in planned order (O11). */
+export interface CompositeStep {
+  readonly component: string;
+  readonly requested: string;
+  readonly planned: string;
+  readonly outcome: WriteOutcome;
+  readonly responseCode?: I64Text;
+}
+
 /** A write the unit accepted (W1): acceptance, not readback. */
 export interface WriteResult<V> extends WritePlan<V> {
   readonly outcome: "accepted";
+  /** For a composite setting, each component write in order (O11). */
+  readonly steps?: readonly CompositeStep[];
 }
 
 /** How a failed write ended, from its request's evidence (K34, O11). */
@@ -59,4 +70,6 @@ export interface WriteProgress<V> extends WritePlan<V> {
   readonly outcome: WriteOutcome;
   /** The device's rejection code, for a rejected write. */
   readonly responseCode?: I64Text;
+  /** For a composite setting: accepted steps kept, the failed one, later ones not sent (O11). */
+  readonly steps?: readonly CompositeStep[];
 }
