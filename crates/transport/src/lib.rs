@@ -5,3 +5,7 @@
 //! Node-API; each application wraps it in its own adapter.
 
 #![forbid(unsafe_code)]
+
+pub mod frame;
+pub mod i64_text;
+pub mod wire;

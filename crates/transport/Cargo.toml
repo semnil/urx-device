@@ -9,3 +9,6 @@ publish = false
 
 [lib]
 name = "urx_device_transport"
+
+[dependencies]
+serde_json = "1"
