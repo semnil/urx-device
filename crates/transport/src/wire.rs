@@ -279,7 +279,7 @@ impl Inbound {
     /// This frame as a notification, or `None` for any other frame. A parameter
     /// notification whose value is neither an integer nor a string, a meter
     /// notification whose value is not an integer, and an address that does
-    /// not parse are not notifications.
+    /// not parse or has more coordinates than its kind are not notifications.
     pub fn notification(&self) -> Option<Notification> {
         if self.field("method") != Some("notify") {
             return None;
@@ -298,6 +298,9 @@ impl Inbound {
                 meter_id: parts.next()?.parse().ok()?,
                 x: parts.next()?.parse().ok()?,
             };
+            if parts.next().is_some() {
+                return None;
+            }
             return Some(Notification::Meter {
                 address,
                 value: value?.as_i64()?,
@@ -310,6 +313,9 @@ impl Inbound {
             x: parts.next()?.parse().ok()?,
             y: parts.next()?.parse().ok()?,
         };
+        if parts.next().is_some() {
+            return None;
+        }
         let value = value?;
         if let Some(v) = value.as_i64() {
             return Some(Notification::Numeric { address, value: v });
@@ -660,6 +666,12 @@ mod tests {
             ),
             ("/vd/meters/7:-1", json!({ "current_value": "1" })),
             ("/vd/meters/7", json!({ "current_value": 1 })),
+            ("/vd/parameters/142:0:1:9", json!({ "current_value": 1 })),
+            ("/vd/parameters/142:0:1:", json!({ "current_value": "a" })),
+            ("/vd/parameters/142:0:1:x", json!({ "current_value": 1 })),
+            ("/vd/meters/7:-1:0", json!({ "current_value": 1 })),
+            ("/vd/meters/7:-1:", json!({ "current_value": 1 })),
+            ("/vd/meters/7:-1:x", json!({ "current_value": 1 })),
             ("/vd/parametersX/1:0:1", json!({ "current_value": 1 })),
             ("/vd/synchronize", json!({ "sync_status": "lost" })),
         ] {
