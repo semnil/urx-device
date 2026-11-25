@@ -22,6 +22,22 @@ import {
   channelStereoLink,
 } from "./channels.js";
 import {
+  compAttack,
+  compAutoMakeup,
+  compGain,
+  compKnee,
+  compOneKnobLevel,
+  compOneKnobOn,
+  compRatio,
+  compRelease,
+  compThreshold,
+  gateAttack,
+  gateDecay,
+  gateHold,
+  gateRange,
+  gateThreshold,
+} from "./dynamics.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -93,6 +109,20 @@ export const settingHandlers: SettingHandlers = {
   "channel.ssmcs.on": ssmcsOn,
   "channel.ssmcs.comp.on": ssmcsCompOn,
   "channel.ssmcs.eq.on": ssmcsEqOn,
+  "channel.gate.threshold": gateThreshold,
+  "channel.gate.range": gateRange,
+  "channel.gate.attack": gateAttack,
+  "channel.gate.hold": gateHold,
+  "channel.gate.decay": gateDecay,
+  "channel.comp.threshold": compThreshold,
+  "channel.comp.ratio": compRatio,
+  "channel.comp.knee": compKnee,
+  "channel.comp.gain": compGain,
+  "channel.comp.attack": compAttack,
+  "channel.comp.release": compRelease,
+  "channel.comp.auto-makeup": compAutoMakeup,
+  "channel.comp.one-knob.on": compOneKnobOn,
+  "channel.comp.one-knob.level": compOneKnobLevel,
 };
 
 function unknownId(): Promise<never> {
@@ -108,11 +138,27 @@ function settled<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-/** The (id, target) pairs a read takes: each ID with its own target type. */
-export type ReadArgs = { [K in SettingId]: [id: K, target: Target<K>] }[SettingId];
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
-/** The (id, target, value) triples a write takes. */
-export type WriteArgs = { [K in WritableSettingId]: [id: K, target: Target<K>, value: Input<K>] }[WritableSettingId];
+/** The IDs that accept a target of type `T` (a channel setting with an optional side accepts a plain channel). */
+type IdsTaking<T> = { [K in SettingId]: [T] extends [Target<K>] ? K : never }[SettingId];
+
+/** The writable IDs whose target and write types are exactly `T` and `I`. */
+type IdsWriting<T, I> = {
+  [K in WritableSettingId]: Same<Target<K>, T> extends true ? (Same<Input<K>, I> extends true ? K : never) : never;
+}[WritableSettingId];
+
+/**
+ * The (id, target) pairs a read takes: each ID with its own target type. An
+ * ID may also be any union of the IDs that accept that target, so a list of
+ * settings read alike type-checks however many it holds.
+ */
+export type ReadArgs = { [K in SettingId]: [id: IdsTaking<Target<K>>, target: Target<K>] }[SettingId];
+
+/** The (id, target, value) triples a write takes, grouped the same way by target and write type. */
+export type WriteArgs = {
+  [K in WritableSettingId]: [id: IdsWriting<Target<K>, Input<K>>, target: Target<K>, value: Input<K>];
+}[WritableSettingId];
 
 /**
  * Reads `id` for `target`. An ID outside the catalog, reachable only from

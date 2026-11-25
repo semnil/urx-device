@@ -73,3 +73,16 @@ export function decodeInteger(raw: I64Text, min: number, max: number): number | 
   const value = parseI64(raw);
   return value === undefined || value < BigInt(min) || value > BigInt(max) ? undefined : Number(value);
 }
+
+/**
+ * The index of the stop nearest to `requested`, the stops given in units of
+ * 1 / `scale` and increasing; a tie goes to the lower stop. Compared with each
+ * midpoint in the request's own unit, so decimal steps carry no binary noise.
+ */
+export function nearestStopIndex(stops: readonly number[], scale: number, requested: number): number {
+  let index = 0;
+  while (index + 1 < stops.length && requested > ((stops[index] as number) + (stops[index + 1] as number)) / 2 / scale) {
+    index += 1;
+  }
+  return index;
+}

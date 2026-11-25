@@ -2,10 +2,13 @@
 // setting ID with its definition; operations bind every ID to a handler.
 // Rows are added per K35 catalog part (stages D7–D15).
 
+import { frozen } from "./frozen.js";
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
+import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import type { SourceToken } from "./inputs.js";
 import type { PROCESSING_MODES } from "./processing.js";
+import type { SettingRule } from "./rules.js";
 
 /** What every setting definition states, independent of its value types. */
 export interface SettingDefinitionBase {
@@ -13,13 +16,15 @@ export interface SettingDefinitionBase {
   readonly readable: true;
   /** Whether the setting can be written. */
   readonly writable: boolean;
+  /** The target, address and value rule, for the settings that carry one (K35 metadata). */
+  readonly rule?: SettingRule;
 }
 
 /**
  * The catalog: setting ID to definition. It is a static literal, never
  * extended at runtime (K2: no dynamic registration).
  */
-export const settingDefinitions = {
+export const settingDefinitions = frozen({
   "input.gain": { readable: true, writable: true },
   "input.phantom": { readable: true, writable: true },
   "input.hi-z": { readable: true, writable: true },
@@ -46,7 +51,21 @@ export const settingDefinitions = {
   "channel.ssmcs.on": { readable: true, writable: true },
   "channel.ssmcs.comp.on": { readable: true, writable: true },
   "channel.ssmcs.eq.on": { readable: true, writable: true },
-} as const satisfies Record<string, SettingDefinitionBase>;
+  "channel.gate.threshold": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.threshold"] },
+  "channel.gate.range": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.range"] },
+  "channel.gate.attack": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.attack"] },
+  "channel.gate.hold": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.hold"] },
+  "channel.gate.decay": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.decay"] },
+  "channel.comp.threshold": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.threshold"] },
+  "channel.comp.ratio": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.ratio"] },
+  "channel.comp.knee": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.knee"] },
+  "channel.comp.gain": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.gain"] },
+  "channel.comp.attack": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.attack"] },
+  "channel.comp.release": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.release"] },
+  "channel.comp.auto-makeup": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.auto-makeup"] },
+  "channel.comp.one-knob.on": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.on"] },
+  "channel.comp.one-knob.level": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.comp.one-knob.level"] },
+} as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
 export type SettingId = keyof typeof settingDefinitions;
@@ -97,6 +116,12 @@ export type RecPoint = (typeof REC_POINTS)[number];
 
 export type ProcessingMode = (typeof PROCESSING_MODES)[number];
 
+/** A GATE range: finite dB, or negative infinity (F04-D). */
+export type GateRange = number | "-inf";
+/** A compressor ratio: finite N for N:1, or infinity (F04-D). */
+export type CompRatio = number | "inf";
+export type CompKnee = "soft" | "medium" | "hard";
+
 /**
  * Each setting's target, observed value and requested value types (K35:
  * switches are boolean, levels are dB numbers).
@@ -127,6 +152,20 @@ export interface SettingTypes {
   "channel.ssmcs.on": { target: ChannelTarget; value: boolean };
   "channel.ssmcs.comp.on": { target: ChannelTarget; value: boolean };
   "channel.ssmcs.eq.on": { target: ChannelTarget; value: boolean };
+  "channel.gate.threshold": { target: ChannelTarget; value: number };
+  "channel.gate.range": { target: ChannelTarget; value: GateRange };
+  "channel.gate.attack": { target: ChannelTarget; value: number };
+  "channel.gate.hold": { target: ChannelTarget; value: number };
+  "channel.gate.decay": { target: ChannelTarget; value: number };
+  "channel.comp.threshold": { target: ChannelTarget; value: number };
+  "channel.comp.ratio": { target: ChannelTarget; value: CompRatio };
+  "channel.comp.knee": { target: ChannelTarget; value: CompKnee };
+  "channel.comp.gain": { target: ChannelTarget; value: number };
+  "channel.comp.attack": { target: ChannelTarget; value: number };
+  "channel.comp.release": { target: ChannelTarget; value: number };
+  "channel.comp.auto-makeup": { target: ChannelTarget; value: boolean };
+  "channel.comp.one-knob.on": { target: ChannelTarget; value: boolean };
+  "channel.comp.one-knob.level": { target: ChannelTarget; value: number };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

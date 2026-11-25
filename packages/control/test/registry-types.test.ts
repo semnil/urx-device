@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
-import type { InputTarget, SourceTarget } from "../src/catalog/settings.js";
+import {
+  settingIds,
+  type ChannelTarget,
+  type InputTarget,
+  type SettingId,
+  type SourceTarget,
+} from "../src/catalog/settings.js";
 import { OperationContext } from "../src/operations/context.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 // Type-level checks: each line marked @ts-expect-error must fail to compile.
+type ChannelId = Extract<SettingId, `channel.${string}`>;
+// The catalog's channel settings, filtered by name only: every one accepts a plain channel target.
+const channelIds = settingIds().filter((id): id is ChannelId => id.startsWith("channel."));
+
 describe("registry argument types", () => {
   it("bind each ID to its own target and value", () => {
     const context = new OperationContext(new FakeTransport(), "URX44");
@@ -33,6 +43,59 @@ describe("registry argument types", () => {
       void written;
       // @ts-expect-error a read-side name object is not a write value
       void writeSetting(context, "channel.name", { channel: 1 }, { kind: "text", text: "Lead" });
+      // Every channel-target ID from the catalog list, read alike, however many there are.
+      for (const each of channelIds) {
+        void readSetting(context, each, { channel: 1 });
+      }
+      const levels = "channel.gate.threshold" as "channel.gate.threshold" | "channel.comp.gain" | "channel.fader";
+      const level: Promise<{ planned: number | "-inf" }> = writeSetting(context, levels, { channel: 1 }, -3);
+      void level;
+      void previewSetting("URX44", levels, { channel: 1 }, -3);
+      const sided = "channel.polarity" as "channel.polarity" | "channel.source";
+      void readSetting(context, sided, { channel: 5, side: "left" });
+      const sidedAndWhole = "channel.polarity" as "channel.polarity" | "channel.fader";
+      // @ts-expect-error a whole-channel setting takes no side
+      void readSetting(context, sidedAndWhole, { channel: 5, side: "left" });
+      const withInput = "channel.on" as "channel.on" | "input.phantom";
+      // @ts-expect-error a channel target is not an input target
+      void readSetting(context, withInput, { channel: 1 });
+      // @ts-expect-error "-inf" is not a value every ID of the group takes
+      void writeSetting(context, levels, { channel: 1 }, "-inf");
+      // Values of a union type every ID of the group takes: both booleans, a level or "-inf".
+      const switches = "channel.on" as "channel.on" | "channel.gate.on";
+      void writeSetting(context, switches, { channel: 1 }, Math.random() > 0.5);
+      const floors = "channel.fader" as "channel.fader" | "channel.gate.range";
+      void previewSetting("URX44", floors, { channel: 1 }, "-inf");
+      void writeSetting(context, floors, { channel: 1 }, -12);
+      // An adapter forwarding the published parameter types takes every valid call.
+      const reads = (...[on, ...args]: Parameters<typeof readSetting>) => readSetting(on, ...args);
+      const writes = (...[on, ...args]: Parameters<typeof writeSetting>) => writeSetting(on, ...args);
+      const previews = (...[model, ...args]: Parameters<typeof previewSetting>) => previewSetting(model, ...args);
+      void reads(context, "input.gain", { input: 1 });
+      for (const each of channelIds) {
+        void reads(context, each, { channel: 1 });
+      }
+      void writes(context, "input.phantom", { input: 1 }, true);
+      void previews("URX44", "channel.fader", { channel: 1 }, "-inf");
+      void writes(context, switches, { channel: 1 }, false);
+      // @ts-expect-error the forwarded types keep each ID's own target
+      void reads(context, "input.gain", { channel: 1 });
+      // @ts-expect-error the forwarded types keep each ID's own value
+      void writes(context, "input.phantom", { input: 1 }, 3);
+      // A pair whose ID is the union of the channel settings.
+      const wide = [channelIds[0] as ChannelId, { channel: 1 }] as [id: ChannelId, target: ChannelTarget];
+      void readSetting(context, ...wide);
+      const edits =
+        Math.random() > 2
+          ? (["input.phantom", { input: 1 }, true] as ["input.phantom", InputTarget, boolean])
+          : (["channel.fader", { channel: 1 }, -3] as ["channel.fader", ChannelTarget, number | "-inf"]);
+      void writeSetting(context, ...edits);
+      void previewSetting("URX44", ...edits);
+      // @ts-expect-error a forwarded preview keeps the value type
+      void previews("URX44", "channel.fader", { channel: 1 }, true);
+      const mixed = "input.gain" as "input.gain" | "channel.fader";
+      // @ts-expect-error a selector uncorrelated with the target
+      void readSetting(context, mixed, { channel: 1 });
     };
     expect(typeof checks).toBe("function");
   });

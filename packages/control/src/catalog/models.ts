@@ -2,7 +2,9 @@
 // outside this list may still be listed by discovery (D14) but has no
 // supported operations.
 
-export const MODELS = ["URX22", "URX44", "URX44V"] as const;
+import { frozen } from "./frozen.js";
+
+export const MODELS = frozen(["URX22", "URX44", "URX44V"] as const);
 
 export type Model = (typeof MODELS)[number];
 
