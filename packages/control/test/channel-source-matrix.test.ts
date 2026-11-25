@@ -66,6 +66,7 @@ describe("input-port selection matrix (F03-I)", () => {
           const at = { paramId, x: "0", y };
           if (!models.includes(model)) {
             const transport = new FakeTransport().script("getNumeric", { kind: "success", value: raw, evidence: { state: "read" } });
+            transport.timers = false;
             const c = new OperationContext(transport, model);
             expect(() => previewSetting(model, "channel.source", target, token)).toThrow();
             expect((await failureOf(writeSetting(c, "channel.source", target, token)))?.code).toBe("unsupported_operation");
@@ -76,6 +77,7 @@ describe("input-port selection matrix (F03-I)", () => {
           const transport = new FakeTransport()
             .script("getNumeric", { kind: "success", value: raw, evidence: { state: "read" } })
             .script("setNumeric", { kind: "success", value: null, evidence: { state: "accepted" } });
+          transport.timers = false;
           const c = new OperationContext(transport, model);
           expect(previewSetting(model, "channel.source", target, token)).toEqual({ requested: token, planned: token });
           expect((await readSetting(c, "channel.source", target)).value).toBe(token);

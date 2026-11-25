@@ -70,6 +70,8 @@ export class FakeTransport implements Transport {
 
   /** How `adoptResult` and `failDelivery` complete; resolving by default. */
   completion: "resolve" | "throw" | "reject" = "resolve";
+  /** Whether completions wait for a timer; off for tests issuing many requests. */
+  timers = true;
   readonly terminated: string[] = [];
 
   terminate(requestTicket: string): Promise<void> {
@@ -93,16 +95,18 @@ export class FakeTransport implements Transport {
     if (this.completion === "throw") {
       throw new Error("adapter failure");
     }
-    // Recorded only once the asynchronous completion runs.
+    // Recorded only once the asynchronous completion runs: after a timer,
+    // or in a microtask when `timers` is off.
+    const later = (run: () => void) => (this.timers ? setTimeout(run, 1) : queueMicrotask(run));
     return new Promise((resolve, reject) => {
-      setTimeout(() => {
+      later(() => {
         record();
         if (this.completion === "reject") {
           reject(new Error("adapter failure"));
         } else {
           resolve();
         }
-      }, 1);
+      });
     });
   }
 
