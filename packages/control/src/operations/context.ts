@@ -46,12 +46,20 @@ export class OperationContext {
   /** The connected unit's model, as the app verified it. */
   readonly model: string;
   readonly #operation: TransportOperation;
+  readonly #clock: () => Date;
   #stopping: OperationCause | undefined;
 
-  constructor(transport: Transport, model: string) {
+  /** `clock` gives observation times (O5); the system clock by default. */
+  constructor(transport: Transport, model: string, clock: () => Date = () => new Date()) {
     this.transport = transport;
     this.model = model;
     this.#operation = transport.createOperation();
+    this.#clock = clock;
+  }
+
+  /** The current observation time, UTC ISO 8601. */
+  now(): string {
+    return this.#clock().toISOString();
   }
 
   /**
