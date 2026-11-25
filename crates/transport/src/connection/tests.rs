@@ -1021,7 +1021,6 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
-            generation: 0,
         }),
         written: Vec::new(),
         end_before_write,
@@ -1920,7 +1919,7 @@ mod notifications {
     use super::{firmware, online, options, ID, TEARDOWN};
     use crate::connection::{open_with, CloseOutcome, Connection, NotificationHandler};
     use crate::delivery::{NotificationBatch, MAX_PENDING_NOTIFICATIONS};
-    use crate::lifecycle::Control;
+    use crate::lifecycle::{Cause, Control, Failure, Phase};
     use crate::request::{Outcome, Request, RequestCause};
     use crate::subscription::SubscriptionAddress;
     use crate::test_peer::{get_reply, line, uri_of};
@@ -1929,7 +1928,7 @@ mod notifications {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
     use std::thread;
     use std::time::Duration;
 
@@ -2162,5 +2161,233 @@ mod notifications {
             Some(RequestCause::NotificationOverflow)
         );
         assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    /// Submits a GET whose completion callback blocks the worker until the
+    /// returned sender is used.
+    fn block_worker(connection: &Connection) -> (Sender<()>, Receiver<()>) {
+        let operation = connection.create_operation().unwrap();
+        let (release, blocked) = mpsc::channel::<()>();
+        let (entered_tx, entered) = mpsc::channel();
+        connection.submit(&operation, Request::GetNumeric(param(5)), move |_| {
+            let _ = entered_tx.send(());
+            let _ = blocked.recv();
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        (release, entered)
+    }
+
+    #[test]
+    fn recipients_are_decided_at_receipt_while_the_worker_is_busy() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, batches) = connect(port);
+        let a = activate(&connection, &[p(1)]);
+        let (release, _) = block_worker(&connection);
+        push.send(notify_param(1, 1)).unwrap();
+        let batch = next(&batches);
+        assert_eq!(batch.records[0].recipients, [a.token()]);
+        let b = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert!(connection.adopt_notifications(batch.ticket));
+        push.send(notify_param(1, 2)).unwrap();
+        let batch = next(&batches);
+        assert_eq!(batch.records[0].recipients, [a.token(), b.token()]);
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn the_budget_is_charged_at_receipt_while_the_worker_is_busy() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let (release, _) = block_worker(&connection);
+        for value in 0..MAX_PENDING_NOTIFICATIONS as i64 {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        let queue = connection.shared.notifications.as_ref().unwrap();
+        super::wait_until(|| {
+            crate::connection::lock(queue).retained().0 == MAX_PENDING_NOTIFICATIONS
+        });
+        assert_eq!(*connection.shared.link_end(), None, "exactly the limit");
+        push.send(notify_param(1, -1)).unwrap();
+        super::wait_until(|| connection.shared.link_end().is_some());
+        assert_eq!(
+            *connection.shared.link_end(),
+            Some(RequestCause::NotificationOverflow)
+        );
+        release.send(()).unwrap();
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(
+            connection.terminal(),
+            Some(RequestCause::NotificationOverflow)
+        );
+    }
+
+    #[test]
+    fn a_reply_after_an_overflow_is_kept_and_the_connection_ends_with_the_overflow() {
+        let (port, push) = pushing_unit(Duration::from_millis(300));
+        let (connection, _batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let (tx, done) = mpsc::channel();
+        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        let (later_tx, later) = mpsc::channel();
+        connection.submit(&operation, Request::GetNumeric(param(6)), move |outcome| {
+            let _ = later_tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        for value in 0..=(MAX_PENDING_NOTIFICATIONS as i64) {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        assert!(
+            matches!(
+                done.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Outcome::Success { .. }
+            ),
+            "the reply within its deadline is the evidence"
+        );
+        assert!(matches!(
+            later.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Outcome::Failure {
+                evidence: crate::request::Evidence::NotSent,
+                ..
+            }
+        ));
+        assert_eq!(
+            connection.terminal(),
+            Some(RequestCause::NotificationOverflow)
+        );
+    }
+
+    #[test]
+    fn an_overflow_during_a_registration_is_its_cause() {
+        let (port, push) = pushing_unit(Duration::from_millis(300));
+        let (connection, _batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let token = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, rx) = mpsc::channel();
+        token.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        for value in 0..=(MAX_PENDING_NOTIFICATIONS as i64) {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        let failure = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            Failure::Cause {
+                code: Cause::NotificationOverflow,
+                phase: Phase::Subscription
+            }
+        );
+        assert_eq!(
+            connection.terminal(),
+            Some(RequestCause::NotificationOverflow)
+        );
+    }
+
+    #[test]
+    fn a_ticket_of_another_connection_does_not_release_a_batch() {
+        let (port_a, push_a) = pushing_unit(Duration::ZERO);
+        let (port_b, push_b) = pushing_unit(Duration::ZERO);
+        let (a, batches_a) = connect(port_a);
+        let (b, batches_b) = connect(port_b);
+        let _ta = activate(&a, &[p(1)]);
+        let _tb = activate(&b, &[p(1)]);
+        push_a.send(notify_param(1, 1)).unwrap();
+        push_b.send(notify_param(1, 1)).unwrap();
+        let first_a = next(&batches_a);
+        let first_b = next(&batches_b);
+        assert!(!b.adopt_notifications(first_a.ticket));
+        assert!(b.adopt_notifications(first_b.ticket));
+    }
+
+    /// A connection whose delivery callback runs `on_batch` with it.
+    fn connect_calling(
+        port: u16,
+        on_batch: impl Fn(&Connection, NotificationBatch) + Send + Sync + 'static,
+    ) -> Arc<Connection> {
+        let slot: Arc<OnceLock<Weak<Connection>>> = Arc::new(OnceLock::new());
+        let seen = Arc::clone(&slot);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            if let Some(connection) = seen.get().and_then(Weak::upgrade) {
+                on_batch(&connection, batch);
+            }
+        });
+        let connection =
+            Arc::new(open_with(port, ID, &options(), &Control::new(), Some(handler)).unwrap());
+        slot.set(Arc::downgrade(&connection)).unwrap();
+        connection
+    }
+
+    #[test]
+    fn a_close_from_the_delivery_callback_does_not_wait_for_itself() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (tx, inner) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let connection = connect_calling(port, move |connection, _| {
+            let _ = tx.lock().unwrap().send(connection.close(TEARDOWN));
+        });
+        let _token = activate(&connection, &[p(1)]);
+        push.send(notify_param(1, 1)).unwrap();
+        assert_eq!(
+            inner.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn the_delivery_callback_joining_a_close_does_not_wait_for_it() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (entered_tx, entered) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel::<()>();
+        let (tx, inner) = mpsc::channel();
+        let state = Mutex::new((entered_tx, go, tx));
+        let connection = connect_calling(port, move |connection, _| {
+            let state = state.lock().unwrap();
+            let _ = state.0.send(());
+            let _ = state.1.recv();
+            let _ = state.2.send(connection.close(TEARDOWN));
+        });
+        let _token = activate(&connection, &[p(1)]);
+        push.send(notify_param(1, 1)).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let closer = {
+            let connection = Arc::clone(&connection);
+            thread::spawn(move || connection.close(TEARDOWN))
+        };
+        super::wait_until(|| connection.shared.lock().closing);
+        go_tx.send(()).unwrap();
+        assert_eq!(
+            inner.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn a_failed_delivery_callback_ends_the_connection() {
+        for acknowledge in [false, true] {
+            let (port, push) = pushing_unit(Duration::ZERO);
+            let connection = connect_calling(port, move |connection, batch| {
+                if acknowledge {
+                    assert!(connection.adopt_notifications(batch.ticket));
+                }
+                panic!("the application failed");
+            });
+            let _token = activate(&connection, &[p(1)]);
+            push.send(notify_param(1, 1)).unwrap();
+            super::wait_until(|| connection.terminal().is_some());
+            assert_eq!(connection.terminal(), Some(RequestCause::InternalError));
+            assert!(connection.create_operation().is_err());
+            assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        }
     }
 }

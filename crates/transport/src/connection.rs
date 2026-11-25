@@ -133,7 +133,6 @@ struct Shared {
     /// Signalled when a batch can be formed or delivery must stop.
     deliverable: Condvar,
     delivery_stop: AtomicBool,
-    generation: u64,
 }
 
 impl Shared {
@@ -181,8 +180,9 @@ pub struct Connection {
     reader_stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     delivery: Mutex<Option<JoinHandle<()>>>,
-    /// Kept apart from the handle, which a close takes.
+    /// Kept apart from the handles, which a close takes.
     worker_id: ThreadId,
+    delivery_id: Option<ThreadId>,
     reader: Mutex<Option<JoinHandle<()>>>,
     close: Arc<CloseCell>,
 }
@@ -310,16 +310,18 @@ impl Connection {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
             settled: Condvar::new(),
-            notifications: notifications.as_ref().map(|_| Mutex::new(Queue::new())),
+            notifications: notifications
+                .as_ref()
+                .map(|_| Mutex::new(Queue::new(generation))),
             deliverable: Condvar::new(),
             delivery_stop: AtomicBool::new(false),
-            generation,
-        });
-        let delivery_thread = notifications.map(|handler| {
-            let shared = Arc::clone(&shared);
-            thread::spawn(move || deliver_notifications(&shared, &handler))
         });
         let (events, inbox) = mpsc::channel();
+        let delivery_thread = notifications.map(|handler| {
+            let shared = Arc::clone(&shared);
+            let events = events.clone();
+            thread::spawn(move || deliver_notifications(&shared, &handler, &events))
+        });
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_thread = {
             let sock = sock.try_clone()?;
@@ -336,6 +338,7 @@ impl Connection {
         };
         Ok(Connection {
             generation,
+            delivery_id: delivery_thread.as_ref().map(|handle| handle.thread().id()),
             delivery: Mutex::new(delivery_thread),
             firmware,
             shared,
@@ -543,7 +546,15 @@ impl Connection {
         if let Some(sock) = lock(&self.sock).take() {
             let _ = sock.shutdown(Shutdown::Both);
         }
-        self.shared.delivery_stop.store(true, Ordering::SeqCst);
+        // Under the queue lock, so the delivery thread cannot miss it
+        // between checking it and waiting.
+        match &self.shared.notifications {
+            Some(queue) => {
+                let _queue = lock(queue);
+                self.shared.delivery_stop.store(true, Ordering::SeqCst);
+            }
+            None => self.shared.delivery_stop.store(true, Ordering::SeqCst),
+        }
         self.shared.deliverable.notify_all();
         let threads = [
             delivery,
@@ -551,9 +562,9 @@ impl Connection {
             lock(&self.reader).take(),
             lock(&self.delivery).take(),
         ];
-        if self.on_worker() {
-            // A completion callback cannot wait for the worker it runs on; a
-            // helper waits for the threads within the same budget.
+        if self.on_own_thread() {
+            // A completion or delivery callback cannot wait for the thread it
+            // runs on; a helper waits for the threads within the same budget.
             let cell = Arc::clone(&self.close);
             thread::spawn(move || cell.record(wait_for(threads, end)));
             return CloseOutcome::Started;
@@ -564,14 +575,17 @@ impl Connection {
     }
 
     /// Whether this thread is one the close waits for: the worker, the
-    /// thread running the close, or the one delivering waiting outcomes.
+    /// notification delivery thread, the thread running the close, or the
+    /// one delivering waiting outcomes.
     fn must_not_wait(&self) -> bool {
         let me = thread::current().id();
-        self.on_worker() || lock(&self.close.exempt).contains(&me)
+        self.on_own_thread() || lock(&self.close.exempt).contains(&me)
     }
 
-    fn on_worker(&self) -> bool {
-        self.worker_id == thread::current().id()
+    /// Whether this is the worker or the notification delivery thread.
+    fn on_own_thread(&self) -> bool {
+        let me = thread::current().id();
+        self.worker_id == me || self.delivery_id == Some(me)
     }
 }
 
@@ -711,9 +725,8 @@ fn lifecycle_cause(cause: RequestCause) -> Cause {
         RequestCause::ConnectionLost => Cause::ConnectionLost,
         RequestCause::NotConnected => Cause::NotConnected,
         RequestCause::PreconditionFailed => Cause::PreconditionFailed,
-        RequestCause::InvalidInput
-        | RequestCause::NotificationOverflow
-        | RequestCause::InternalError => Cause::InternalError,
+        RequestCause::NotificationOverflow => Cause::NotificationOverflow,
+        RequestCause::InvalidInput | RequestCause::InternalError => Cause::InternalError,
     }
 }
 
@@ -794,12 +807,26 @@ fn now_ms() -> i64 {
         })
 }
 
-/// Queues the notification in `received` for the tokens eligible now, when
-/// the application takes notifications and any token is eligible. A record
-/// that does not fit the budget ends the connection (K6).
-fn route(shared: &Shared, received: Received) -> Option<RequestCause> {
-    let queue = shared.notifications.as_ref()?;
-    let payload = Inbound::new(received.message).notification()?;
+/// What [`route`] did with a received frame.
+enum Routed {
+    /// Not a notification: the worker takes it.
+    NotNotification,
+    Queued,
+    /// A notification no token is eligible for, or the application takes none.
+    Dropped,
+    /// A notification beyond the delivery budget (K6).
+    Overflow,
+}
+
+/// Decides, at receipt, which tokens a notification frame is for, and
+/// queues it for them within the budget (K6).
+fn route(shared: &Shared, received: &Received) -> Routed {
+    let Some(payload) = Inbound::new(received.message.clone()).notification() else {
+        return Routed::NotNotification;
+    };
+    let Some(queue) = shared.notifications.as_ref() else {
+        return Routed::Dropped;
+    };
     let recipients = {
         let state = shared.lock();
         match &payload {
@@ -815,7 +842,7 @@ fn route(shared: &Shared, received: Received) -> Option<RequestCause> {
         }
     };
     if recipients.is_empty() {
-        return None;
+        return Routed::Dropped;
     }
     let record = NotificationRecord {
         recipients,
@@ -824,12 +851,15 @@ fn route(shared: &Shared, received: Received) -> Option<RequestCause> {
     };
     let pushed = lock(queue).push(record, received.len);
     shared.deliverable.notify_all();
-    pushed.err().map(|_| RequestCause::NotificationOverflow)
+    match pushed {
+        Ok(()) => Routed::Queued,
+        Err(_) => Routed::Overflow,
+    }
 }
 
 /// The delivery thread: hands one batch at a time to `handler` and waits
 /// for its acknowledgment before the next, until the connection closes.
-fn deliver_notifications(shared: &Shared, handler: &NotificationHandler) {
+fn deliver_notifications(shared: &Shared, handler: &NotificationHandler, events: &Sender<Event>) {
     let Some(queue) = &shared.notifications else {
         return;
     };
@@ -840,7 +870,7 @@ fn deliver_notifications(shared: &Shared, handler: &NotificationHandler) {
                 if shared.delivery_stop.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Some(batch) = queue.next_batch(shared.generation) {
+                if let Some(batch) = queue.next_batch() {
                     break batch;
                 }
                 queue = shared
@@ -849,7 +879,13 @@ fn deliver_notifications(shared: &Shared, handler: &NotificationHandler) {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         };
-        let _ = panic::catch_unwind(AssertUnwindSafe(|| handler(batch)));
+        if panic::catch_unwind(AssertUnwindSafe(|| handler(batch))).is_err() {
+            // The application can no longer adopt notifications: the
+            // connection ends, and delivery stops.
+            shared.link_end().get_or_insert(RequestCause::InternalError);
+            let _ = events.send(Event::ReadFailed(RequestCause::InternalError));
+            return;
+        }
     }
 }
 
@@ -864,6 +900,9 @@ fn read_frames(
     let record = |cause| {
         shared.link_end().get_or_insert(cause);
     };
+    // After an overflow, replies to a request already sent still arrive;
+    // further notifications are not queued.
+    let mut overflowed = false;
     if sock.set_read_timeout(Some(READ_POLL)).is_err() {
         record(RequestCause::ConnectionLost);
         let _ = events.send(Event::ReadFailed(RequestCause::ConnectionLost));
@@ -881,6 +920,20 @@ fn read_frames(
                         len: frame.len,
                         received_at_ms: now_ms(),
                     };
+                    // Recipients and budget are decided here, at receipt.
+                    match route(&shared, &received) {
+                        Routed::NotNotification => {}
+                        Routed::Queued | Routed::Dropped => continue,
+                        Routed::Overflow => {
+                            if !overflowed {
+                                overflowed = true;
+                                record(RequestCause::NotificationOverflow);
+                                let _ = events
+                                    .send(Event::ReadFailed(RequestCause::NotificationOverflow));
+                            }
+                            continue;
+                        }
+                    }
                     if events.send(Event::Frame(received)).is_err() {
                         return;
                     }
@@ -971,11 +1024,7 @@ fn serve(
             None => match inbox.recv() {
                 Ok(Event::Wake) => None,
                 Ok(Event::Frame(received)) => {
-                    if lost_notification(&received.message) {
-                        Some(RequestCause::ConnectionLost)
-                    } else {
-                        route(&shared, received)
-                    }
+                    lost_notification(&received.message).then_some(RequestCause::ConnectionLost)
                 }
                 Ok(Event::ReadFailed(cause)) => Some(cause),
                 Err(_) => return,
@@ -1193,10 +1242,18 @@ impl Io<'_> {
             unstarted: &unstarted,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
-            Ok(inbound) => {
+            Ok((inbound, ending)) => {
                 let reply = inbound
                     .reply(&key)
                     .expect("exchange returns the matching reply");
+                if let Some(cause) = ending {
+                    let verdict = match reply.post_verdict() {
+                        PostVerdict::Accepted => Verdict::Accepted,
+                        PostVerdict::Rejected(_) => Verdict::Rejected,
+                        PostVerdict::Malformed => Verdict::Unknown,
+                    };
+                    return refused(verdict, cause, true);
+                }
                 match reply.post_verdict() {
                     PostVerdict::Accepted => Posted::Accepted,
                     PostVerdict::Rejected(_) => {
@@ -1421,11 +1478,11 @@ fn execute(
         unstarted: &unstarted,
     };
     match exchange(sock, inbox, shared, options, outbound) {
-        Ok(inbound) => {
+        Ok((inbound, ending)) => {
             let reply = inbound
                 .reply(key)
                 .expect("exchange returns the matching reply");
-            (decode(request, reply), None)
+            (decode(request, reply), ending)
         }
         Err(failed) => (
             Outcome::Failure {
@@ -1483,7 +1540,7 @@ fn exchange(
     shared: &Shared,
     options: &ConnectionOptions,
     outbound: Outbound<'_>,
-) -> Result<Inbound, Failed> {
+) -> Result<(Inbound, Option<RequestCause>), Failed> {
     let Outbound {
         frame,
         key,
@@ -1529,6 +1586,9 @@ fn exchange(
             true,
         ))
     };
+    // An overflow ends the connection but not this request: its reply is
+    // still awaited within its deadline and kept as evidence.
+    let mut ending = None;
     loop {
         let remaining = response_end.saturating_duration_since(Instant::now());
         let event = if remaining.is_zero() {
@@ -1541,17 +1601,19 @@ fn exchange(
                 if lost_notification(&received.message) {
                     return unconfirmed(RequestCause::ConnectionLost);
                 }
-                let inbound = Inbound::new(received.message.clone());
+                let inbound = Inbound::new(received.message);
                 if inbound.reply(key).is_some() {
-                    return Ok(inbound);
-                }
-                if let Some(cause) = route(shared, received) {
-                    return unconfirmed(cause);
+                    return Ok((inbound, ending));
                 }
             }
             Ok(Event::Wake) => {}
+            Ok(Event::ReadFailed(RequestCause::NotificationOverflow)) => {
+                ending = Some(RequestCause::NotificationOverflow);
+            }
             Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
-            Err(RecvTimeoutError::Timeout) => return unconfirmed(RequestCause::ResponseTimeout),
+            Err(RecvTimeoutError::Timeout) => {
+                return unconfirmed(ending.unwrap_or(RequestCause::ResponseTimeout))
+            }
             Err(RecvTimeoutError::Disconnected) => return unconfirmed(RequestCause::InternalError),
         }
     }

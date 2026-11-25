@@ -26,9 +26,13 @@ pub struct NotificationRecord {
     pub payload: Notification,
 }
 
-/// Identifies one delivered batch; only its own acknowledgment releases it.
+/// Identifies one delivered batch of one connection; only its own
+/// acknowledgment releases it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BatchTicket(u64);
+pub struct BatchTicket {
+    generation: u64,
+    sequence: u64,
+}
 
 /// Records handed to the application together, in receive order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +56,9 @@ struct InDelivery {
 }
 
 /// The pending records of one connection and its batch in delivery.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Queue {
+    generation: u64,
     pending: VecDeque<(NotificationRecord, usize)>,
     pending_bytes: usize,
     in_delivery: Option<InDelivery>,
@@ -61,8 +66,16 @@ pub struct Queue {
 }
 
 impl Queue {
-    pub fn new() -> Self {
-        Self::default()
+    /// The queue of the connection with `generation`, which its batches and
+    /// tickets carry.
+    pub fn new(generation: u64) -> Self {
+        Queue {
+            generation,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            in_delivery: None,
+            next_ticket: 0,
+        }
     }
 
     /// Queues `record`, charged `bytes` (its originating frame's length),
@@ -91,7 +104,7 @@ impl Queue {
     /// The next batch, when none is in delivery and records are pending: the
     /// oldest records up to [`MAX_BATCH_RECORDS`] and [`MAX_BATCH_BYTES`]
     /// (at least one record). They stay charged until [`Queue::adopt`].
-    pub fn next_batch(&mut self, generation: u64) -> Option<NotificationBatch> {
+    pub fn next_batch(&mut self) -> Option<NotificationBatch> {
         if self.in_delivery.is_some() || self.pending.is_empty() {
             return None;
         }
@@ -109,14 +122,17 @@ impl Queue {
             records.push(record);
         }
         self.next_ticket += 1;
-        let ticket = BatchTicket(self.next_ticket);
+        let ticket = BatchTicket {
+            generation: self.generation,
+            sequence: self.next_ticket,
+        };
         self.in_delivery = Some(InDelivery {
             ticket,
             records: records.len(),
             bytes,
         });
         Some(NotificationBatch {
-            generation,
+            generation: self.generation,
             ticket,
             records,
         })

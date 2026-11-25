@@ -33,6 +33,8 @@ pub enum Cause {
     NotConnected,
     /// A local limit refused the call before anything was sent.
     PreconditionFailed,
+    /// A notification did not fit the delivery budget (K6).
+    NotificationOverflow,
     /// An unexpected internal failure.
     InternalError,
 }
