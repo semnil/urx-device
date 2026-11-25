@@ -52,7 +52,12 @@ describe("operation context", () => {
       transport.completion = completion;
       const error = await new OperationContext(transport, "URX44").getText(address).catch((caught: unknown) => caught);
       expect(operationFailureOf(error)).toEqual({ code: "internal_error", phase: "delivery", progress: null });
+      expect(transport.terminated, "the connection's end takes the slot before returning").toBe(1);
     }
+    const handedOver = new FakeTransport().script("getText", { kind: "success", value: 1, evidence: { state: "read" } });
+    await new OperationContext(handedOver, "URX44").getText(address).catch(() => undefined);
+    expect(handedOver.undelivered).toEqual(["t0"]);
+    expect(handedOver.terminated).toBe(0);
   });
 
   it("takes tickets from the connection, so two operations never share one", async () => {

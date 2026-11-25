@@ -70,6 +70,16 @@ export class FakeTransport implements Transport {
 
   /** How `adoptResult` and `failDelivery` complete; resolving by default. */
   completion: "resolve" | "throw" | "reject" = "resolve";
+  terminated = 0;
+
+  terminate(): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        this.terminated += 1;
+        resolve();
+      }, 1);
+    });
+  }
 
   adoptResult(requestTicket: string): Promise<void> {
     return this.#complete(() => this.adopted.push(requestTicket));
