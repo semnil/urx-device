@@ -90,6 +90,10 @@ export interface PortChoiceRule {
   readonly none: Sentinel;
   readonly known: readonly string[];
   readonly byModel: { readonly [model: string]: readonly { readonly token: string; readonly id: number }[] };
+  /** The tokens a write may send, `none` included where listed; absent: every readable token and `none`. */
+  readonly writes?: readonly string[];
+  /** Whether a write sends the identifier with the high tag bit set. */
+  readonly tagged?: boolean;
 }
 
 /**
@@ -255,7 +259,8 @@ export interface FxParameterRule {
 
 /** One side of a bus: its parameter ID and the y of each side. */
 export interface BusSideAddress {
-  readonly paramId: number;
+  /** One ID for both sides, or one per side. */
+  readonly paramId: number | { readonly left: number; readonly right: number };
   readonly y: { readonly left: number; readonly right: number };
   readonly write: boolean;
 }
@@ -315,7 +320,29 @@ export interface BusBandSettingRule {
   readonly value: ValueRule | ByBandRule;
 }
 
+/**
+ * An output destination's per-side setting (F07-R): the target names an
+ * output and a side. An output a model lacks is unsupported there; an address
+ * entry's `value` replaces the shared value rule for that output.
+ */
+export interface OutputSideSettingRule {
+  readonly target: "output-side";
+  readonly known: readonly string[];
+  readonly address: {
+    readonly [output: string]:
+      | {
+          readonly paramId: number;
+          readonly y: { readonly left: number; readonly right: number };
+          readonly models: readonly string[];
+          readonly value?: ValueRule;
+        }
+      | undefined;
+  };
+  readonly value: ValueRule;
+}
+
 export type SettingRule =
+  | OutputSideSettingRule
   | BusBandSettingRule
   | ChannelSettingRule
   | ChannelBandSettingRule

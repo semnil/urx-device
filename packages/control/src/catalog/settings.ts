@@ -11,6 +11,7 @@ import { INSERT_FX_RULES, type INSERT_FX_EFFECTS } from "./insert-fx.js";
 import { FX_RETURN_RULES, type FX_RETURN_EFFECTS } from "./fx-return.js";
 import { OUTPUT_EQ_RULES, type GEQ_BANDS } from "./output-eq.js";
 import { OUTPUT_PEQ_RULES } from "./output-peq.js";
+import { OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES } from "./output-routing.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -137,6 +138,11 @@ export const settingDefinitions = frozen({
   "bus.peq.one-knob.on": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.on"] },
   "bus.peq.one-knob.type": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.type"] },
   "bus.peq.one-knob.level": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.level"] },
+  "bus.delay.on": { readable: true, writable: true, rule: STREAM_DELAY_RULES["bus.delay.on"] },
+  "bus.delay.time": { readable: true, writable: true, rule: STREAM_DELAY_RULES["bus.delay.time"] },
+  "bus.delay.frame-rate": { readable: true, writable: true, rule: STREAM_DELAY_RULES["bus.delay.frame-rate"] },
+  "output.source": { readable: true, writable: true, rule: OUTPUT_SOURCE_RULES["output.source"] },
+  "bus.source": { readable: true, writable: true, rule: OUTPUT_SOURCE_RULES["bus.source"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -195,6 +201,13 @@ export interface BusTarget {
 /** One side of an output bus (F07-G). */
 export interface BusSideTarget {
   readonly bus: (typeof BUS_TOKENS)[number];
+  readonly side: "left" | "right";
+  readonly band?: never;
+}
+
+/** One side of a physical or USB output destination (F07-R). */
+export interface OutputSideTarget {
+  readonly output: "main" | "line" | "usb-main-a" | "usb-main-b" | "usb-main-c" | "usb-sub";
   readonly side: "left" | "right";
   readonly band?: never;
 }
@@ -391,6 +404,11 @@ export interface SettingTypes {
   "bus.peq.one-knob.on": { target: BusTarget; value: boolean };
   "bus.peq.one-knob.type": { target: BusTarget; value: EqOneKnobType };
   "bus.peq.one-knob.level": { target: BusTarget; value: number };
+  "bus.delay.on": { target: BusTarget; value: boolean };
+  "bus.delay.time": { target: BusTarget; value: number };
+  "bus.delay.frame-rate": { target: BusTarget; value: string };
+  "output.source": { target: OutputSideTarget; value: string };
+  "bus.source": { target: BusSideTarget; value: string };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

@@ -11,6 +11,7 @@ import type {
   ChannelSettingRule,
   BusBandSettingRule,
   BusSideSettingRule,
+  OutputSideSettingRule,
   ContextStopsRule,
   FxParameterRule,
   GeqGainRule,
@@ -134,12 +135,13 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
       return choices.find((choice) => choice.id === id)?.token;
     },
     plan: (value) => {
+      const writable = (token: string) => rule.writes === undefined || rule.writes.includes(token);
       if (value === rule.none.value) {
-        return { planned: value, raw: rule.none.raw };
+        return writable(value) ? { planned: value, raw: rule.none.raw } : "unsupported";
       }
       const choice = choices.find((each) => each.token === value);
-      if (choice !== undefined) {
-        return { planned: value, raw: `${choice.id}` };
+      if (choice !== undefined && writable(choice.token)) {
+        return { planned: value, raw: `${rule.tagged === true ? BigInt(choice.id) + PORT_TAG : choice.id}` };
       }
       return rule.known.includes(value as string) ? "unsupported" : undefined;
     },
@@ -357,7 +359,9 @@ export function busRuleSetting<V, I = V>(rule: BusSettingRule) {
     if (at === undefined || (write && !at.write)) {
       return refuse("unsupported_operation");
     }
-    return { at: address(at.paramId, at.y), codec: perBus.get(own.bus) ?? shared };
+    const value = at.value ?? rule.value;
+    const codec = value.kind === "port-choice" ? codecOf(value, model) : (perBus.get(own.bus) ?? shared);
+    return { at: address(at.paramId, at.y), codec };
   });
 }
 
@@ -491,14 +495,17 @@ function busSide(model: string, target: unknown, known: readonly string[], extra
 
 /** A per-side bus setting whose handler is built from `rule`: the target names a bus and one side. */
 export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
-  const codec = codecOf(rule.value);
+  // A port choice depends on the model; any other codec is built once.
+  const fixed = rule.value.kind === "port-choice" ? undefined : codecOf(rule.value);
   return handler<V>((model, target, write) => {
     const { bus, side } = busSide(model, target, rule.known);
+    const codec = fixed ?? codecOf(rule.value, model);
     const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
     if (at === undefined || (write && !at.write)) {
       return refuse("unsupported_operation");
     }
-    return { at: address(at.paramId, at.y[side]), codec };
+    const paramId = typeof at.paramId === "number" ? at.paramId : at.paramId[side];
+    return { at: address(paramId, at.y[side]), codec };
   });
 }
 
@@ -603,6 +610,22 @@ export function busBandRuleSetting<V>(rule: BusBandSettingRule) {
       return refuse("unsupported_operation");
     }
     return { at: address(at.paramId, at.y), codec };
+  });
+}
+
+/** An output per-side setting whose handler is built from `rule`: the target names an output and one side. */
+export function outputSideRuleSetting<V>(rule: OutputSideSettingRule) {
+  return handler<V>((model, target) => {
+    const known = modelOf(model);
+    const own = targetOf<{ output?: unknown; side?: unknown }>(target, ["output", "side"]);
+    if (typeof own.output !== "string" || !rule.known.includes(own.output) || !SIDES.includes(own.side as "left")) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.address, own.output) ? rule.address[own.output] : undefined;
+    if (at === undefined || !at.models.includes(known)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(at.paramId, at.y[own.side as "left" | "right"]), codec: codecOf(at.value ?? rule.value, known) };
   });
 }
 
