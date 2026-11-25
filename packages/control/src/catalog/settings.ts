@@ -2,6 +2,8 @@
 // setting ID with its definition; operations bind every ID to a handler.
 // Rows are added per K35 catalog part (stages D7–D15).
 
+import type { CHANNEL_COLORS } from "./channels.js";
+import type { I64Text } from "./i64.js";
 import type { SourceToken } from "./inputs.js";
 
 /** What every setting definition states, independent of its value types. */
@@ -31,6 +33,8 @@ export const settingDefinitions = {
   // Its write sequence needs evidence first (F03-J); readable until then.
   "channel.stereo-link": { readable: true, writable: false },
   "channel.pan-mode": { readable: true, writable: true },
+  "channel.name": { readable: true, writable: true },
+  "channel.color": { readable: true, writable: true },
 } as const satisfies Record<string, SettingDefinitionBase>;
 
 /** A known setting ID. */
@@ -73,6 +77,11 @@ export type Polarity = "normal" | "inverted";
 
 export type PanMode = "pan" | "balance";
 
+/** An observed channel name: the received text, or a numeric preset index (F03-K). */
+export type ChannelName = { kind: "text"; text: string } | { kind: "preset"; presetIndex: I64Text };
+
+export type ChannelColor = (typeof CHANNEL_COLORS)[number];
+
 /**
  * Each setting's target, observed value and requested value types (K35:
  * switches are boolean, levels are dB numbers).
@@ -91,6 +100,8 @@ export interface SettingTypes {
   "channel.source": { target: ChannelSideTarget; value: string };
   "channel.stereo-link": { target: ChannelTarget; value: boolean };
   "channel.pan-mode": { target: ChannelTarget; value: PanMode };
+  "channel.name": { target: ChannelTarget; value: ChannelName; input: string };
+  "channel.color": { target: ChannelTarget; value: ChannelColor };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

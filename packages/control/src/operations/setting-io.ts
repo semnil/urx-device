@@ -69,9 +69,27 @@ export async function writeRaw<V>(
   raw: I64Text,
   plan: WritePlan<V>,
 ): Promise<WriteResult<V>> {
+  return writeWith(context, () => context.setNumeric(at, raw), plan);
+}
+
+/** The single text write of `text` to `at` (a string parameter), reported like `writeRaw`. */
+export function writeText<V>(
+  context: OperationContext,
+  at: ParameterAddress,
+  text: string,
+  plan: WritePlan<V>,
+): Promise<WriteResult<V>> {
+  return writeWith(context, () => context.setText(at, text), plan);
+}
+
+async function writeWith<V>(
+  context: OperationContext,
+  send: () => Promise<NativePostResult>,
+  plan: WritePlan<V>,
+): Promise<WriteResult<V>> {
   let record: NativePostResult;
   try {
-    record = await context.setNumeric(at, raw);
+    record = await send();
   } catch (error) {
     // No trusted record: unsent when it failed before the request was
     // handed over, otherwise possibly sent (K34). The plan is kept.
