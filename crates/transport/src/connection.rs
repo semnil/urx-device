@@ -14,11 +14,14 @@
 
 use crate::discovery::{get, lost_notification, system_firmware, SystemFirmware};
 use crate::frame::{self, FrameReader, ReadError, MAX_FRAME_BYTES};
-use crate::lifecycle::{Cause, Control, Failure, Phase};
+use crate::lifecycle::{
+    Cause, Cleanup, CleanupState, Control, Failure, LifecycleFailure, LifecycleOutcome, Phase,
+};
 use crate::link::{Budget, Link};
 use crate::request::{
     Evidence, Outcome, ReadValue, Request, RequestCause, RequestFailure, RequestPhase,
 };
+use crate::subscription::{Ledger, StartRefusal, SubscriptionAddress, TokenId, Verdict};
 use crate::wire::{self, Inbound, PostVerdict, Reply, ReplyKey, WriteValue};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -79,6 +82,33 @@ struct State {
     terminal: Option<RequestCause>,
     cancelled_owners: Vec<u64>,
     next_owner: u64,
+    ledger: Ledger,
+    /// Subscription lifecycle work, run one job at a time ahead of requests.
+    jobs: VecDeque<Job>,
+    /// Tokens whose release was asked for, with the callers waiting on it.
+    releases: Vec<(TokenId, Vec<LifecycleDone>)>,
+}
+
+type LifecycleDone = Box<dyn FnOnce(LifecycleOutcome) + Send>;
+
+enum Job {
+    Activate {
+        token: TokenId,
+        owner: u64,
+        done: LifecycleDone,
+    },
+    Release {
+        token: TokenId,
+    },
+}
+
+/// A subscription token on its connection (K37). Admission is local;
+/// [`Subscription::activate`] registers its addresses and
+/// [`Subscription::release`] gives them up.
+pub struct Subscription {
+    token: TokenId,
+    shared: Weak<Shared>,
+    events: Sender<Event>,
 }
 
 struct Shared {
@@ -354,6 +384,32 @@ impl Connection {
         let _ = self.events.send(Event::Wake);
     }
 
+    /// Admits a subscription token for `addresses` without any device
+    /// traffic (K11). It receives notifications for them from now on; its
+    /// registrations start with [`Subscription::activate`].
+    pub fn prepare_subscription(
+        &self,
+        addresses: &[SubscriptionAddress],
+    ) -> Result<Subscription, LifecycleFailure> {
+        let mut state = self.shared.lock();
+        let refused = |code| LifecycleFailure {
+            failure: Failure::cause(code, Phase::Admission),
+            cleanup: Cleanup::COMPLETE,
+        };
+        if state.closing || state.terminal.is_some() {
+            return Err(refused(Cause::NotConnected));
+        }
+        let token = state
+            .ledger
+            .admit(addresses)
+            .map_err(|_| refused(Cause::PreconditionFailed))?;
+        Ok(Subscription {
+            token,
+            shared: Arc::downgrade(&self.shared),
+            events: self.events.clone(),
+        })
+    }
+
     /// Closes the connection. In order: new submissions and any request not
     /// yet started on the wire are refused, waiting requests complete unsent
     /// as `not_connected` (on a separate thread, so their callbacks never hold
@@ -387,10 +443,9 @@ impl Connection {
             let _gate = self.shared.link_end();
             let mut state = self.shared.lock();
             state.closing = true;
-            state.waiting_bytes = 0;
             *close = CloseState::Closing;
             lock(&self.close.exempt).push(thread::current().id());
-            std::mem::take(&mut state.waiting)
+            take_pending(&mut state)
         };
         let _ = self.events.send(Event::Wake);
         // Waiting requests complete on their own thread, which the close
@@ -400,16 +455,7 @@ impl Connection {
             let (go, ready) = mpsc::channel::<()>();
             let handle = thread::spawn(move || {
                 let _ = ready.recv();
-                for item in waiting {
-                    deliver(
-                        item.done,
-                        Outcome::failed(
-                            RequestCause::NotConnected,
-                            RequestPhase::Admission,
-                            Evidence::NotSent,
-                        ),
-                    );
-                }
+                waiting.complete(RequestCause::NotConnected);
             });
             lock(&self.close.exempt).push(handle.thread().id());
             let _ = go.send(());
@@ -499,6 +545,96 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Subscription {
+    pub fn token(&self) -> TokenId {
+        self.token
+    }
+
+    /// Registers the token's addresses one at a time, each verdict checked
+    /// before the next request (K9), as work of `operation`. `done` receives
+    /// success once every needed registration is accepted, or the first
+    /// failure with its cleanup: what this attempt registered alone is
+    /// unregistered again, and a cleanup that fails ends the connection.
+    /// Cancelling `operation`, or releasing the token, stops the unsent
+    /// registrations.
+    pub fn activate(
+        &self,
+        operation: &Operation,
+        done: impl FnOnce(LifecycleOutcome) + Send + 'static,
+    ) {
+        let Some(shared) = self.shared.upgrade() else {
+            return done(Err(not_connected(Phase::Subscription)));
+        };
+        let mut state = shared.lock();
+        let ours = operation.shared.ptr_eq(&self.shared);
+        if !ours || state.closing || state.terminal.is_some() {
+            drop(state);
+            return done(Err(not_connected(Phase::Subscription)));
+        }
+        state.jobs.push_back(Job::Activate {
+            token: self.token,
+            owner: operation.id,
+            done: Box::new(done),
+        });
+        drop(state);
+        let _ = self.events.send(Event::Wake);
+    }
+
+    /// Releases the token. A token never activated is released without
+    /// traffic; otherwise the addresses it was the last holder of are
+    /// unregistered, and a failure ends the connection. A release during the
+    /// token's activation stops it first. Repeated calls share one release.
+    pub fn release(&self, done: impl FnOnce(LifecycleOutcome) + Send + 'static) {
+        let Some(shared) = self.shared.upgrade() else {
+            return done(Err(not_connected(Phase::Subscription)));
+        };
+        let mut state = shared.lock();
+        if state.closing || state.terminal.is_some() {
+            drop(state);
+            return done(Err(not_connected(Phase::Subscription)));
+        }
+        let done: LifecycleDone = Box::new(done);
+        if let Some((_, waiting)) = state.releases.iter_mut().find(|(t, _)| *t == self.token) {
+            waiting.push(done);
+            return;
+        }
+        state.releases.push((self.token, vec![done]));
+        state.jobs.push_back(Job::Release { token: self.token });
+        drop(state);
+        let _ = self.events.send(Event::Wake);
+    }
+}
+
+fn not_connected(phase: Phase) -> LifecycleFailure {
+    LifecycleFailure {
+        failure: Failure::cause(Cause::NotConnected, phase),
+        cleanup: Cleanup {
+            state: CleanupState::ConnectionClosed,
+            failure: None,
+        },
+    }
+}
+
+fn lifecycle_cause(cause: RequestCause) -> Cause {
+    match cause {
+        RequestCause::SendTimeout => Cause::SendTimeout,
+        RequestCause::ResponseTimeout => Cause::ResponseTimeout,
+        RequestCause::TeardownTimeout => Cause::TeardownTimeout,
+        RequestCause::DeviceRejected => Cause::DeviceRejected,
+        RequestCause::InvalidResponse => Cause::InvalidResponse,
+        RequestCause::ConnectionLost => Cause::ConnectionLost,
+        RequestCause::NotConnected => Cause::NotConnected,
+        RequestCause::PreconditionFailed => Cause::PreconditionFailed,
+        RequestCause::InvalidInput
+        | RequestCause::NotificationOverflow
+        | RequestCause::InternalError => Cause::InternalError,
+    }
+}
+
+fn deliver_lifecycle(done: LifecycleDone, outcome: LifecycleOutcome) {
+    let _ = panic::catch_unwind(AssertUnwindSafe(move || done(outcome)));
 }
 
 impl Operation {
@@ -623,6 +759,28 @@ fn serve(
             finish(&mut sock, waiting, cause);
             return;
         }
+        let job = {
+            let mut state = shared.lock();
+            let job = state.jobs.pop_front();
+            state.active |= job.is_some();
+            job
+        };
+        if let Some(job) = job {
+            let (deliveries, fatal) = run_job(&mut sock, &inbox, &shared, &options, job);
+            let ended = fatal.map(|cause| mark_ended(&shared, cause));
+            {
+                shared.lock().active = false;
+                shared.settled.notify_all();
+            }
+            for (done, outcome) in deliveries {
+                deliver_lifecycle(done, outcome);
+            }
+            if let (Some(cause), Some(ended)) = (fatal, ended) {
+                finish(&mut sock, ended, cause);
+                return;
+            }
+            continue;
+        }
         let next = {
             let mut state = shared.lock();
             if state.closing && state.waiting.is_empty() {
@@ -672,21 +830,287 @@ fn serve(
 /// Records `cause` as the end of the connection and takes the waiting
 /// requests in the same step, so that no later cancellation or close changes
 /// how they end.
-fn mark_ended(shared: &Shared, cause: RequestCause) -> VecDeque<Item> {
+fn mark_ended(shared: &Shared, cause: RequestCause) -> Taken {
     let mut state = shared.lock();
     state.terminal.get_or_insert(cause);
-    state.waiting_bytes = 0;
-    std::mem::take(&mut state.waiting)
+    take_pending(&mut state)
 }
 
-/// Closes the socket and completes `waiting` unsent with `cause`.
-fn finish(sock: &mut TcpStream, waiting: VecDeque<Item>, cause: RequestCause) {
+/// What an end or a close takes from the state: waiting requests, pending
+/// lifecycle jobs and the callers waiting on releases.
+struct Taken {
+    waiting: VecDeque<Item>,
+    jobs: VecDeque<Job>,
+    releases: Vec<(TokenId, Vec<LifecycleDone>)>,
+}
+
+fn take_pending(state: &mut State) -> Taken {
+    state.waiting_bytes = 0;
+    Taken {
+        waiting: std::mem::take(&mut state.waiting),
+        jobs: std::mem::take(&mut state.jobs),
+        releases: std::mem::take(&mut state.releases),
+    }
+}
+
+impl Taken {
+    fn is_empty(&self) -> bool {
+        self.waiting.is_empty() && self.jobs.is_empty() && self.releases.is_empty()
+    }
+
+    /// Completes everything taken without sending anything: requests unsent
+    /// with `cause`, lifecycle calls as not connected.
+    fn complete(self, cause: RequestCause) {
+        for item in self.waiting {
+            deliver(
+                item.done,
+                Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
+            );
+        }
+        for job in self.jobs {
+            if let Job::Activate { done, .. } = job {
+                deliver_lifecycle(done, Err(not_connected(Phase::Subscription)));
+            }
+        }
+        for (_, waiting) in self.releases {
+            for done in waiting {
+                deliver_lifecycle(done, Err(not_connected(Phase::Subscription)));
+            }
+        }
+    }
+}
+
+/// Closes the socket and completes what was taken with `cause`.
+fn finish(sock: &mut TcpStream, taken: Taken, cause: RequestCause) {
     let _ = sock.shutdown(Shutdown::Both);
-    for item in waiting {
-        deliver(
-            item.done,
-            Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
-        );
+    taken.complete(cause);
+}
+
+/// The outcomes a lifecycle job settled, to deliver once the end (if any) is
+/// recorded.
+type Deliveries = Vec<(LifecycleDone, LifecycleOutcome)>;
+
+/// Runs one lifecycle job. Returns its settled outcomes and the cause that
+/// ends the connection, if any.
+fn run_job(
+    sock: &mut TcpStream,
+    inbox: &Receiver<Event>,
+    shared: &Shared,
+    options: &ConnectionOptions,
+    job: Job,
+) -> (Deliveries, Option<RequestCause>) {
+    let mut io = Io {
+        sock,
+        inbox,
+        shared,
+        options,
+    };
+    match job {
+        Job::Activate { token, owner, done } => {
+            let (outcome, fatal) = io.activate(token, owner);
+            let mut deliveries = vec![(done, outcome)];
+            // An activation stopped by a release did the release's cleanup:
+            // the release's callers receive its result.
+            if let Some(waiting) = io.take_release(token) {
+                let released = match outcome {
+                    Err(failure) if failure.cleanup.state != CleanupState::Complete => {
+                        Err(LifecycleFailure {
+                            failure: failure.cleanup.failure.unwrap_or(failure.failure),
+                            cleanup: failure.cleanup,
+                        })
+                    }
+                    _ => Ok(()),
+                };
+                deliveries.extend(waiting.into_iter().map(|done| (done, released)));
+            }
+            (deliveries, fatal)
+        }
+        Job::Release { token } => {
+            let Some(waiting) = io.take_release(token) else {
+                // An earlier activation already released the token.
+                return (Vec::new(), None);
+            };
+            let (outcome, fatal) = io.release(token);
+            (
+                waiting.into_iter().map(|done| (done, outcome)).collect(),
+                fatal,
+            )
+        }
+    }
+}
+
+/// The worker's socket and state, for one lifecycle job.
+struct Io<'a> {
+    sock: &'a mut TcpStream,
+    inbox: &'a Receiver<Event>,
+    shared: &'a Shared,
+    options: &'a ConnectionOptions,
+}
+
+/// A registration or unregistration that did not succeed.
+#[derive(Debug, Clone, Copy)]
+struct Refused {
+    cause: RequestCause,
+    /// Whether it ends the connection by itself.
+    ends: bool,
+}
+
+impl Io<'_> {
+    fn take_release(&mut self, token: TokenId) -> Option<Vec<LifecycleDone>> {
+        let mut state = self.shared.lock();
+        let index = state.releases.iter().position(|(t, _)| *t == token)?;
+        Some(state.releases.swap_remove(index).1)
+    }
+
+    fn release_requested(&self, token: TokenId) -> bool {
+        self.shared.lock().releases.iter().any(|(t, _)| *t == token)
+    }
+
+    /// One registration or unregistration POST and its verdict.
+    fn post(&mut self, request: wire::Request) -> (Verdict, Option<Refused>) {
+        let frame = match frame::encode(&request.message()) {
+            Ok(frame) => frame,
+            Err(_) => {
+                let refused = Refused {
+                    cause: RequestCause::InternalError,
+                    ends: false,
+                };
+                return (Verdict::Rejected, Some(refused));
+            }
+        };
+        let key = request.reply_key();
+        let send_end = Instant::now() + self.options.send_deadline;
+        match exchange(
+            self.sock,
+            self.inbox,
+            self.shared,
+            self.options,
+            &frame,
+            &key,
+            send_end,
+        ) {
+            Ok(inbound) => {
+                let reply = inbound
+                    .reply(&key)
+                    .expect("exchange returns the matching reply");
+                match reply.post_verdict() {
+                    PostVerdict::Accepted => (Verdict::Accepted, None),
+                    PostVerdict::Rejected(_) => (
+                        Verdict::Rejected,
+                        Some(Refused {
+                            cause: RequestCause::DeviceRejected,
+                            ends: false,
+                        }),
+                    ),
+                    PostVerdict::Malformed => (
+                        Verdict::Unknown,
+                        Some(Refused {
+                            cause: RequestCause::InvalidResponse,
+                            ends: false,
+                        }),
+                    ),
+                }
+            }
+            Err(failed) => {
+                let verdict = if failed.evidence == Evidence::NotSent {
+                    Verdict::Rejected
+                } else {
+                    Verdict::Unknown
+                };
+                let refused = Refused {
+                    cause: failed.cause,
+                    ends: failed.ends.is_some(),
+                };
+                (verdict, Some(refused))
+            }
+        }
+    }
+
+    fn activate(&mut self, token: TokenId, owner: u64) -> (LifecycleOutcome, Option<RequestCause>) {
+        let needed = match self.shared.lock().ledger.start(token) {
+            Ok(needed) => needed,
+            Err(StartRefusal::Busy | StartRefusal::Unusable) => {
+                return (Err(not_connected(Phase::Subscription)), None)
+            }
+        };
+        let mut failure = None;
+        for address in needed {
+            let stopped = self.shared.lock().cancelled_owners.contains(&owner)
+                || self.release_requested(token);
+            if stopped {
+                failure = Some((
+                    Failure::Cancelled {
+                        phase: Phase::Subscription,
+                    },
+                    None,
+                ));
+                break;
+            }
+            let (verdict, refused) = self.post(register(address));
+            self.shared.lock().ledger.registered(address, verdict);
+            if let Some(refused) = refused {
+                let failed = Failure::cause(lifecycle_cause(refused.cause), Phase::Subscription);
+                failure = Some((failed, refused.ends.then_some(refused.cause)));
+                break;
+            }
+        }
+        let Some((failure, ends)) = failure else {
+            self.shared.lock().ledger.activate(token);
+            return (Ok(()), None);
+        };
+        if let Some(cause) = ends {
+            // The connection ends, which releases what this attempt owned.
+            let cleanup = Cleanup {
+                state: CleanupState::ConnectionClosed,
+                failure: None,
+            };
+            return (Err(LifecycleFailure { failure, cleanup }), Some(cause));
+        }
+        let (cleanup, ends) = self.unregister_owned(token);
+        (Err(LifecycleFailure { failure, cleanup }), ends)
+    }
+
+    fn release(&mut self, token: TokenId) -> (LifecycleOutcome, Option<RequestCause>) {
+        let (cleanup, ends) = self.unregister_owned(token);
+        match cleanup.failure {
+            None => (Ok(()), ends),
+            Some(failure) => (Err(LifecycleFailure { failure, cleanup }), ends),
+        }
+    }
+
+    /// Ends `token`'s ownership and unregisters what it was the last holder
+    /// of, once each. A failure stops the rest and ends the connection (K10).
+    fn unregister_owned(&mut self, token: TokenId) -> (Cleanup, Option<RequestCause>) {
+        let addresses = self.shared.lock().ledger.begin_release(token);
+        for address in addresses {
+            let (verdict, refused) = self.post(unregister(address));
+            self.shared.lock().ledger.unregistered(address, verdict);
+            if let Some(refused) = refused {
+                self.shared.lock().ledger.finish(token);
+                let failure = Failure::cause(lifecycle_cause(refused.cause), Phase::Subscription);
+                let cleanup = Cleanup {
+                    state: CleanupState::ConnectionClosed,
+                    failure: Some(failure),
+                };
+                return (cleanup, Some(refused.cause));
+            }
+        }
+        self.shared.lock().ledger.finish(token);
+        (Cleanup::COMPLETE, None)
+    }
+}
+
+fn register(address: SubscriptionAddress) -> wire::Request {
+    match address {
+        SubscriptionAddress::Parameter(address) => wire::Request::RegisterParameter(address),
+        SubscriptionAddress::Meter(address) => wire::Request::RegisterMeter(address),
+    }
+}
+
+fn unregister(address: SubscriptionAddress) -> wire::Request {
+    match address {
+        SubscriptionAddress::Parameter(address) => wire::Request::UnregisterParameter(address),
+        SubscriptionAddress::Meter(address) => wire::Request::UnregisterMeter(address),
     }
 }
 

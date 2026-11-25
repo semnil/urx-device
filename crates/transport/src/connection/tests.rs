@@ -1398,3 +1398,330 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
     );
     drop(release);
 }
+
+mod lifecycle {
+    use super::{connect, firmware, online, ID, TEARDOWN};
+    use crate::connection::{open, CloseOutcome, Connection, ConnectionOptions, Subscription};
+    use crate::lifecycle::{
+        Cause, Cleanup, CleanupState, Control, Failure, LifecycleFailure, LifecycleOutcome, Phase,
+    };
+    use crate::subscription::SubscriptionAddress;
+    use crate::test_peer::{get_reply, line, uri_of, Peer};
+    use crate::wire::{MeterAddress, ParameterAddress};
+    use serde_json::json;
+    use std::sync::mpsc::{self, Receiver};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn p(param_id: u32) -> SubscriptionAddress {
+        SubscriptionAddress::Parameter(ParameterAddress {
+            param_id,
+            x: 0,
+            y: 0,
+        })
+    }
+
+    fn m(meter_id: u32) -> SubscriptionAddress {
+        SubscriptionAddress::Meter(MeterAddress { meter_id, x: 0 })
+    }
+
+    /// A unit that answers registrations and unregistrations with
+    /// `response_code` from `code(uri)`, after `delay`.
+    fn unit(delay: Duration, code: impl Fn(&str) -> Option<i64> + Send + Sync + 'static) -> Peer {
+        Peer::serve(move |request| match uri_of(request) {
+            "/vd/synchronize" => vec![get_reply("/vd/synchronize", online(ID))],
+            "/vd/device" => vec![get_reply("/vd/device", firmware())],
+            uri => {
+                thread::sleep(delay);
+                match code(uri) {
+                    Some(code) => vec![line(
+                        json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": code } } }),
+                    )],
+                    None => vec![],
+                }
+            }
+        })
+    }
+
+    fn accepting() -> Peer {
+        unit(Duration::ZERO, |_| Some(200))
+    }
+
+    fn posts(peer: &Peer) -> Vec<String> {
+        peer.uris()
+            .into_iter()
+            .filter(|uri| uri.contains("operation="))
+            .collect()
+    }
+
+    fn reg(id: u32) -> String {
+        format!("/vd/parameters/{id}:0:0?operation=regist")
+    }
+
+    fn unreg(id: u32) -> String {
+        format!("/vd/parameters/{id}:0:0?operation=unregist")
+    }
+
+    fn activate(
+        connection: &Connection,
+        subscription: &Subscription,
+    ) -> Receiver<LifecycleOutcome> {
+        let operation = connection.create_operation().unwrap();
+        let (tx, rx) = mpsc::channel();
+        subscription.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        rx
+    }
+
+    fn release(subscription: &Subscription) -> Receiver<LifecycleOutcome> {
+        let (tx, rx) = mpsc::channel();
+        subscription.release(move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        rx
+    }
+
+    fn settled(rx: &Receiver<LifecycleOutcome>) -> LifecycleOutcome {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("an outcome")
+    }
+
+    fn failed(code: Cause, cleanup: Cleanup) -> LifecycleOutcome {
+        Err(LifecycleFailure {
+            failure: Failure::Cause {
+                code,
+                phase: Phase::Subscription,
+            },
+            cleanup,
+        })
+    }
+
+    fn closed_by(code: Cause) -> Cleanup {
+        Cleanup {
+            state: CleanupState::ConnectionClosed,
+            failure: Some(Failure::Cause {
+                code,
+                phase: Phase::Subscription,
+            }),
+        }
+    }
+
+    #[test]
+    fn activation_registers_each_needed_address_once_and_release_unregisters_the_last_holder() {
+        let peer = accepting();
+        let connection = connect(&peer);
+        let a = connection
+            .prepare_subscription(&[p(1), p(2), p(1)])
+            .unwrap();
+        assert!(posts(&peer).is_empty(), "admission sends nothing");
+        assert_eq!(settled(&activate(&connection, &a)), Ok(()));
+        let b = connection.prepare_subscription(&[p(2), m(7)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &b)), Ok(()));
+        assert_eq!(settled(&release(&a)), Ok(()));
+        assert_eq!(settled(&release(&b)), Ok(()));
+        assert_eq!(
+            posts(&peer),
+            [
+                reg(1),
+                reg(2),
+                "/vd/meters/7:0?operation=regist".into(),
+                unreg(1),
+                unreg(2),
+                "/vd/meters/7:0?operation=unregist".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rejected_replacement_keeps_the_old_set_and_unregisters_only_its_own_addition() {
+        // Old {p, q}; new {q, r, s}; Device Center rejects s.
+        let peer = unit(Duration::ZERO, |uri| {
+            Some(if uri == reg(4) { 400 } else { 200 })
+        });
+        let connection = connect(&peer);
+        let old = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &old)), Ok(()));
+        let new = connection
+            .prepare_subscription(&[p(2), p(3), p(4)])
+            .unwrap();
+        assert_eq!(
+            settled(&activate(&connection, &new)),
+            failed(Cause::DeviceRejected, Cleanup::COMPLETE)
+        );
+        assert_eq!(posts(&peer), [reg(1), reg(2), reg(3), reg(4), unreg(3)]);
+        assert_eq!(
+            connection.terminal(),
+            None,
+            "an ordinary rejection keeps the connection"
+        );
+        assert_eq!(settled(&release(&old)), Ok(()));
+        assert_eq!(&posts(&peer)[5..], [unreg(1), unreg(2)]);
+    }
+
+    #[test]
+    fn releasing_a_token_never_activated_sends_nothing() {
+        let peer = accepting();
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&release(&token)), Ok(()));
+        assert!(posts(&peer).is_empty());
+    }
+
+    #[test]
+    fn repeated_releases_share_one_release() {
+        let peer = unit(Duration::from_millis(100), |_| Some(200));
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        let first = release(&token);
+        let second = release(&token);
+        assert_eq!(settled(&first), Ok(()));
+        assert_eq!(settled(&second), Ok(()));
+        assert_eq!(posts(&peer), [reg(1), unreg(1)]);
+    }
+
+    #[test]
+    fn cancelling_or_releasing_during_activation_stops_and_cleans_up_once() {
+        for by_release in [false, true] {
+            let peer = unit(Duration::from_millis(150), |_| Some(200));
+            let connection = connect(&peer);
+            let token = connection
+                .prepare_subscription(&[p(1), p(2), p(3)])
+                .unwrap();
+            let operation = connection.create_operation().unwrap();
+            let (tx, activated) = mpsc::channel();
+            token.activate(&operation, move |outcome| {
+                let _ = tx.send(outcome);
+            });
+            super::wait_until(|| posts(&peer).len() == 1);
+            let released = if by_release {
+                Some(release(&token))
+            } else {
+                operation.cancel();
+                None
+            };
+            assert_eq!(
+                settled(&activated),
+                Err(LifecycleFailure {
+                    failure: Failure::Cancelled {
+                        phase: Phase::Subscription
+                    },
+                    cleanup: Cleanup::COMPLETE
+                })
+            );
+            if let Some(released) = released {
+                assert_eq!(settled(&released), Ok(()));
+            }
+            assert_eq!(posts(&peer), [reg(1), unreg(1)], "release: {by_release}");
+        }
+    }
+
+    #[test]
+    fn a_failed_cleanup_ends_the_connection() {
+        let peer = unit(Duration::ZERO, |uri| {
+            Some(if uri == reg(2) || uri == unreg(1) {
+                400
+            } else {
+                200
+            })
+        });
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        assert_eq!(
+            settled(&activate(&connection, &token)),
+            failed(Cause::DeviceRejected, closed_by(Cause::DeviceRejected))
+        );
+        assert!(connection.terminal().is_some());
+        assert!(connection.prepare_subscription(&[p(9)]).is_err());
+    }
+
+    #[test]
+    fn a_registration_without_an_answer_ends_the_connection() {
+        let peer = unit(Duration::ZERO, |uri| (uri != reg(2)).then_some(200));
+        let connection = open(
+            peer.port,
+            ID,
+            &ConnectionOptions {
+                response_deadline: Duration::from_millis(150),
+                ..super::options()
+            },
+            &Control::new(),
+        )
+        .unwrap();
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        assert_eq!(
+            settled(&activate(&connection, &token)),
+            failed(
+                Cause::ResponseTimeout,
+                Cleanup {
+                    state: CleanupState::ConnectionClosed,
+                    failure: None
+                }
+            )
+        );
+        assert!(connection.terminal().is_some());
+        assert_eq!(
+            posts(&peer),
+            [reg(1), reg(2)],
+            "no unregistration after the end"
+        );
+    }
+
+    #[test]
+    fn admission_is_refused_at_capacity_and_on_a_closed_connection() {
+        let peer = accepting();
+        let connection = Arc::new(connect(&peer));
+        let tokens: Vec<_> = (0..crate::subscription::MAX_TOKENS as u32)
+            .map(|i| connection.prepare_subscription(&[p(i)]).unwrap())
+            .collect();
+        let refused = connection.prepare_subscription(&[p(99)]).err().unwrap();
+        assert_eq!(
+            refused.failure,
+            Failure::Cause {
+                code: Cause::PreconditionFailed,
+                phase: Phase::Admission
+            }
+        );
+        assert!(posts(&peer).is_empty());
+        drop(tokens);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        let refused = connection.prepare_subscription(&[p(1)]).err().unwrap();
+        assert_eq!(
+            refused.failure,
+            Failure::Cause {
+                code: Cause::NotConnected,
+                phase: Phase::Admission
+            }
+        );
+    }
+
+    #[test]
+    fn close_completes_pending_lifecycle_calls_without_traffic() {
+        let peer = unit(Duration::from_millis(200), |_| Some(200));
+        let connection = connect(&peer);
+        let busy = connection.prepare_subscription(&[p(1)]).unwrap();
+        let waiting = connection.prepare_subscription(&[p(2)]).unwrap();
+        let first = activate(&connection, &busy);
+        super::wait_until(|| posts(&peer).len() == 1);
+        let second = activate(&connection, &waiting);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        assert_eq!(
+            settled(&first),
+            Ok(()),
+            "the registration already sent settles"
+        );
+        assert!(matches!(
+            settled(&second),
+            Err(LifecycleFailure {
+                failure: Failure::Cause {
+                    code: Cause::NotConnected,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(posts(&peer), [reg(1)]);
+    }
+}
