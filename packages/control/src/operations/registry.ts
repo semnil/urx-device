@@ -73,6 +73,7 @@ import {
   duckerRange,
   duckerThreshold,
 } from "./ducker.js";
+import { sendLevel, sendOn, sendPan, sendTap } from "./sends.js";
 import {
   compOn,
   eqOn,
@@ -189,6 +190,10 @@ export const settingHandlers: SettingHandlers = {
   "channel.ducker.range": duckerRange,
   "channel.ducker.attack": duckerAttack,
   "channel.ducker.decay": duckerDecay,
+  "send.on": sendOn,
+  "send.level": sendLevel,
+  "send.pan": sendPan,
+  "send.tap": sendTap,
 };
 
 function unknownId(): Promise<never> {

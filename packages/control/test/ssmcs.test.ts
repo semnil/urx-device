@@ -125,7 +125,7 @@ describe("SSMCS controls (F04-M)", () => {
     expect(transport.calls).toEqual([]);
     const ids = Object.keys(settingDefinitions).filter((id) => id.startsWith("channel.ssmcs."));
     for (const id of ids) {
-      const rule = (settingDefinitions as Record<string, { rule?: { address: object } }>)[id]?.rule;
+      const rule = (settingDefinitions as unknown as Record<string, { rule?: { address: object } }>)[id]?.rule;
       expect(JSON.stringify(rule?.address ?? {}), id).not.toMatch(/:10[01]\b/);
     }
   });
