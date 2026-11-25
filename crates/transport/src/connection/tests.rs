@@ -2884,4 +2884,95 @@ mod notifications {
         super::wait_until(|| connection.terminal().is_some());
         assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
     }
+
+    /// A connection with an 80 ms send deadline whose batches reach the test.
+    fn connect_short(port: u16) -> (Arc<Connection>, Receiver<NotificationBatch>) {
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let _ = tx.lock().unwrap().send(batch);
+        });
+        let short = crate::connection::ConnectionOptions {
+            send_deadline: Duration::from_millis(80),
+            ..options()
+        };
+        let connection = open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap();
+        (Arc::new(connection), batches)
+    }
+
+    #[test]
+    fn a_request_submitted_after_a_hold_began_still_expires() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        // The reply arrives at about 200 ms; the hold then waits with an
+        // empty queue.
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let waiting = submit_held(&connection, &other, 6);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            unsent_with(RequestCause::SendTimeout)
+        );
+        assert!(held.try_recv().is_err(), "still held");
+    }
+
+    #[test]
+    fn a_close_from_an_expiry_callback_during_a_hold_does_not_wait_for_itself() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let _held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let (tx, inner) = mpsc::channel();
+        let closing = Arc::clone(&connection);
+        connection.submit(&other, Request::GetNumeric(param(6)), move |_, _| {
+            let _ = tx.send(closing.close(TEARDOWN));
+        });
+        assert_eq!(
+            inner.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn a_cancelled_reactivation_keeps_the_established_subscription() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let other = activate(&connection, &[p(1)]);
+        let token = activate(&connection, &[p(1), p(2)]);
+        let operation = connection.create_operation().unwrap();
+        operation.cancel();
+        let (tx, again) = mpsc::channel();
+        token.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        assert_eq!(
+            again.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(crate::lifecycle::LifecycleFailure {
+                failure: Failure::Cancelled {
+                    phase: Phase::Subscription
+                },
+                cleanup: crate::lifecycle::Cleanup::COMPLETE,
+            })
+        );
+        let state = connection.shared.lock();
+        assert!(state.ledger.is_active(token.token()));
+        assert_eq!(state.ledger.recipients(p(2)), [token.token()]);
+        assert_eq!(
+            state.ledger.recipients(p(1)),
+            [other.token(), token.token()]
+        );
+    }
 }

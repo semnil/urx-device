@@ -507,6 +507,8 @@ impl Connection {
             done: Box::new(done),
         });
         drop(state);
+        // A held result's wait tracks the earliest send deadline.
+        self.shared.advance.notify_all();
         let _ = self.events.send(Event::Wake);
     }
 
@@ -1486,6 +1488,26 @@ impl Io<'_> {
             ends,
             released,
         };
+        let started = {
+            let state = self.shared.lock();
+            let active = state.ledger.is_active(token);
+            (active, stopped(&state))
+        };
+        if let (true, stop) = started {
+            // Already active: this call acquires nothing, so a cancellation
+            // of it leaves the established subscription as it is.
+            let outcome = if stop {
+                Err(LifecycleFailure {
+                    failure: Failure::Cancelled {
+                        phase: Phase::Subscription,
+                    },
+                    cleanup: Cleanup::COMPLETE,
+                })
+            } else {
+                Ok(())
+            };
+            return done(outcome, None, false);
+        }
         let needed = match self.shared.lock().ledger.start(token) {
             Ok(needed) => needed,
             Err(StartRefusal::Busy) | Err(StartRefusal::Unusable) => {
@@ -1806,8 +1828,14 @@ fn await_cutoff(shared: &Shared, options: &ConnectionOptions, reply: &Answer) ->
     if let Some(cause) = reply.ending {
         return Held::Ended(cause);
     }
+    // Its exchange is settled: a close need not wait for this hold (it
+    // stops it), and a callback run meanwhile may close. A write after it
+    // cannot start once the close is marked, so the request is active again
+    // only for what follows.
+    shared.lock().active = false;
+    shared.settled.notify_all();
     // The queue lock is taken under the state lock, never the reverse.
-    hold(
+    let held = hold(
         shared,
         options.send_deadline,
         |_| {
@@ -1817,7 +1845,9 @@ fn await_cutoff(shared: &Shared, options: &ConnectionOptions, reply: &Answer) ->
                 .is_none_or(|queue| lock(queue).has_adopted(reply.cutoff))
         },
         |state| state.ended_adopted >= reply.cutoff,
-    )
+    );
+    shared.lock().active = true;
+    held
 }
 
 /// An established result whose normal delivery cannot complete because the
