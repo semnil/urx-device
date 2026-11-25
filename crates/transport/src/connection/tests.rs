@@ -1799,6 +1799,80 @@ mod lifecycle {
         );
         assert!(posts(&peer).is_empty());
     }
+
+    #[test]
+    fn a_release_asked_during_an_automatic_cleanup_gets_the_cleanup_result() {
+        for code in [200, 400] {
+            let peer = unit(Duration::from_millis(150), move |uri| {
+                Some(if uri == reg(2) {
+                    400
+                } else if uri == unreg(1) {
+                    code
+                } else {
+                    200
+                })
+            });
+            let connection = connect(&peer);
+            let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+            let activated = activate(&connection, &token);
+            super::wait_until(|| posts(&peer).len() == 3);
+            let (first, second) = (release(&token), release(&token));
+            let outcome = settled(&activated);
+            let (a, b) = (settled(&first), settled(&second));
+            assert_eq!(a, b);
+            if code == 200 {
+                assert_eq!(outcome, failed(Cause::DeviceRejected, Cleanup::COMPLETE));
+                assert_eq!(a, Ok(()));
+            } else {
+                assert_eq!(
+                    a,
+                    failed(Cause::DeviceRejected, closed_by(Cause::DeviceRejected))
+                );
+            }
+            assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1)], "code {code}");
+        }
+    }
+
+    #[test]
+    fn a_close_during_an_automatic_cleanup_leaves_its_release_callers_the_cleanup_result() {
+        let peer = unit(Duration::from_millis(150), |uri| {
+            Some(if uri == reg(2) { 400 } else { 200 })
+        });
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        let activated = activate(&connection, &token);
+        super::wait_until(|| posts(&peer).len() == 3);
+        let released = release(&token);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        assert_eq!(
+            settled(&activated),
+            failed(Cause::DeviceRejected, Cleanup::COMPLETE)
+        );
+        assert_eq!(
+            settled(&released),
+            Ok(()),
+            "not answered not_connected by the close"
+        );
+    }
+
+    #[test]
+    fn a_release_after_the_connection_ended_is_refused_without_a_job() {
+        let peer = accepting();
+        let connection = connect(&peer);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        assert!(matches!(
+            settled(&release(&token)),
+            Err(LifecycleFailure {
+                failure: Failure::Cause {
+                    code: Cause::NotConnected,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

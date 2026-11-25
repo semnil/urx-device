@@ -598,16 +598,17 @@ impl Subscription {
         let Some(shared) = self.shared.upgrade() else {
             return done(Err(not_connected(Phase::Subscription)));
         };
-        let state = shared.lock();
+        // Ordered with the start of every write (see write_frame): a
+        // registration of this token not yet started will not start. The
+        // check below and the queueing are one step under the state lock, so
+        // an end or a close either comes first and refuses this release or
+        // comes after and completes it.
+        let _gate = shared.link_end();
+        let mut state = shared.lock();
         if state.closing || state.terminal.is_some() {
             drop(state);
             return done(Err(not_connected(Phase::Subscription)));
         }
-        drop(state);
-        // Ordered with the start of every write (see write_frame): a
-        // registration of this token not yet started will not start.
-        let _gate = shared.link_end();
-        let mut state = shared.lock();
         let done: LifecycleDone = Box::new(done);
         if let Some(release) = state.releases.iter_mut().find(|r| r.token == self.token) {
             release.waiting.push(done);
@@ -1154,18 +1155,21 @@ impl Io<'_> {
             };
             return done(Err(failure), None, false);
         };
-        // A failed activation of a token whose release was asked for carries
-        // that release out: its cleanup is the release.
-        let released = {
+        // A failed activation's cleanup is the token's release: it is
+        // recorded as running before any unregistration, so a release asked
+        // for before or during the cleanup joins it and receives its result.
+        {
             let mut state = self.shared.lock();
             match state.releases.iter_mut().find(|r| r.token == token) {
-                Some(release) => {
-                    release.running = true;
-                    true
-                }
-                None => false,
+                Some(release) => release.running = true,
+                None => state.releases.push(Release {
+                    token,
+                    waiting: Vec::new(),
+                    running: true,
+                }),
             }
-        };
+        }
+        let released = true;
         if let Some(cause) = ends {
             // The connection ends, which releases what this attempt owned.
             let cleanup = Cleanup {
