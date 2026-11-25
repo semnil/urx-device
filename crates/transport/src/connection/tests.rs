@@ -1019,6 +1019,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             link_end: std::sync::Mutex::new(None),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
+            expiries: std::sync::Mutex::new(Vec::new()),
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
@@ -1363,7 +1364,11 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
     }
     let past = Instant::now() - Duration::from_millis(1);
     assert_eq!(
-        super::wait_for([Some(finished), None, None, None], past),
+        super::wait_for(
+            [Some(finished), None, None, None],
+            &scripted(None).shared,
+            past
+        ),
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
             phase: Phase::Teardown
@@ -1373,6 +1378,7 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
     assert_eq!(
         super::wait_for(
             [Some(done), None, None, None],
+            &scripted(None).shared,
             Instant::now() + Duration::from_secs(1)
         ),
         CloseOutcome::Closed
@@ -1399,6 +1405,7 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
     assert_eq!(
         super::wait_for(
             [Some(stuck), None, None, None],
+            &scripted(None).shared,
             Instant::now() + Duration::from_millis(100)
         ),
         CloseOutcome::Incomplete(Failure::Cause {
@@ -2974,5 +2981,40 @@ mod notifications {
             state.ledger.recipients(p(1)),
             [other.token(), token.token()]
         );
+    }
+
+    #[test]
+    fn a_blocked_expiry_callback_does_not_hold_up_the_end_of_the_connection() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        connection.submit(&other, Request::GetNumeric(param(6)), move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = blocked.recv();
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        push.send(lost()).unwrap();
+        assert_eq!(
+            held.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            Outcome::failed(
+                RequestCause::ConnectionLost,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
+            ),
+            "the held result is delivered while the expiry callback blocks"
+        );
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+        release.send(()).unwrap();
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     }
 }

@@ -183,6 +183,9 @@ struct Shared {
     /// Signalled, with the state lock, when what a held result waits for may
     /// have changed: a notification or result adoption, an end, a close.
     advance: Condvar,
+    /// Threads completing requests that expired while a reply was held, so
+    /// their callbacks never hold the worker up; a close waits for them.
+    expiries: Mutex<Vec<JoinHandle<()>>>,
     /// Notifications waiting for the application (K6), when it takes them.
     notifications: Option<Mutex<Queue>>,
     /// Signalled when a batch can be formed or delivery must stop.
@@ -368,6 +371,7 @@ impl Connection {
             link_end: Mutex::new(None),
             settled: Condvar::new(),
             advance: Condvar::new(),
+            expiries: Mutex::new(Vec::new()),
             notifications: notifications
                 .as_ref()
                 .map(|_| Mutex::new(Queue::new(generation))),
@@ -647,10 +651,11 @@ impl Connection {
             // A completion or delivery callback cannot wait for the thread it
             // runs on; a helper waits for the threads within the same budget.
             let cell = Arc::clone(&self.close);
-            thread::spawn(move || cell.record(wait_for(threads, end)));
+            let shared = Arc::clone(&self.shared);
+            thread::spawn(move || cell.record(wait_for(threads, &shared, end)));
             return CloseOutcome::Started;
         }
-        let outcome = wait_for(threads, end);
+        let outcome = wait_for(threads, &self.shared, end);
         self.close.record(outcome);
         outcome
     }
@@ -663,10 +668,15 @@ impl Connection {
         self.on_own_thread() || lock(&self.close.exempt).contains(&me)
     }
 
-    /// Whether this is the worker or the notification delivery thread.
+    /// Whether this is the worker, the notification delivery thread or a
+    /// thread completing expired requests.
     fn on_own_thread(&self) -> bool {
         let me = thread::current().id();
-        self.worker_id == me || self.delivery_id == Some(me)
+        self.worker_id == me
+            || self.delivery_id == Some(me)
+            || lock(&self.shared.expiries)
+                .iter()
+                .any(|thread| thread.thread().id() == me)
     }
 }
 
@@ -674,13 +684,28 @@ impl Connection {
 /// `Incomplete`, even if the threads finish later. The joins run on their own
 /// thread, so a thread whose exit (its thread-local destructors included)
 /// does not finish cannot hold this past `end`.
-fn wait_for(threads: [Option<JoinHandle<()>>; 4], end: Instant) -> CloseOutcome {
+fn wait_for(
+    threads: [Option<JoinHandle<()>>; 4],
+    shared: &Arc<Shared>,
+    end: Instant,
+) -> CloseOutcome {
     let incomplete =
         CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
     let (joined, all_joined) = mpsc::channel();
+    let shared = Arc::clone(shared);
     thread::spawn(move || {
         for thread in threads.into_iter().flatten() {
             let _ = thread.join();
+        }
+        // Taken after the worker is joined: it starts no expiry thread after.
+        loop {
+            let expiries: Vec<_> = lock(&shared.expiries).drain(..).collect();
+            if expiries.is_empty() {
+                break;
+            }
+            for thread in expiries {
+                let _ = thread.join();
+            }
         }
         let _ = joined.send(());
     });
@@ -1790,14 +1815,26 @@ fn hold(
         if !expired.is_empty() {
             state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
             drop(state);
-            for item in expired {
-                let timeout = Outcome::failed(
-                    RequestCause::SendTimeout,
-                    RequestPhase::Admission,
-                    Evidence::NotSent,
-                );
-                deliver(item.done, timeout, ResultAdoption::none());
+            // Completed on their own thread, which is registered before it
+            // runs a callback: a close from one returns `Started`.
+            let (go, ready) = mpsc::channel::<()>();
+            let handle = thread::spawn(move || {
+                let _ = ready.recv();
+                for item in expired {
+                    let timeout = Outcome::failed(
+                        RequestCause::SendTimeout,
+                        RequestPhase::Admission,
+                        Evidence::NotSent,
+                    );
+                    deliver(item.done, timeout, ResultAdoption::none());
+                }
+            });
+            {
+                let mut expiries = lock(&shared.expiries);
+                expiries.retain(|thread| !thread.is_finished());
+                expiries.push(handle);
             }
+            let _ = go.send(());
             state = shared.lock();
             continue;
         }
