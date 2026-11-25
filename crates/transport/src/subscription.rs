@@ -46,6 +46,10 @@ pub enum Refusal {
     TooManyMemberships,
 }
 
+/// A release or cleanup is still in progress; see [`Ledger::start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Busy;
+
 /// What a registration or unregistration reply established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -153,12 +157,23 @@ impl Ledger {
     /// token's order. Addresses registered or possibly registered for another
     /// activating or active token are not sent again. Only a provisional token
     /// starts; any other returns nothing.
-    pub fn start(&mut self, token: TokenId) -> Vec<SubscriptionAddress> {
+    ///
+    /// A release or cleanup that has not finished makes this `Err(Busy)`: its
+    /// unregistrations decide what is still registered, so an activation can
+    /// start only after their verdicts are recorded and [`Ledger::finish`] ran.
+    pub fn start(&mut self, token: TokenId) -> Result<Vec<SubscriptionAddress>, Busy> {
+        if self
+            .tokens
+            .values()
+            .any(|token| token.state == TokenState::Releasing)
+        {
+            return Err(Busy);
+        }
         let Some(token) = self.tokens.get_mut(&token) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if token.state != TokenState::Provisional {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         token.state = TokenState::Registering;
         let mut needed = Vec::new();
@@ -172,7 +187,7 @@ impl Ledger {
                 needed.push(*address);
             }
         }
-        needed
+        Ok(needed)
     }
 
     /// Records the verdict of a registration sent for `address`.
