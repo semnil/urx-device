@@ -119,20 +119,43 @@ function evidenceOf(
 }
 
 /**
- * The cause/evidence constraints beyond the record shape (K34): established
- * evidence in a failure only at delivery with a delivery cause; cancellation
- * only with pending evidence; a rejection only as `device_rejected` at
- * response, and `device_rejected` only with a rejection.
+ * The evidence each phase can carry (K34): before sending nothing was sent;
+ * while sending, either; a response phase has passed transmission (a
+ * verdict or none); delivery adopts an established result.
+ */
+const PHASE_EVIDENCE: Readonly<Record<NativeRequestPhase, readonly EvidenceState[]>> = {
+  validation: ["not_sent"],
+  admission: ["not_sent"],
+  send: ["not_sent", "unconfirmed"],
+  response: ["unconfirmed", "rejected"],
+  delivery: ["read", "accepted"],
+};
+
+/** Causes that occur only before anything is sent (K34). */
+const UNSENT_CAUSES: readonly string[] = ["invalid_input", "precondition_failed", "not_connected"];
+
+/**
+ * The phase/cause/evidence constraints beyond the record shape (K34): the
+ * evidence fits the phase; established evidence in a failure only with a
+ * delivery cause; cancellation only with pending evidence; a rejection only
+ * as `device_rejected`, and `device_rejected` only with a rejection; the
+ * before-sending causes only with `not_sent`.
  */
 function consistent(failure: NativeRequestFailure, state: EvidenceState): boolean {
+  if (!PHASE_EVIDENCE[failure.phase].includes(state)) {
+    return false;
+  }
   if (failure.kind === "cancelled") {
     return state === "not_sent" || state === "unconfirmed";
   }
   if (state === "read" || state === "accepted") {
-    return failure.phase === "delivery" && DELIVERY_CAUSES.includes(failure.code);
+    return DELIVERY_CAUSES.includes(failure.code);
   }
   if (state === "rejected") {
-    return failure.code === "device_rejected" && failure.phase === "response";
+    return failure.code === "device_rejected";
+  }
+  if (UNSENT_CAUSES.includes(failure.code)) {
+    return state === "not_sent";
   }
   return failure.code !== "device_rejected";
 }

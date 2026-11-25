@@ -64,6 +64,12 @@ describe("failure records (K34)", () => {
       [cause("device_rejected", "response"), rejected("500")],
       [cause("notification_overflow", "delivery"), accepted],
       [cause("teardown_timeout", "delivery"), accepted],
+      [cause("send_timeout", "admission"), notSent],
+      [cause("connection_lost", "send"), notSent],
+      [cancelled("send"), unconfirmed],
+      [cancelled("response"), unconfirmed],
+      [cause("response_timeout", "response"), unconfirmed],
+      [cause("not_connected", "admission"), notSent],
     ];
     for (const [f, evidence] of cases) {
       expect(validatePost(failure(f, evidence)), JSON.stringify([f, evidence])).toEqual(failure(f, evidence));
@@ -81,6 +87,15 @@ describe("failure records (K34)", () => {
       [cause("device_rejected", "response"), rejected("200")],
       [cause("device_rejected", "response"), rejected("0409")],
       [cause("not_connected", "delivery"), accepted],
+      [cause("internal_error", "validation"), unconfirmed],
+      [cause("precondition_failed", "admission"), unconfirmed],
+      [cancelled("admission"), unconfirmed],
+      [cause("response_timeout", "response"), notSent],
+      [cancelled("response"), notSent],
+      [cause("invalid_input", "send"), unconfirmed],
+      [cause("not_connected", "send"), unconfirmed],
+      [cause("connection_lost", "delivery"), unconfirmed],
+      [cause("send_timeout", "send"), accepted],
       [cause("device_rejected", "delivery"), accepted],
       [cause("notification_overflow", "response"), accepted],
     ];
