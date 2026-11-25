@@ -3,7 +3,6 @@
 // report the actual result. No related-state reads, no readback.
 
 import { decodeCentiDb, decodeSwitch, encodeCentiDb, encodeSwitch, planWholeDb } from "../catalog/codecs.js";
-import type { I64Text } from "../catalog/i64.js";
 import {
   HI_Z_JACKS,
   INPUT_GAIN_DB,
@@ -13,25 +12,10 @@ import {
   SOURCE_GAIN_DB,
   isSourceToken,
 } from "../catalog/inputs.js";
-import { isModel, type Model } from "../catalog/models.js";
 import type { InputTarget, SourceTarget } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
-import { OperationFailureError, type OperationCause } from "./failure.js";
-import type { NativeFailure, NativePostResult, PostEvidence } from "./native.js";
-import type { Reading, WriteOutcome, WritePlan, WriteProgress, WriteResult } from "./results.js";
-import type { ParameterAddress } from "./transport.js";
-
-function refuse(code: OperationCause): never {
-  throw new OperationFailureError({ code, phase: "preparation", progress: null });
-}
-
-function modelOf(model: string): Model {
-  return isModel(model) ? model : refuse("unsupported_operation");
-}
-
-function address(paramId: number, y: number): ParameterAddress {
-  return { paramId, x: "0", y: `${y}` };
-}
+import type { Reading, WritePlan, WriteResult } from "./results.js";
+import { address, modelOf, readDecoded, refuse, writeRaw } from "./setting-io.js";
 
 /** The jack index of a target valid on `model`; `hiZ` also requires HI-Z. */
 function jackOf(model: string, target: unknown, hiZ = false): number {
@@ -54,79 +38,6 @@ function sourceOf(model: string, target: unknown): (typeof SOURCE_GAIN)[keyof ty
   }
   const entry = SOURCE_GAIN[source];
   return entry.models.includes(known) ? entry : refuse("unsupported_operation");
-}
-
-/** The raw value of a numeric read and its receipt time, or the failure it reports. */
-async function readRaw(context: OperationContext, at: ParameterAddress): Promise<{ raw: I64Text; observedAt: string }> {
-  const { record, observedAt } = await context.getNumeric(at);
-  if (record.kind === "failure") {
-    throw context.failureOf(record, null);
-  }
-  if (observedAt === undefined) {
-    // The slot is already handled; a value without its time is not delivered.
-    throw new OperationFailureError({ code: "internal_error", phase: "delivery", progress: null });
-  }
-  return { raw: record.value, observedAt };
-}
-
-async function readDecoded<V>(
-  context: OperationContext,
-  at: ParameterAddress,
-  decode: (raw: I64Text) => V | undefined,
-): Promise<Reading<V>> {
-  const { raw, observedAt } = await readRaw(context, at);
-  const value = decode(raw);
-  if (value === undefined) {
-    // A raw value outside the definition is malformed, not a default.
-    throw new OperationFailureError({ code: "invalid_response", phase: "response", progress: null });
-  }
-  return { value, observedAt };
-}
-
-function outcomeOf(evidence: PostEvidence): WriteOutcome {
-  switch (evidence.state) {
-    case "not_sent":
-      return "not_sent";
-    case "unconfirmed":
-      return "uncertain";
-    case "rejected":
-      return "rejected";
-    case "accepted":
-      return "accepted";
-  }
-}
-
-/** The single write of `plan` to `at` and its actual result (W1). */
-async function writeRaw<V>(
-  context: OperationContext,
-  at: ParameterAddress,
-  raw: I64Text,
-  plan: WritePlan<V>,
-): Promise<WriteResult<V>> {
-  let record: NativePostResult;
-  try {
-    record = await context.setNumeric(at, raw);
-  } catch (error) {
-    // No trusted record: unsent when it failed before the request was
-    // handed over, otherwise possibly sent (K34). The plan is kept.
-    const failure = error instanceof OperationFailureError ? error.failure : undefined;
-    const outcome: WriteOutcome = failure?.phase === "admission" ? "not_sent" : "uncertain";
-    throw new OperationFailureError<WriteProgress<V>>({
-      code: failure?.code ?? "internal_error",
-      phase: failure?.phase ?? "delivery",
-      progress: { ...plan, outcome },
-    });
-  }
-  if (record.kind === "success") {
-    return { ...plan, outcome: "accepted" };
-  }
-  const failure = record as NativeFailure<PostEvidence>;
-  const progress: WriteProgress<V> = {
-    ...plan,
-    outcome: outcomeOf(failure.evidence),
-    ...(failure.evidence.state === "rejected" ? { responseCode: failure.evidence.responseCode } : {}),
-  };
-  throw context.failureOf(failure, progress);
 }
 
 /** A switch setting on a physical jack. */
