@@ -141,3 +141,34 @@ fn a_ticket_of_another_connection_is_not_accepted() {
     );
     assert!(new.adopt(new_batch.ticket));
 }
+
+#[test]
+fn a_cutoff_counts_the_records_queued_before_it_including_the_batch_in_delivery() {
+    let mut queue = Queue::new(7);
+    queue.push(record(0), 1).unwrap();
+    queue.push(record(1), 1).unwrap();
+    let first = queue.next_batch().unwrap();
+    queue.push(record(2), 1).unwrap();
+    let cutoff = queue.accepted();
+    assert_eq!(cutoff, 3);
+    queue.push(record(3), 1).unwrap();
+    assert_eq!(queue.accepted(), 4, "later arrivals do not move the cutoff");
+    assert!(!queue.has_adopted(cutoff));
+    assert!(queue.adopt(first.ticket));
+    assert!(
+        !queue.has_adopted(cutoff),
+        "one record before the cutoff remains"
+    );
+    let second = queue.next_batch().unwrap();
+    assert_eq!(
+        second.records.len(),
+        2,
+        "the cutoff falls inside this batch"
+    );
+    assert!(queue.adopt(second.ticket));
+    assert!(queue.has_adopted(cutoff));
+    assert!(
+        Queue::new(7).has_adopted(0),
+        "nothing before an empty cutoff"
+    );
+}

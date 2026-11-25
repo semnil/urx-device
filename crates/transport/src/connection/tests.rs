@@ -91,7 +91,7 @@ fn submit(
     request: Request,
 ) -> Receiver<Outcome> {
     let (tx, rx) = mpsc::channel();
-    connection.submit(operation, request, move |outcome| {
+    connection.submit_adopted(operation, request, move |outcome| {
         let _ = tx.send(outcome);
     });
     rx
@@ -786,7 +786,7 @@ fn an_outcome_that_ends_the_connection_is_delivered_after_the_end_is_recorded() 
     let operation = connection.create_operation().unwrap();
     let (tx, rx) = mpsc::channel();
     let observer = Arc::clone(&connection);
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::GetNumeric(address(1)),
         move |outcome| {
@@ -810,7 +810,7 @@ fn a_panicking_callback_does_not_stop_other_completions() {
     let peer = unit(plain);
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
-    connection.submit(&operation, Request::GetNumeric(address(1)), |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), |_| {
         panic!("callback failure")
     });
     let next = submit(&connection, &operation, Request::GetNumeric(address(2)));
@@ -829,10 +829,10 @@ fn a_panicking_callback_does_not_stop_other_completions() {
     )
     .unwrap();
     let operation = connection.create_operation().unwrap();
-    connection.submit(&operation, Request::GetNumeric(address(1)), |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), |_| {
         panic!("callback failure")
     });
-    connection.submit(&operation, Request::GetNumeric(address(2)), |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(2)), |_| {
         panic!("callback failure")
     });
     let last = submit(&connection, &operation, Request::GetNumeric(address(3)));
@@ -864,7 +864,7 @@ fn releasing_the_connection_from_a_completion_callback_does_not_deadlock() {
         let (tx, rx) = mpsc::channel();
         let last = Arc::clone(&connection);
         let waiting = submit(&connection, &operation, Request::GetNumeric(address(9)));
-        connection.submit(
+        connection.submit_adopted(
             &operation,
             Request::GetNumeric(address(1)),
             move |outcome| {
@@ -905,7 +905,7 @@ fn cancelling_or_closing_after_the_end_does_not_change_how_waiting_requests_end(
     let other = connection.create_operation().unwrap();
     let canceller = Arc::clone(&operation);
     let (tx, active) = mpsc::channel();
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::GetNumeric(address(1)),
         move |outcome| {
@@ -950,7 +950,7 @@ fn no_write_starts_after_the_link_is_reported_lost() {
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
     let (tx, first) = mpsc::channel();
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::SetNumeric(address(1), 1),
         move |outcome| {
@@ -1018,6 +1018,8 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             settled: std::sync::Condvar::new(),
+            advance: std::sync::Condvar::new(),
+            expiry: Default::default(),
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
@@ -1149,7 +1151,7 @@ fn a_close_started_from_a_callback_finishes_for_other_callers() {
     let operation = connection.create_operation().unwrap();
     let (tx, started) = mpsc::channel();
     let closer = Arc::clone(&connection);
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let _ = tx.send(closer.close(TEARDOWN));
     });
     assert_eq!(
@@ -1166,7 +1168,7 @@ fn a_second_close_from_the_same_callback_does_not_wait_for_its_own_worker() {
     let operation = connection.create_operation().unwrap();
     let (tx, outcomes) = mpsc::channel();
     let closer = Arc::clone(&connection);
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let first = closer.close(TEARDOWN);
         let second = closer.close(TEARDOWN);
         let _ = tx.send((first, second));
@@ -1222,7 +1224,7 @@ fn a_waiting_request_callback_that_closes_does_not_hold_the_close_up() {
     wait_until(|| parameter_uris(&peer).len() == 1);
     let (tx, inner) = mpsc::channel();
     let again = Arc::clone(&connection);
-    connection.submit(
+    connection.submit_adopted(
         &operation,
         Request::SetNumeric(address(2), 1),
         move |outcome| {
@@ -1255,7 +1257,7 @@ fn a_callback_that_outlasts_the_teardown_budget_makes_the_close_incomplete() {
     let connection = connect(&peer);
     let operation = connection.create_operation().unwrap();
     let (tx, delivered) = mpsc::channel();
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let _ = tx.send(());
         thread::sleep(Duration::from_millis(600));
     });
@@ -1289,7 +1291,7 @@ fn a_slow_waiting_request_callback_is_bounded_by_the_teardown_budget() {
     let operation = connection.create_operation().unwrap();
     let active = submit(&connection, &operation, Request::SetNumeric(address(1), 1));
     wait_until(|| parameter_uris(&peer).len() == 1);
-    connection.submit(&operation, Request::SetNumeric(address(2), 1), |_| {
+    connection.submit_adopted(&operation, Request::SetNumeric(address(2), 1), |_| {
         thread::sleep(Duration::from_secs(1));
     });
     let started = Instant::now();
@@ -1327,7 +1329,7 @@ fn waiting_outcomes_are_delivered_before_closed_is_returned() {
     let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for id in [2, 3] {
         let delivered = Arc::clone(&delivered);
-        connection.submit(&operation, Request::SetNumeric(address(id), 1), move |_| {
+        connection.submit_adopted(&operation, Request::SetNumeric(address(id), 1), move |_| {
             thread::sleep(Duration::from_millis(50));
             delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
@@ -1344,7 +1346,7 @@ fn closing_is_visible_only_once_new_work_is_refused() {
     let operation = connection.create_operation().unwrap();
     let (tx, seen) = mpsc::channel();
     let probe = Arc::clone(&connection);
-    connection.submit(&operation, Request::GetNumeric(address(1)), move |_| {
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
         let outcome = probe.close(TEARDOWN);
         let _ = tx.send((outcome, probe.create_operation().is_err()));
     });
@@ -1362,7 +1364,11 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
     }
     let past = Instant::now() - Duration::from_millis(1);
     assert_eq!(
-        super::wait_for([Some(finished), None, None, None], past),
+        super::wait_for(
+            [Some(finished), None, None, None],
+            &Default::default(),
+            past
+        ),
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
             phase: Phase::Teardown
@@ -1372,6 +1378,7 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
     assert_eq!(
         super::wait_for(
             [Some(done), None, None, None],
+            &Default::default(),
             Instant::now() + Duration::from_secs(1)
         ),
         CloseOutcome::Closed
@@ -1398,6 +1405,7 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
     assert_eq!(
         super::wait_for(
             [Some(stuck), None, None, None],
+            &Default::default(),
             Instant::now() + Duration::from_millis(100)
         ),
         CloseOutcome::Incomplete(Failure::Cause {
@@ -1740,7 +1748,7 @@ mod lifecycle {
     }
 
     #[test]
-    fn a_release_asked_during_a_successful_activation_still_unregisters() {
+    fn a_release_asked_during_the_last_registration_cancels_the_activation() {
         let peer = unit(Duration::from_millis(150), |_| Some(200));
         let connection = connect(&peer);
         let token = connection.prepare_subscription(&[p(1)]).unwrap();
@@ -1749,8 +1757,13 @@ mod lifecycle {
         let released = release(&token);
         assert_eq!(
             settled(&activated),
-            Ok(()),
-            "its only registration was already sent"
+            Err(LifecycleFailure {
+                failure: Failure::Cancelled {
+                    phase: Phase::Subscription
+                },
+                cleanup: Cleanup::COMPLETE,
+            }),
+            "a release during activation cancels it (K37), though its only registration was sent"
         );
         assert_eq!(settled(&released), Ok(()));
         assert_eq!(posts(&peer), [reg(1), unreg(1)]);
@@ -1933,6 +1946,7 @@ fn a_write_whose_operation_was_cancelled_before_its_first_byte_is_not_started() 
 
 mod notifications {
     use super::{firmware, online, options, ID, TEARDOWN};
+    use crate::connection::MAX_WAITING_REQUESTS;
     use crate::connection::{open_with, CloseOutcome, Connection, NotificationHandler};
     use crate::delivery::{NotificationBatch, MAX_PENDING_NOTIFICATIONS};
     use crate::lifecycle::{Cause, Control, Failure, Phase};
@@ -1973,6 +1987,11 @@ mod notifications {
     /// A unit that answers the handshake, accepts every POST after `delay`
     /// and writes whatever lines the returned sender is given.
     fn pushing_unit(delay: Duration) -> (u16, Sender<Vec<u8>>) {
+        pushing_unit_coded(delay, |_| 200)
+    }
+
+    /// `pushing_unit`, answering each POST with `code(request)`.
+    fn pushing_unit_coded(delay: Duration, code: fn(&Value) -> i64) -> (u16, Sender<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (push, pushed) = mpsc::channel::<Vec<u8>>();
@@ -1995,7 +2014,7 @@ mod notifications {
                         _ => {
                             thread::sleep(delay);
                             line(
-                                json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": 200 } } }),
+                                json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": code(&request) } } }),
                             )
                         }
                     };
@@ -2141,13 +2160,13 @@ mod notifications {
     }
 
     #[test]
-    fn notifications_received_while_a_request_waits_are_delivered() {
+    fn a_result_waits_for_the_notifications_received_before_it() {
         let (port, push) = pushing_unit(Duration::from_millis(200));
         let (connection, batches) = connect(port);
         let _token = activate(&connection, &[p(1)]);
         let operation = connection.create_operation().unwrap();
         let (tx, done) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
             let _ = tx.send(outcome);
         });
         thread::sleep(Duration::from_millis(50));
@@ -2157,6 +2176,11 @@ mod notifications {
             batch.records.iter().map(numeric).collect::<Vec<_>>(),
             [(1, 7)]
         );
+        assert!(
+            done.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the reply arrived, but its prior notification is not adopted"
+        );
+        assert!(connection.adopt_notifications(batch.ticket));
         assert!(matches!(
             done.recv_timeout(Duration::from_secs(5)).unwrap(),
             Outcome::Success { .. }
@@ -2185,7 +2209,7 @@ mod notifications {
         let operation = connection.create_operation().unwrap();
         let (release, blocked) = mpsc::channel::<()>();
         let (entered_tx, entered) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |_| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |_| {
             let _ = entered_tx.send(());
             let _ = blocked.recv();
         });
@@ -2245,23 +2269,25 @@ mod notifications {
         let _token = activate(&connection, &[p(1)]);
         let operation = connection.create_operation().unwrap();
         let (tx, done) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
             let _ = tx.send(outcome);
         });
         let (later_tx, later) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(6)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(6)), move |outcome| {
             let _ = later_tx.send(outcome);
         });
         thread::sleep(Duration::from_millis(50));
         for value in 0..=(MAX_PENDING_NOTIFICATIONS as i64) {
             push.send(notify_param(1, value)).unwrap();
         }
-        assert!(
-            matches!(
-                done.recv_timeout(Duration::from_secs(5)).unwrap(),
-                Outcome::Success { .. }
+        assert_eq!(
+            done.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Outcome::failed(
+                RequestCause::NotificationOverflow,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
             ),
-            "the reply within its deadline is the evidence"
+            "the reply within its deadline is the evidence; its delivery fails"
         );
         assert!(matches!(
             later.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -2467,7 +2493,7 @@ mod notifications {
         let _token = activate(&connection, &[p(1)]);
         let operation = connection.create_operation().unwrap();
         let (tx, done) = mpsc::channel();
-        connection.submit(&operation, Request::GetNumeric(param(5)), move |outcome| {
+        connection.submit_adopted(&operation, Request::GetNumeric(param(5)), move |outcome| {
             let _ = tx.send(outcome);
         });
         thread::sleep(Duration::from_millis(50));
@@ -2519,7 +2545,7 @@ mod notifications {
             let (release, _) = block_worker(&connection);
             let operation = connection.create_operation().unwrap();
             let (tx, done) = mpsc::channel();
-            connection.submit(&operation, Request::GetNumeric(param(6)), move |outcome| {
+            connection.submit_adopted(&operation, Request::GetNumeric(param(6)), move |outcome| {
                 let _ = tx.send(outcome);
             });
             overflow(&connection, &push);
@@ -2540,5 +2566,625 @@ mod notifications {
                 assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
             }
         }
+    }
+
+    /// Submits a GET whose outcome and adoption are handed to the test.
+    fn submit_held(
+        connection: &Connection,
+        operation: &crate::connection::Operation,
+        param_id: u32,
+    ) -> Receiver<(Outcome, crate::connection::ResultAdoption)> {
+        let (tx, rx) = mpsc::channel();
+        connection.submit(
+            operation,
+            Request::GetNumeric(param(param_id)),
+            move |outcome, adoption| {
+                let _ = tx.send((outcome, adoption));
+            },
+        );
+        rx
+    }
+
+    #[test]
+    fn a_result_holds_the_wire_slot_until_it_is_adopted() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let operation = connection.create_operation().unwrap();
+        let first = submit_held(&connection, &operation, 5);
+        let second = submit_held(&connection, &operation, 6);
+        let (outcome, adoption) = first.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+        assert!(
+            second.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing is sent before the adoption"
+        );
+        assert!(adoption.adopt());
+        let (outcome, adoption) = second.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+        assert!(adoption.adopt());
+    }
+
+    #[test]
+    fn an_unsent_completion_holds_nothing() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let operation = connection.create_operation().unwrap();
+        operation.cancel();
+        let (outcome, adoption) = submit_held(&connection, &operation, 5)
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Failure { .. }));
+        assert!(!adoption.adopt(), "no result is held");
+        let other = connection.create_operation().unwrap();
+        let (outcome, _) = submit_held(&connection, &other, 6)
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+    }
+
+    #[test]
+    fn later_notifications_do_not_move_the_cutoff() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        // The reply arrives at about 200 ms; these arrive after it.
+        thread::sleep(Duration::from_millis(400));
+        for value in 2..6 {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert!(held.try_recv().is_err());
+        assert!(connection.adopt_notifications(first.ticket));
+        let (outcome, adoption) = held.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+        assert!(adoption.adopt());
+        let later = next(&batches);
+        assert_eq!(
+            later.records.iter().map(numeric).collect::<Vec<_>>(),
+            [(1, 2), (1, 3), (1, 4), (1, 5)],
+            "still pending, not required by the result"
+        );
+    }
+
+    #[test]
+    fn an_end_while_a_result_is_held_fails_its_delivery_with_its_evidence() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        let waiting = submit_held(&connection, &operation, 6);
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        let (outcome, adoption) = held.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::failed(
+                RequestCause::ConnectionLost,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
+            )
+        );
+        assert!(!adoption.adopt());
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap().0,
+            unsent_with(RequestCause::ConnectionLost)
+        );
+        assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    }
+
+    #[test]
+    fn a_close_does_not_wait_for_a_stalled_application() {
+        // Held for its prior notification, then for its adoption.
+        for adopt_batch in [false, true] {
+            let (port, push) = pushing_unit(Duration::from_millis(200));
+            let (connection, batches) = connect(port);
+            let _token = activate(&connection, &[p(1)]);
+            let operation = connection.create_operation().unwrap();
+            let held = submit_held(&connection, &operation, 5);
+            thread::sleep(Duration::from_millis(50));
+            push.send(notify_param(1, 1)).unwrap();
+            let first = next(&batches);
+            if adopt_batch {
+                assert!(connection.adopt_notifications(first.ticket));
+            }
+            thread::sleep(Duration::from_millis(400));
+            assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+            let (outcome, _) = held.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(outcome, Outcome::Success { .. }),
+                "an established result is not invalidated by the close"
+            );
+        }
+    }
+
+    #[test]
+    fn a_registration_waits_for_the_notifications_received_before_its_reply() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        assert!(
+            activated.recv_timeout(Duration::from_millis(500)).is_err(),
+            "accepted, but not consumed before the prior notification"
+        );
+        assert!(connection.adopt_notifications(first.ticket));
+        assert_eq!(
+            activated.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn notifications_adopted_after_an_end_do_not_make_a_held_result_normal() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        super::wait_until(|| connection.shared.link_end().is_some());
+        connection.adopt_notifications(first.ticket);
+        assert_eq!(
+            held.recv_timeout(Duration::from_secs(5)).unwrap().0,
+            Outcome::failed(
+                RequestCause::ConnectionLost,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
+            )
+        );
+    }
+
+    #[test]
+    fn notifications_adopted_after_an_end_do_not_activate_a_subscription() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        super::wait_until(|| connection.shared.link_end().is_some());
+        connection.adopt_notifications(first.ticket);
+        let failure = activated
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            Failure::Cause {
+                code: Cause::ConnectionLost,
+                phase: Phase::Subscription
+            }
+        );
+    }
+
+    #[test]
+    fn a_cancellation_during_the_last_registrations_cutoff_cleans_it_up() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        operation.cancel();
+        assert!(connection.adopt_notifications(first.ticket));
+        let failure = activated
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            Failure::Cancelled {
+                phase: Phase::Subscription
+            }
+        );
+        let state = connection.shared.lock();
+        assert!(!state.ledger.is_active(b.token()));
+        assert!(
+            state.ledger.recipients(p(2)).is_empty(),
+            "only the cancelled acquisition owned it, and it was unregistered"
+        );
+        assert_eq!(
+            state.ledger.recipients(p(1)).len(),
+            1,
+            "the existing owner keeps its address"
+        );
+    }
+
+    #[test]
+    fn a_waiting_request_expires_while_a_result_is_held() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let _ = tx.lock().unwrap().send(batch);
+        });
+        let short = crate::connection::ConnectionOptions {
+            send_deadline: Duration::from_millis(80),
+            ..options()
+        };
+        let connection = open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap();
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        let other = connection.create_operation().unwrap();
+        let waiting = submit_held(&connection, &other, 6);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            unsent_with(RequestCause::SendTimeout),
+            "completed while the earlier result is still held"
+        );
+        assert!(held.try_recv().is_err(), "still held");
+        assert_eq!(connection.shared.lock().waiting_bytes, 0);
+    }
+
+    #[test]
+    fn a_rejection_held_for_its_cutoff_stays_a_rejection_when_the_link_ends() {
+        let (port, push) = pushing_unit_coded(Duration::from_millis(200), |request| {
+            if request["vdp"]["uri"] == "/vd/parameters/2:0:0?operation=regist" {
+                409
+            } else {
+                200
+            }
+        });
+        let (connection, batches) = connect(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(50));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        push.send(lost()).unwrap();
+        let failure = activated
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            Failure::Cause {
+                code: Cause::DeviceRejected,
+                phase: Phase::Subscription
+            }
+        );
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    }
+
+    /// A connection with an 80 ms send deadline whose batches reach the test.
+    fn connect_short(port: u16) -> (Arc<Connection>, Receiver<NotificationBatch>) {
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let _ = tx.lock().unwrap().send(batch);
+        });
+        let short = crate::connection::ConnectionOptions {
+            send_deadline: Duration::from_millis(80),
+            ..options()
+        };
+        let connection = open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap();
+        (Arc::new(connection), batches)
+    }
+
+    #[test]
+    fn a_request_submitted_after_a_hold_began_still_expires() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        // The reply arrives at about 200 ms; the hold then waits with an
+        // empty queue.
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let waiting = submit_held(&connection, &other, 6);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            unsent_with(RequestCause::SendTimeout)
+        );
+        assert!(held.try_recv().is_err(), "still held");
+    }
+
+    #[test]
+    fn a_close_from_an_expiry_callback_during_a_hold_does_not_wait_for_itself() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let _held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let (tx, inner) = mpsc::channel();
+        let closing = Arc::clone(&connection);
+        connection.submit(&other, Request::GetNumeric(param(6)), move |_, _| {
+            let _ = tx.send(closing.close(TEARDOWN));
+        });
+        assert_eq!(
+            inner.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn a_cancelled_reactivation_keeps_the_established_subscription() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let other = activate(&connection, &[p(1)]);
+        let token = activate(&connection, &[p(1), p(2)]);
+        let operation = connection.create_operation().unwrap();
+        operation.cancel();
+        let (tx, again) = mpsc::channel();
+        token.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        assert_eq!(
+            again.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(crate::lifecycle::LifecycleFailure {
+                failure: Failure::Cancelled {
+                    phase: Phase::Subscription
+                },
+                cleanup: crate::lifecycle::Cleanup::COMPLETE,
+            })
+        );
+        let state = connection.shared.lock();
+        assert!(state.ledger.is_active(token.token()));
+        assert_eq!(state.ledger.recipients(p(2)), [token.token()]);
+        assert_eq!(
+            state.ledger.recipients(p(1)),
+            [other.token(), token.token()]
+        );
+    }
+
+    #[test]
+    fn a_blocked_expiry_callback_does_not_hold_up_the_end_of_the_connection() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        connection.submit(&other, Request::GetNumeric(param(6)), move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = blocked.recv();
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        push.send(lost()).unwrap();
+        assert_eq!(
+            held.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            Outcome::failed(
+                RequestCause::ConnectionLost,
+                crate::request::RequestPhase::Delivery,
+                crate::request::Evidence::Read
+            ),
+            "the held result is delivered while the expiry callback blocks"
+        );
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+        release.send(()).unwrap();
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    /// Holds a GET for its cutoff, then submits one whose expiry callback
+    /// blocks until the returned sender is used.
+    fn blocked_expiry(
+        connection: &Arc<Connection>,
+        push: &Sender<Vec<u8>>,
+        batches: &Receiver<NotificationBatch>,
+        on_release: impl FnOnce() + Send + 'static,
+    ) -> Sender<()> {
+        let _token = activate(connection, &[p(1)]);
+        std::mem::forget(_token);
+        let operation = connection.create_operation().unwrap();
+        let _held = submit_held(connection, &operation, 5);
+        std::mem::forget(_held);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(batches);
+        thread::sleep(Duration::from_millis(400));
+        let other = connection.create_operation().unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        connection.submit(&other, Request::GetNumeric(param(6)), move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = blocked.recv();
+            on_release();
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        release
+    }
+
+    #[test]
+    fn an_expiry_callback_joining_a_running_close_does_not_wait_for_itself() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let (tx, inner) = mpsc::channel();
+        let joining = Arc::clone(&connection);
+        let release = blocked_expiry(&connection, &push, &batches, move || {
+            let _ = tx.send(joining.close(TEARDOWN));
+        });
+        let closer = {
+            let connection = Arc::clone(&connection);
+            thread::spawn(move || connection.close(TEARDOWN))
+        };
+        super::wait_until(|| connection.shared.lock().closing);
+        release.send(()).unwrap();
+        assert_eq!(
+            inner.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn expired_requests_stay_charged_until_completed() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let release = blocked_expiry(&connection, &push, &batches, || {});
+        let operation = connection.create_operation().unwrap();
+        let (tx, completed) = mpsc::channel();
+        // Every completion blocks until the gate opens.
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        for id in 0..(MAX_WAITING_REQUESTS - 1) as u32 {
+            let tx = tx.clone();
+            let gate = Arc::clone(&gate);
+            connection.submit(
+                &operation,
+                Request::GetNumeric(param(100 + id)),
+                move |outcome, _| {
+                    let (open, opened) = &*gate;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        open = opened.wait(open).unwrap();
+                    }
+                    drop(open);
+                    let _ = tx.send(outcome);
+                },
+            );
+        }
+        super::wait_until(|| connection.shared.expiry.charged().0 == MAX_WAITING_REQUESTS);
+        let (refused_tx, refused) = mpsc::channel();
+        connection.submit(
+            &operation,
+            Request::GetNumeric(param(99)),
+            move |outcome, _| {
+                let _ = refused_tx.send(outcome);
+            },
+        );
+        assert_eq!(
+            refused.recv_timeout(Duration::from_secs(1)).unwrap(),
+            unsent_with(RequestCause::PreconditionFailed),
+            "the expired ones still count against the queue"
+        );
+        assert!(
+            crate::connection::lock(&connection.shared.expiry.pool)
+                .threads
+                .len()
+                <= MAX_WAITING_REQUESTS,
+            "one thread at most per charged completion"
+        );
+        release.send(()).unwrap();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for _ in 0..MAX_WAITING_REQUESTS - 1 {
+            assert_eq!(
+                completed.recv_timeout(Duration::from_secs(2)).unwrap(),
+                unsent_with(RequestCause::SendTimeout)
+            );
+        }
+        assert!(
+            completed.recv_timeout(Duration::from_millis(100)).is_err(),
+            "once each"
+        );
+        super::wait_until(|| connection.shared.expiry.charged().0 == 0);
+    }
+
+    #[test]
+    fn the_expiry_threads_end_with_the_connection_without_a_close() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let release = blocked_expiry(&connection, &push, &batches, || {});
+        push.send(lost()).unwrap();
+        super::wait_until(|| connection.terminal().is_some());
+        release.send(()).unwrap();
+        super::wait_until(|| {
+            let pool = crate::connection::lock(&connection.shared.expiry.pool);
+            !pool.threads.is_empty() && pool.threads.iter().all(|thread| thread.is_finished())
+        });
+    }
+
+    #[test]
+    fn a_blocked_expiry_callback_does_not_delay_other_expiries() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let release = blocked_expiry(&connection, &push, &batches, || {});
+        let other = connection.create_operation().unwrap();
+        let later = submit_held(&connection, &other, 7);
+        assert_eq!(
+            later.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            unsent_with(RequestCause::SendTimeout),
+            "completed while the first expiry callback is still blocked"
+        );
+        super::wait_until(|| connection.shared.expiry.charged().0 == 1);
+        release.send(()).unwrap();
+        super::wait_until(|| connection.shared.expiry.charged().0 == 0);
+    }
+
+    #[test]
+    fn the_expiry_threads_end_without_waiting_for_the_ends_completions() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let release = blocked_expiry(&connection, &push, &batches, || {});
+        release.send(()).unwrap();
+        super::wait_until(|| connection.shared.expiry.charged().0 == 0);
+        // A waiting request whose completion, run by the end, blocks.
+        let operation = connection.create_operation().unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (unblock, blocked) = mpsc::channel::<()>();
+        connection.submit(&operation, Request::GetNumeric(param(8)), move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = blocked.recv();
+        });
+        push.send(lost()).unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        super::wait_until(|| {
+            let pool = crate::connection::lock(&connection.shared.expiry.pool);
+            !pool.threads.is_empty() && pool.threads.iter().all(|thread| thread.is_finished())
+        });
+        unblock.send(()).unwrap();
     }
 }

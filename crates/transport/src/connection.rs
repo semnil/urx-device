@@ -35,9 +35,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Waiting requests, excluding the active one (K6).
+/// Waiting requests, excluding the active one (K6). A request that expired
+/// while a reply was held counts until its completion has run.
 pub const MAX_WAITING_REQUESTS: usize = 64;
-/// Total encoded bytes of waiting requests (K6).
+/// Total encoded bytes of waiting requests, counted the same way (K6).
 pub const MAX_WAITING_BYTES: usize = 4 << 20;
 
 /// Longest a write blocks before its deadline is checked again.
@@ -62,7 +63,50 @@ pub struct ConnectionOptions {
     pub response_deadline: Duration,
 }
 
-type Done = Box<dyn FnOnce(Outcome) + Send>;
+type Done = Box<dyn FnOnce(Outcome, ResultAdoption) + Send>;
+
+/// The acknowledgment of one app-issued request's completion (K6, K37):
+/// until it is adopted, the request keeps the connection's single wire
+/// slot, and the worker starts nothing after it. Completions that leave no
+/// result in the slot (refused, unsent or ended) carry one that adopts
+/// nothing.
+pub struct ResultAdoption {
+    shared: Weak<Shared>,
+    id: u64,
+}
+
+impl ResultAdoption {
+    fn none() -> Self {
+        ResultAdoption {
+            shared: Weak::new(),
+            id: 0,
+        }
+    }
+
+    /// Releases the slot once the result is adopted. Returns false when it
+    /// holds no result (anymore) on its own connection.
+    pub fn adopt(self) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut state = shared.lock();
+        match &mut state.result {
+            Some(held) if held.id == self.id && !held.adopted => {
+                held.adopted = true;
+                drop(state);
+                shared.advance.notify_all();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The completion in the wire slot, awaiting its adoption.
+struct HeldResult {
+    id: u64,
+    adopted: bool,
+}
 
 struct Item {
     owner: u64,
@@ -88,6 +132,15 @@ struct State {
     jobs: VecDeque<Job>,
     /// Releases asked for and not yet settled, one per token.
     releases: Vec<Release>,
+    /// The end recorded in `Shared::link_end`, mirrored for the waits that
+    /// hold the state lock (K12).
+    ended: Option<RequestCause>,
+    /// Notification records acknowledged when the end was recorded: a held
+    /// reply whose cutoff they reach was released before the end (K12).
+    ended_adopted: u64,
+    /// The app-issued completion holding the wire slot.
+    result: Option<HeldResult>,
+    next_result: u64,
 }
 
 /// One release of a token and every caller waiting on it.
@@ -128,6 +181,13 @@ struct Shared {
     link_end: Mutex<Option<RequestCause>>,
     /// Signalled when the worker settles its active request.
     settled: Condvar,
+    /// Signalled, with the state lock, when what a held result waits for may
+    /// have changed: a notification or result adoption, an end, a close.
+    advance: Condvar,
+    /// Requests that expired while a reply was held, and the threads that
+    /// complete them, so their callbacks hold up neither the worker nor each
+    /// other.
+    expiry: Arc<Expiry>,
     /// Notifications waiting for the application (K6), when it takes them.
     notifications: Option<Mutex<Queue>>,
     /// Signalled when a batch can be formed or delivery must stop.
@@ -162,6 +222,8 @@ struct Received {
     len: usize,
     /// PC receipt time, milliseconds since the Unix epoch.
     received_at_ms: i64,
+    /// Notification records queued before it (K12's receive cutoff).
+    cutoff: u64,
 }
 
 /// Receives each notification batch; acknowledge it with
@@ -305,11 +367,17 @@ impl Connection {
         options: &ConnectionOptions,
         notifications: Option<NotificationHandler>,
     ) -> std::io::Result<Connection> {
+        // Every fallible step comes before any thread starts, so a failure
+        // leaves nothing running.
+        let reader_sock = sock.try_clone()?;
+        let worker_sock = sock.try_clone()?;
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
             settled: Condvar::new(),
+            advance: Condvar::new(),
+            expiry: Arc::new(Expiry::default()),
             notifications: notifications
                 .as_ref()
                 .map(|_| Mutex::new(Queue::new(generation))),
@@ -324,14 +392,14 @@ impl Connection {
         });
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_thread = {
-            let sock = sock.try_clone()?;
+            let sock = reader_sock;
             let events = events.clone();
             let stop = Arc::clone(&reader_stop);
             let shared = Arc::clone(&shared);
             thread::spawn(move || read_frames(sock, reader, events, stop, shared))
         };
         let worker_thread = {
-            let sock = sock.try_clone()?;
+            let sock = worker_sock;
             let shared = Arc::clone(&shared);
             let options = *options;
             thread::spawn(move || serve(sock, inbox, shared, options))
@@ -390,42 +458,55 @@ impl Connection {
 
     /// Admits `request` for `operation`, or completes it at once, unsent,
     /// when it cannot be admitted. `done` runs exactly once, on the worker
-    /// thread or, for a refusal, on this thread.
+    /// thread or, for a refusal, on this thread. A result received from the
+    /// unit is passed only after every notification received before it is
+    /// adopted (K12), and it holds the wire slot until its
+    /// [`ResultAdoption`] is adopted (K6).
     pub fn submit(
         &self,
         operation: &Operation,
         request: Request,
-        done: impl FnOnce(Outcome) + Send + 'static,
+        done: impl FnOnce(Outcome, ResultAdoption) + Send + 'static,
     ) {
         let refuse = |code, phase| Outcome::failed(code, phase, Evidence::NotSent);
         let message = message_of(&request);
         let frame = match frame::encode(&message) {
             Ok(frame) => frame,
-            Err(_) => return done(refuse(RequestCause::InvalidInput, RequestPhase::Validation)),
+            Err(_) => {
+                return done(
+                    refuse(RequestCause::InvalidInput, RequestPhase::Validation),
+                    ResultAdoption::none(),
+                )
+            }
         };
         let mut state = self.shared.lock();
         let ours = operation.shared.ptr_eq(&Arc::downgrade(&self.shared));
         if !ours || state.closing || state.terminal.is_some() {
             drop(state);
-            return done(refuse(RequestCause::NotConnected, RequestPhase::Admission));
+            return done(
+                refuse(RequestCause::NotConnected, RequestPhase::Admission),
+                ResultAdoption::none(),
+            );
         }
         if state.cancelled_owners.contains(&operation.id) {
             drop(state);
-            return done(Outcome::Failure {
+            let cancelled = Outcome::Failure {
                 failure: RequestFailure::Cancelled {
                     phase: RequestPhase::Admission,
                 },
                 evidence: Evidence::NotSent,
-            });
+            };
+            return done(cancelled, ResultAdoption::none());
         }
-        if state.waiting.len() >= MAX_WAITING_REQUESTS
-            || state.waiting_bytes + frame.len() > MAX_WAITING_BYTES
+        let (expiring, expiring_bytes) = self.shared.expiry.charged();
+        if state.waiting.len() + expiring >= MAX_WAITING_REQUESTS
+            || state.waiting_bytes + expiring_bytes + frame.len() > MAX_WAITING_BYTES
         {
             drop(state);
-            return done(refuse(
-                RequestCause::PreconditionFailed,
-                RequestPhase::Admission,
-            ));
+            return done(
+                refuse(RequestCause::PreconditionFailed, RequestPhase::Admission),
+                ResultAdoption::none(),
+            );
         }
         state.waiting_bytes += frame.len();
         state.waiting.push_back(Item {
@@ -437,6 +518,8 @@ impl Connection {
             done: Box::new(done),
         });
         drop(state);
+        // A held result's wait tracks the earliest send deadline.
+        self.shared.advance.notify_all();
         let _ = self.events.send(Event::Wake);
     }
 
@@ -450,6 +533,10 @@ impl Connection {
         let adopted = lock(queue).adopt(ticket);
         if adopted {
             self.shared.deliverable.notify_all();
+            // Taken after the queue changed, so a held result checking it
+            // under the state lock either sees the change or is woken.
+            drop(self.shared.lock());
+            self.shared.advance.notify_all();
         }
         adopted
     }
@@ -520,6 +607,10 @@ impl Connection {
             (take_pending(&mut state), cause)
         };
         let (waiting, cause) = waiting;
+        // After the close is marked, no hold queues another expired request.
+        self.shared.expiry.stop();
+        // A held result stops waiting for the application.
+        self.shared.advance.notify_all();
         let _ = self.events.send(Event::Wake);
         // Waiting requests complete on their own thread, which the close
         // waits for within the budget; a close called from one of their
@@ -569,10 +660,11 @@ impl Connection {
             // A completion or delivery callback cannot wait for the thread it
             // runs on; a helper waits for the threads within the same budget.
             let cell = Arc::clone(&self.close);
-            thread::spawn(move || cell.record(wait_for(threads, end)));
+            let expiry = Arc::clone(&self.shared.expiry);
+            thread::spawn(move || cell.record(wait_for(threads, &expiry, end)));
             return CloseOutcome::Started;
         }
-        let outcome = wait_for(threads, end);
+        let outcome = wait_for(threads, &self.shared.expiry, end);
         self.close.record(outcome);
         outcome
     }
@@ -585,10 +677,13 @@ impl Connection {
         self.on_own_thread() || lock(&self.close.exempt).contains(&me)
     }
 
-    /// Whether this is the worker or the notification delivery thread.
+    /// Whether this is the worker, the notification delivery thread or a
+    /// thread completing expired requests.
     fn on_own_thread(&self) -> bool {
         let me = thread::current().id();
-        self.worker_id == me || self.delivery_id == Some(me)
+        self.worker_id == me
+            || self.delivery_id == Some(me)
+            || lock(&self.shared.expiry.pool).ids.contains(&me)
     }
 }
 
@@ -596,12 +691,24 @@ impl Connection {
 /// `Incomplete`, even if the threads finish later. The joins run on their own
 /// thread, so a thread whose exit (its thread-local destructors included)
 /// does not finish cannot hold this past `end`.
-fn wait_for(threads: [Option<JoinHandle<()>>; 4], end: Instant) -> CloseOutcome {
+fn wait_for<const N: usize>(
+    threads: [Option<JoinHandle<()>>; N],
+    expiry: &Arc<Expiry>,
+    end: Instant,
+) -> CloseOutcome {
     let incomplete =
         CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
     let (joined, all_joined) = mpsc::channel();
+    let expiry = Arc::clone(expiry);
     thread::spawn(move || {
         for thread in threads.into_iter().flatten() {
+            let _ = thread.join();
+        }
+        // Taken after the worker is joined: it starts no expiry thread after.
+        // Their identities stay recorded, so a close from one never waits
+        // for itself.
+        let expiries = std::mem::take(&mut lock(&expiry.pool).threads);
+        for thread in expiries {
             let _ = thread.join();
         }
         let _ = joined.send(());
@@ -770,16 +877,138 @@ impl Operation {
                     evidence: Evidence::NotSent,
                 },
             };
-            deliver(item.done, outcome);
+            deliver(item.done, outcome, ResultAdoption::none());
         }
+    }
+}
+
+fn is_unsent(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Failure {
+            evidence: Evidence::NotSent,
+            ..
+        }
+    )
+}
+
+#[cfg(test)]
+impl Connection {
+    /// `submit`, adopting the result as soon as `done` has returned.
+    pub(crate) fn submit_adopted(
+        &self,
+        operation: &Operation,
+        request: Request,
+        done: impl FnOnce(Outcome) + Send + 'static,
+    ) {
+        self.submit(operation, request, move |outcome, adoption| {
+            done(outcome);
+            adoption.adopt();
+        });
+    }
+}
+
+/// Requests that expired during a hold, waiting for a completing thread,
+/// and those threads (K5, K6).
+#[derive(Default)]
+struct Expiry {
+    pool: Mutex<ExpiryPool>,
+    /// Signalled when a request is queued or the threads must stop.
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct ExpiryPool {
+    queue: VecDeque<Item>,
+    /// Expired requests whose completion has not run, and their bytes: they
+    /// stay charged to the waiting-request limits until then.
+    charged: usize,
+    charged_bytes: usize,
+    /// Threads waiting for a request, and threads started that have not yet
+    /// taken one: both will take a queued request without a new thread.
+    idle: usize,
+    starting: usize,
+    threads: Vec<JoinHandle<()>>,
+    /// Identities of every thread started, kept for the connection's life.
+    ids: Vec<ThreadId>,
+    stopping: bool,
+}
+
+impl Expiry {
+    /// Queues expired requests, starting a thread for each one no idle
+    /// thread takes, so a blocked completion delays no other. Every queued
+    /// or running completion is charged, so the threads stay within the
+    /// waiting-request limit.
+    fn queue(self: &Arc<Self>, expired: VecDeque<Item>) {
+        let mut pool = lock(&self.pool);
+        for item in expired {
+            pool.charged += 1;
+            pool.charged_bytes += item.frame.len();
+            pool.queue.push_back(item);
+        }
+        let needed = pool.queue.len().saturating_sub(pool.idle + pool.starting);
+        for _ in 0..needed {
+            pool.starting += 1;
+            let expiry = Arc::clone(self);
+            // Registered before it can run: it waits for this lock first.
+            let thread = thread::spawn(move || expiry.complete());
+            pool.ids.push(thread.thread().id());
+            pool.threads.push(thread);
+        }
+        drop(pool);
+        self.ready.notify_all();
+    }
+
+    /// One completing thread: completes queued requests until told to stop
+    /// with none left.
+    fn complete(&self) {
+        let mut pool = lock(&self.pool);
+        pool.starting -= 1;
+        loop {
+            if let Some(item) = pool.queue.pop_front() {
+                drop(pool);
+                let bytes = item.frame.len();
+                let timeout = Outcome::failed(
+                    RequestCause::SendTimeout,
+                    RequestPhase::Admission,
+                    Evidence::NotSent,
+                );
+                deliver(item.done, timeout, ResultAdoption::none());
+                pool = lock(&self.pool);
+                pool.charged -= 1;
+                pool.charged_bytes -= bytes;
+                continue;
+            }
+            if pool.stopping {
+                return;
+            }
+            pool.idle += 1;
+            pool = self
+                .ready
+                .wait(pool)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pool.idle -= 1;
+        }
+    }
+
+    /// Lets the threads end once nothing is queued; no hold follows.
+    fn stop(&self) {
+        lock(&self.pool).stopping = true;
+        self.ready.notify_all();
+    }
+
+    fn charged(&self) -> (usize, usize) {
+        let pool = lock(&self.pool);
+        (pool.charged, pool.charged_bytes)
     }
 }
 
 /// Runs one completion callback. A callback that panics is contained, so
 /// every other admitted request still completes and the connection still
 /// shuts down.
-fn deliver(done: Done, outcome: Outcome) {
-    let _ = panic::catch_unwind(AssertUnwindSafe(move || done(outcome)));
+/// Returns false when the callback panicked.
+fn deliver(done: Done, outcome: Outcome, adoption: ResultAdoption) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(move || done(outcome, adoption))).is_ok()
 }
 
 fn message_of(request: &Request) -> Value {
@@ -888,7 +1117,7 @@ fn deliver_notifications(shared: &Shared, handler: &NotificationHandler, events:
         if panic::catch_unwind(AssertUnwindSafe(|| handler(batch))).is_err() {
             // The application can no longer adopt notifications: the
             // connection ends, and delivery stops.
-            shared.link_end().get_or_insert(RequestCause::InternalError);
+            record_end(shared, RequestCause::InternalError);
             let _ = events.send(Event::ReadFailed(RequestCause::InternalError));
             return;
         }
@@ -904,7 +1133,7 @@ fn read_frames(
     shared: Arc<Shared>,
 ) {
     let record = |cause| {
-        shared.link_end().get_or_insert(cause);
+        record_end(&shared, cause);
     };
     // After an overflow, replies to a request already sent still arrive;
     // further notifications are not queued, even once budget is released.
@@ -921,10 +1150,11 @@ fn read_frames(
                     if lost_notification(&json) {
                         record(RequestCause::ConnectionLost);
                     }
-                    let received = Received {
+                    let mut received = Received {
                         message: json,
                         len: frame.len,
                         received_at_ms: now_ms(),
+                        cutoff: 0,
                     };
                     // Recipients and budget are decided here, at receipt.
                     match route(&shared, &received, !overflowed) {
@@ -940,6 +1170,10 @@ fn read_frames(
                             continue;
                         }
                     }
+                    received.cutoff = shared
+                        .notifications
+                        .as_ref()
+                        .map_or(0, |queue| lock(queue).accepted());
                     if events.send(Event::Frame(received)).is_err() {
                         return;
                     }
@@ -1002,27 +1236,64 @@ fn serve(
             if state.closing && state.waiting.is_empty() {
                 return;
             }
-            let item = state.waiting.pop_front();
-            if let Some(item) = &item {
+            state.waiting.pop_front().map(|item| {
                 state.waiting_bytes -= item.frame.len();
                 state.active = true;
-            }
-            item
+                state.next_result += 1;
+                let id = state.next_result;
+                state.result = Some(HeldResult { id, adopted: false });
+                (item, id)
+            })
         };
         let fatal = match next {
-            Some(item) => {
+            Some((item, id)) => {
                 let (outcome, fatal) = execute(&mut sock, &inbox, &shared, &options, &item);
-                shared.lock().active = false;
+                // Only a request that may have reached the unit holds the
+                // slot for its adoption; an end releases it.
+                let holds = fatal.is_none() && !is_unsent(&outcome);
+                {
+                    let mut state = shared.lock();
+                    state.active = false;
+                    if !holds {
+                        state.result = None;
+                    }
+                }
                 shared.settled.notify_all();
                 // The end is recorded, and the waiting requests taken with it,
                 // before the outcome is delivered: whoever receives it sees
                 // the ended state, and nothing it does can change how the
                 // waiting requests end.
                 let waiting = fatal.map(|cause| mark_ended(&shared, cause));
-                deliver(item.done, outcome);
+                let adoption = if holds {
+                    ResultAdoption {
+                        shared: Arc::downgrade(&shared),
+                        id,
+                    }
+                } else {
+                    ResultAdoption::none()
+                };
+                if !deliver(item.done, outcome, adoption) && holds {
+                    // A callback that failed took its adoption with it; the
+                    // result is consumed, as the other completions are not
+                    // held up by a failed callback.
+                    if let Some(held) = shared.lock().result.as_mut() {
+                        held.adopted = true;
+                    }
+                }
                 if let Some(ended) = waiting {
                     finish(&mut sock, ended);
                     return;
+                }
+                if holds {
+                    // Nothing starts on the wire until the result is
+                    // adopted; an end or a close does not wait for it.
+                    hold(
+                        &shared,
+                        options.send_deadline,
+                        |state| state.result.as_ref().is_none_or(|held| held.adopted),
+                        |_| false,
+                    );
+                    shared.lock().result = None;
                 }
                 None
             }
@@ -1042,6 +1313,30 @@ fn serve(
     }
 }
 
+/// Records `cause` as the end of the connection unless one is recorded, and
+/// returns the recorded end.
+fn record_end(shared: &Shared, cause: RequestCause) -> RequestCause {
+    let mut link_end = shared.link_end();
+    let cause = *link_end.get_or_insert(cause);
+    note_end(shared, &mut shared.lock(), cause);
+    drop(link_end);
+    shared.advance.notify_all();
+    cause
+}
+
+/// Mirrors the recorded end into the state, once, with the notification
+/// records acknowledged at that moment.
+fn note_end(shared: &Shared, state: &mut State, cause: RequestCause) {
+    if state.ended.is_none() {
+        state.ended = Some(cause);
+        // The queue lock is taken under the state lock, never the reverse.
+        state.ended_adopted = shared
+            .notifications
+            .as_ref()
+            .map_or(0, |queue| lock(queue).adopted());
+    }
+}
+
 /// Records `cause` as the end of the connection and takes the waiting
 /// requests in the same step, so that no later cancellation or close changes
 /// how they end.
@@ -1051,10 +1346,15 @@ fn mark_ended(shared: &Shared, cause: RequestCause) -> Ended {
     let mut link_end = shared.link_end();
     let cause = *link_end.get_or_insert(cause);
     let mut state = shared.lock();
+    note_end(shared, &mut state, cause);
     state.terminal.get_or_insert(cause);
     let taken = take_pending(&mut state);
     drop(state);
     drop(link_end);
+    shared.advance.notify_all();
+    // No hold follows the end: the expiry threads end once nothing is
+    // queued, without waiting for the completions the end still runs.
+    shared.expiry.stop();
     Ended { taken, cause }
 }
 
@@ -1099,6 +1399,7 @@ impl Taken {
             deliver(
                 item.done,
                 Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
+                ResultAdoption::none(),
             );
         }
         for job in self.jobs {
@@ -1200,8 +1501,9 @@ enum Posted {
     Refused {
         verdict: Verdict,
         cause: RequestCause,
-        /// Whether it ends the connection by itself.
-        ends: bool,
+        /// The end of the connection it comes with, if any: its own cause,
+        /// or an end recorded meanwhile that leaves its verdict as it is.
+        ends: Option<RequestCause>,
     },
     /// Not started, because the operation was cancelled or the release asked.
     Stopped,
@@ -1239,7 +1541,7 @@ impl Io<'_> {
             ends,
         };
         let Ok(frame) = frame::encode(&request.message()) else {
-            return refused(Verdict::Rejected, RequestCause::InternalError, false);
+            return refused(Verdict::Rejected, RequestCause::InternalError, None);
         };
         let key = request.reply_key();
         let send_end = Instant::now() + self.options.send_deadline;
@@ -1259,26 +1561,34 @@ impl Io<'_> {
             unstarted: &unstarted,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
-            Ok((inbound, ending)) => {
-                let reply = inbound
+            Ok(held) => {
+                let ending = match await_cutoff(self.shared, self.options, &held) {
+                    Held::Ready | Held::Closing => None,
+                    Held::Ended(cause) => Some(cause),
+                };
+                let reply = held
+                    .inbound
                     .reply(&key)
                     .expect("exchange returns the matching reply");
-                if let Some(cause) = ending {
-                    let verdict = match reply.post_verdict() {
-                        PostVerdict::Accepted => Verdict::Accepted,
-                        PostVerdict::Rejected(_) => Verdict::Rejected,
-                        PostVerdict::Malformed => Verdict::Unknown,
-                    };
-                    return refused(verdict, cause, true);
-                }
-                match reply.post_verdict() {
+                let posted = match reply.post_verdict() {
                     PostVerdict::Accepted => Posted::Accepted,
                     PostVerdict::Rejected(_) => {
-                        refused(Verdict::Rejected, RequestCause::DeviceRejected, false)
+                        refused(Verdict::Rejected, RequestCause::DeviceRejected, None)
                     }
                     PostVerdict::Malformed => {
-                        refused(Verdict::Unknown, RequestCause::InvalidResponse, false)
+                        refused(Verdict::Unknown, RequestCause::InvalidResponse, None)
                     }
+                };
+                // An end before the verdict is consumed ends the connection;
+                // an acceptance then fails with it, and a refusal keeps its
+                // own cause (K34).
+                match (posted, ending) {
+                    (posted, None) => posted,
+                    (Posted::Accepted, Some(end)) => refused(Verdict::Accepted, end, Some(end)),
+                    (Posted::Refused { verdict, cause, .. }, Some(end)) => {
+                        refused(verdict, cause, Some(end))
+                    }
+                    (Posted::Stopped, Some(_)) => Posted::Stopped,
                 }
             }
             Err(failed) => match failed.failure {
@@ -1289,7 +1599,7 @@ impl Io<'_> {
                     } else {
                         Verdict::Unknown
                     };
-                    refused(verdict, code, failed.ends.is_some())
+                    refused(verdict, code, failed.ends)
                 }
             },
         }
@@ -1305,6 +1615,26 @@ impl Io<'_> {
             ends,
             released,
         };
+        let started = {
+            let state = self.shared.lock();
+            let active = state.ledger.is_active(token);
+            (active, stopped(&state))
+        };
+        if let (true, stop) = started {
+            // Already active: this call acquires nothing, so a cancellation
+            // of it leaves the established subscription as it is.
+            let outcome = if stop {
+                Err(LifecycleFailure {
+                    failure: Failure::Cancelled {
+                        phase: Phase::Subscription,
+                    },
+                    cleanup: Cleanup::COMPLETE,
+                })
+            } else {
+                Ok(())
+            };
+            return done(outcome, None, false);
+        }
         let needed = match self.shared.lock().ledger.start(token) {
             Ok(needed) => needed,
             Err(StartRefusal::Busy) | Err(StartRefusal::Unusable) => {
@@ -1352,23 +1682,35 @@ impl Io<'_> {
                 } => {
                     self.shared.lock().ledger.registered(address, verdict);
                     let failed = Failure::cause(lifecycle_cause(cause), Phase::Subscription);
-                    failure = Some((failed, ends.then_some(cause)));
+                    failure = Some((failed, ends));
                     break;
                 }
             }
         }
-        let Some((failure, ends)) = failure else {
-            let mut state = self.shared.lock();
-            state.ledger.activate(token);
-            if state.ledger.is_active(token) {
-                return done(Ok(()), None, false);
+        let (failure, ends) = match failure {
+            Some(failure) => failure,
+            None => {
+                // The stop check and the activation happen under one lock: a
+                // cancellation or release accepted first is cleaned up.
+                let mut state = self.shared.lock();
+                if stopped(&state) {
+                    let cancelled = Failure::Cancelled {
+                        phase: Phase::Subscription,
+                    };
+                    (cancelled, None)
+                } else {
+                    state.ledger.activate(token);
+                    if state.ledger.is_active(token) {
+                        return done(Ok(()), None, false);
+                    }
+                    drop(state);
+                    let failure = LifecycleFailure {
+                        failure: Failure::cause(Cause::PreconditionFailed, Phase::Subscription),
+                        cleanup: Cleanup::COMPLETE,
+                    };
+                    return done(Err(failure), None, false);
+                }
             }
-            drop(state);
-            let failure = LifecycleFailure {
-                failure: Failure::cause(Cause::PreconditionFailed, Phase::Subscription),
-                cleanup: Cleanup::COMPLETE,
-            };
-            return done(Err(failure), None, false);
         };
         // A failed activation's cleanup is the token's release: it is
         // recorded as running before any unregistration, so a release asked
@@ -1415,10 +1757,14 @@ impl Io<'_> {
         let addresses = self.shared.lock().ledger.begin_release(token);
         for address in addresses {
             let posted = self.post(unregister(address), &|_| false);
-            let (verdict, cause) = match posted {
-                Posted::Accepted => (Verdict::Accepted, None),
-                Posted::Refused { verdict, cause, .. } => (verdict, Some(cause)),
-                Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected)),
+            let (verdict, cause, ends) = match posted {
+                Posted::Accepted => (Verdict::Accepted, None, None),
+                Posted::Refused {
+                    verdict,
+                    cause,
+                    ends,
+                } => (verdict, Some(cause), ends),
+                Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected), None),
             };
             self.shared.lock().ledger.unregistered(address, verdict);
             if let Some(cause) = cause {
@@ -1428,7 +1774,7 @@ impl Io<'_> {
                     state: CleanupState::ConnectionClosed,
                     failure: Some(failure),
                 };
-                return (cleanup, Some(cause));
+                return (cleanup, Some(ends.unwrap_or(cause)));
             }
         }
         self.shared.lock().ledger.finish(token);
@@ -1495,11 +1841,18 @@ fn execute(
         unstarted: &unstarted,
     };
     match exchange(sock, inbox, shared, options, outbound) {
-        Ok((inbound, ending)) => {
-            let reply = inbound
-                .reply(key)
-                .expect("exchange returns the matching reply");
-            (decode(request, reply), ending)
+        Ok(reply) => {
+            let outcome = decode(
+                request,
+                reply
+                    .inbound
+                    .reply(key)
+                    .expect("exchange returns the matching reply"),
+            );
+            match await_cutoff(shared, options, &reply) {
+                Held::Ready | Held::Closing => (outcome, None),
+                Held::Ended(cause) => (at_delivery(outcome, cause), Some(cause)),
+            }
         }
         Err(failed) => (
             Outcome::Failure {
@@ -1508,6 +1861,124 @@ fn execute(
             },
             failed.ends,
         ),
+    }
+}
+
+/// The matching reply of one exchange.
+struct Answer {
+    inbound: Inbound,
+    /// Notification records queued before it was received (K12).
+    cutoff: u64,
+    /// An end that came while it was awaited.
+    ending: Option<RequestCause>,
+}
+
+/// What a held result stopped waiting for.
+enum Held {
+    Ready,
+    Ended(RequestCause),
+    Closing,
+}
+
+/// Waits until `ready`, or until the connection ends or closes: fatal
+/// stopping and a close never wait for the application (K6, K12).
+fn hold(
+    shared: &Shared,
+    send_deadline: Duration,
+    ready: impl Fn(&State) -> bool,
+    ready_before_end: impl Fn(&State) -> bool,
+) -> Held {
+    let mut state = shared.lock();
+    loop {
+        // Once an end is recorded, only what was ready before it counts:
+        // what the application adopts afterwards does not turn the result
+        // into a normal one.
+        if let Some(cause) = state.ended {
+            return if ready_before_end(&state) {
+                Held::Ready
+            } else {
+                Held::Ended(cause)
+            };
+        }
+        if ready(&state) {
+            return Held::Ready;
+        }
+        if state.closing {
+            return Held::Closing;
+        }
+        // Waiting requests whose send budget runs out meanwhile complete
+        // unsent, releasing their queue capacity (K5, K6).
+        let now = Instant::now();
+        let (expired, waiting): (VecDeque<Item>, VecDeque<Item>) =
+            std::mem::take(&mut state.waiting)
+                .into_iter()
+                .partition(|item| item.submitted + send_deadline <= now);
+        state.waiting = waiting;
+        if !expired.is_empty() {
+            state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
+            // Queued under the state lock, so a close marked after this
+            // finds them queued before it stops the threads.
+            shared.expiry.queue(expired);
+            continue;
+        }
+        let next = state
+            .waiting
+            .iter()
+            .map(|item| item.submitted + send_deadline)
+            .min();
+        state = match next {
+            Some(at) => {
+                shared
+                    .advance
+                    .wait_timeout(state, at.saturating_duration_since(now))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0
+            }
+            None => shared
+                .advance
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        };
+    }
+}
+
+/// Holds a reply until every notification record received before it is
+/// adopted (K12), or the connection ends or closes.
+fn await_cutoff(shared: &Shared, options: &ConnectionOptions, reply: &Answer) -> Held {
+    if let Some(cause) = reply.ending {
+        return Held::Ended(cause);
+    }
+    // Its exchange is settled: a close need not wait for this hold (it
+    // stops it), and a callback run meanwhile may close. A write after it
+    // cannot start once the close is marked, so the request is active again
+    // only for what follows.
+    shared.lock().active = false;
+    shared.settled.notify_all();
+    // The queue lock is taken under the state lock, never the reverse.
+    let held = hold(
+        shared,
+        options.send_deadline,
+        |_| {
+            shared
+                .notifications
+                .as_ref()
+                .is_none_or(|queue| lock(queue).has_adopted(reply.cutoff))
+        },
+        |state| state.ended_adopted >= reply.cutoff,
+    );
+    shared.lock().active = true;
+    held
+}
+
+/// An established result whose normal delivery cannot complete because the
+/// connection ended: a failure at delivery keeping its evidence (K34). A
+/// rejection or a failure stays as it is.
+fn at_delivery(outcome: Outcome, cause: RequestCause) -> Outcome {
+    match outcome {
+        Outcome::Success { evidence, .. } => {
+            Outcome::failed(cause, RequestPhase::Delivery, evidence)
+        }
+        failure => failure,
     }
 }
 
@@ -1557,7 +2028,7 @@ fn exchange(
     shared: &Shared,
     options: &ConnectionOptions,
     outbound: Outbound<'_>,
-) -> Result<(Inbound, Option<RequestCause>), Failed> {
+) -> Result<Answer, Failed> {
     let Outbound {
         frame,
         key,
@@ -1600,7 +2071,7 @@ fn exchange(
     // reported instead.
     let unconfirmed = |cause: RequestCause| {
         Err(Failed::new(
-            *shared.link_end().get_or_insert(cause),
+            record_end(shared, cause),
             RequestPhase::Response,
             Evidence::Unconfirmed,
             true,
@@ -1623,7 +2094,11 @@ fn exchange(
                 }
                 let inbound = Inbound::new(received.message);
                 if inbound.reply(key).is_some() {
-                    return Ok((inbound, ending));
+                    return Ok(Answer {
+                        inbound,
+                        cutoff: received.cutoff,
+                        ending,
+                    });
                 }
             }
             Ok(Event::Wake) => {}
