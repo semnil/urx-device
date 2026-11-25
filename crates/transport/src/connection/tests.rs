@@ -801,3 +801,45 @@ fn an_outcome_that_ends_the_connection_is_delivered_after_the_end_is_recorded() 
     );
     assert_eq!(terminal, Some(RequestCause::ResponseTimeout));
 }
+
+#[test]
+fn a_panicking_callback_does_not_stop_other_completions() {
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    connection.submit(&operation, Request::GetNumeric(address(1)), |_| {
+        panic!("callback failure")
+    });
+    let next = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert!(matches!(outcome(&next), Outcome::Success { .. }));
+    assert_eq!(connection.terminal(), None);
+
+    let silent = unit(|_| vec![]);
+    let connection = open(
+        silent.port,
+        ID,
+        &ConnectionOptions {
+            response_deadline: Duration::from_millis(100),
+            ..options()
+        },
+        &Control::new(),
+    )
+    .unwrap();
+    let operation = connection.create_operation().unwrap();
+    connection.submit(&operation, Request::GetNumeric(address(1)), |_| {
+        panic!("callback failure")
+    });
+    connection.submit(&operation, Request::GetNumeric(address(2)), |_| {
+        panic!("callback failure")
+    });
+    let last = submit(&connection, &operation, Request::GetNumeric(address(3)));
+    assert_eq!(
+        outcome(&last),
+        failed(
+            RequestCause::ResponseTimeout,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    connection.close();
+}

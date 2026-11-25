@@ -24,6 +24,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
 use std::net::{Shutdown, TcpStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -301,11 +302,14 @@ impl Connection {
             std::mem::take(&mut state.waiting)
         };
         for item in waiting {
-            (item.done)(Outcome::failed(
-                RequestCause::NotConnected,
-                RequestPhase::Admission,
-                Evidence::NotSent,
-            ));
+            deliver(
+                item.done,
+                Outcome::failed(
+                    RequestCause::NotConnected,
+                    RequestPhase::Admission,
+                    Evidence::NotSent,
+                ),
+            );
         }
         let _ = self.events.send(Event::Wake);
         if let Some(worker) = self.worker.take() {
@@ -348,14 +352,24 @@ impl Operation {
             mine
         };
         for item in cancelled {
-            (item.done)(Outcome::Failure {
-                failure: RequestFailure::Cancelled {
-                    phase: RequestPhase::Admission,
+            deliver(
+                item.done,
+                Outcome::Failure {
+                    failure: RequestFailure::Cancelled {
+                        phase: RequestPhase::Admission,
+                    },
+                    evidence: Evidence::NotSent,
                 },
-                evidence: Evidence::NotSent,
-            });
+            );
         }
     }
+}
+
+/// Runs one completion callback. A callback that panics is contained, so
+/// every other admitted request still completes and the connection still
+/// shuts down.
+fn deliver(done: Done, outcome: Outcome) {
+    let _ = panic::catch_unwind(AssertUnwindSafe(move || done(outcome)));
 }
 
 fn message_of(request: &Request) -> Value {
@@ -443,7 +457,7 @@ fn serve(
                 if let Some(cause) = fatal {
                     mark_ended(&shared, cause);
                 }
-                (item.done)(outcome);
+                deliver(item.done, outcome);
                 fatal
             }
             None => match inbox.recv() {
@@ -477,11 +491,10 @@ fn end(sock: &mut TcpStream, shared: &Shared, cause: RequestCause) {
     };
     let _ = sock.shutdown(Shutdown::Both);
     for item in waiting {
-        (item.done)(Outcome::failed(
-            cause,
-            RequestPhase::Admission,
-            Evidence::NotSent,
-        ));
+        deliver(
+            item.done,
+            Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
+        );
     }
 }
 
