@@ -206,6 +206,44 @@ describe("CURRENT composition (K36, F18)", () => {
     }
   });
 
+  it("plan on URX22 only the MIX sends whose one write was measured, whatever the file's Pan Link (F03-G)", () => {
+    const measured = [
+      "send.level channel-1 mix-1",
+      "send.level channel-1 mix-2",
+      "send.level channel-2 mix-1",
+      "send.pan channel-1 mix-1",
+      "send.pan channel-1 mix-2",
+      "send.on channel-1 mix-1",
+      "send.on channel-1 mix-2",
+      "send.level channel-3 mix-1",
+      "send.level channel-3 mix-2",
+      "send.on channel-3 mix-1",
+      "send.level fx-1 mix-1",
+      "send.level fx-1 mix-2",
+      "send.level fx-2 mix-1",
+      "send.pan fx-1 mix-1",
+      "send.on fx-1 mix-1",
+    ].sort();
+    const toMix = (row: { setting: string; target: object }) =>
+      ["send.level", "send.pan", "send.on"].includes(row.setting) && `${(row.target as { destination?: string }).destination}`.startsWith("mix-");
+    const name = (row: { setting: string; target: object }) => {
+      const { source, destination } = row.target as { source: string; destination: string };
+      return `${row.setting} ${source} ${destination}`;
+    };
+    for (const link of [0, 1]) {
+      const plan = planCurrent(synthesize("URX22", { "589:0": link, "589:2": link }), "URX22");
+      expect(plan.steps.filter(toMix).map(name).sort(), `Pan Link ${link}`).toEqual(measured);
+      const omitted = plan.omissions.filter(toMix);
+      expect(new Set(omitted.map((o) => o.reason)), `Pan Link ${link}`).toEqual(new Set(["not_writable"]));
+      // URX22's 6 channels' and 2 FX returns' level, pan and on to 2 MIX buses, less the measured ones.
+      expect(omitted.length + measured.length, `Pan Link ${link}`).toBe(8 * 3 * 2);
+    }
+    // Elsewhere no partner-linked MIX send is a step.
+    for (const model of ["URX44", "URX44V"] as const) {
+      expect(planCurrent(synthesize(model), model).steps.filter(toMix), model).toEqual([]);
+    }
+  });
+
   it("send a Delay's Sync, BPM, Note, the rest, then Delay Time; omit the time with Sync On (F18-D-A)", () => {
     const delay = FX_RETURN_RULES["bus.fx.parameter"].effects["mono-delay"];
     const stored: Record<string, number> = { "679:0": 1024 };

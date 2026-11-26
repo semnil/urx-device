@@ -215,12 +215,20 @@ export interface ChannelBandSettingRule {
  * leaves the write unbound (a read-only field, or a write multiplicity that
  * awaits evidence under F03-G).
  */
+/**
+ * A write gate for some sends of a route only (F03-G): per model, the sends
+ * as [source index y, destination number] whose one representative write
+ * was measured to move the partner; every other send of the route stays
+ * unbound on that model, and every send on the models not listed.
+ */
+export type SendInstanceGate = { readonly [model: string]: readonly (readonly [y: number, destination: number])[] };
+
 export interface SendRoute {
   readonly from: "mono" | "stereo" | "fx";
   readonly to: "mix" | "fx";
   readonly base: number;
   readonly stride: number;
-  readonly write: WriteGate;
+  readonly write: WriteGate | SendInstanceGate;
 }
 
 /**

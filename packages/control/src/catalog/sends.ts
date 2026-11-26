@@ -3,14 +3,14 @@
 // a/a+1/a+2/a+5. CH → FX: a = 193 + 4b mono, 320 + 4b stereo; level/on at
 // a+1/a+3, tap a (read-only), no pan. FX → MIX: a = 342 + 10b; level/pan/on/
 // tap at a+1/a+2/a+3/a. Level, pan and on writes with a linked-address
-// candidate (CH → MIX, FX → MIX) write the representative once on the models
-// in PARTNER_FOLLOWS, where the partner follows natively (F03-G), except the
-// unmeasured stereo CH → MIX pan; elsewhere they stay unbound.
+// candidate (CH → MIX, FX → MIX) write the representative once only for the
+// sends measured on URX22, where the partner follows natively (F03-G); every
+// other such send, the stereo CH → MIX pan included, stays unbound.
 
 import { FADER_LEVEL_RULE, MONO_CHANNELS, PAN_RULE, STEREO_CHANNELS } from "./channels.js";
 import { frozen } from "./frozen.js";
-import { MODELS, PARTNER_FOLLOWS } from "./models.js";
-import type { SendRoute, SendSettingRule, ValueRule, WriteGate } from "./rules.js";
+import { MODELS } from "./models.js";
+import type { SendInstanceGate, SendRoute, SendSettingRule, ValueRule, WriteGate } from "./rules.js";
 
 const channels = [...new Set(MODELS.flatMap((model) => [...MONO_CHANNELS[model], ...STEREO_CHANNELS[model]]))].sort((a, b) => a - b);
 
@@ -20,13 +20,31 @@ const KNOWN_DESTINATIONS = ["mix-1", "mix-2", "fx-1", "fx-2", "stereo"];
 
 type Field = "level" | "pan" | "on" | "tap";
 
+/**
+ * The sends measured on URX22 (System 1.5.0.1) to move their partner after
+ * one representative write, as [source index y, MIX number]: mono CH 1 = y 0,
+ * CH 2 = y 1; stereo CH 3/4 = y 0; FX 1 = y 0, FX 2 = y 1 (F03-G).
+ */
+const URX22 = (sends: readonly (readonly [number, number])[]): SendInstanceGate => ({ URX22: sends });
+
 /** Field offsets from each family's base a, and whether its write is bound. */
-const FAMILIES: readonly { from: SendRoute["from"]; to: SendRoute["to"]; a: number; stride: number; fields: { [F in Field]?: [number, WriteGate] } }[] = [
-  { from: "mono", to: "mix", a: 146, stride: 12, fields: { level: [0, PARTNER_FOLLOWS], pan: [1, PARTNER_FOLLOWS], on: [2, PARTNER_FOLLOWS], tap: [5, true] } },
-  { from: "stereo", to: "mix", a: 273, stride: 12, fields: { level: [0, PARTNER_FOLLOWS], pan: [1, false], on: [2, PARTNER_FOLLOWS], tap: [5, true] } },
+const FAMILIES: readonly { from: SendRoute["from"]; to: SendRoute["to"]; a: number; stride: number; fields: { [F in Field]?: [number, WriteGate | SendInstanceGate] } }[] = [
+  {
+    from: "mono",
+    to: "mix",
+    a: 146,
+    stride: 12,
+    fields: {
+      level: [0, URX22([[0, 1], [0, 2], [1, 1]])],
+      pan: [1, URX22([[0, 1], [0, 2]])],
+      on: [2, URX22([[0, 1], [0, 2]])],
+      tap: [5, true],
+    },
+  },
+  { from: "stereo", to: "mix", a: 273, stride: 12, fields: { level: [0, URX22([[0, 1], [0, 2]])], pan: [1, false], on: [2, URX22([[0, 1]])], tap: [5, true] } },
   { from: "mono", to: "fx", a: 193, stride: 4, fields: { level: [1, true], on: [3, true], tap: [0, false] } },
   { from: "stereo", to: "fx", a: 320, stride: 4, fields: { level: [1, true], on: [3, true], tap: [0, false] } },
-  { from: "fx", to: "mix", a: 342, stride: 10, fields: { level: [1, PARTNER_FOLLOWS], pan: [2, PARTNER_FOLLOWS], on: [3, PARTNER_FOLLOWS], tap: [0, true] } },
+  { from: "fx", to: "mix", a: 342, stride: 10, fields: { level: [1, URX22([[0, 1], [0, 2], [1, 1]])], pan: [2, URX22([[0, 1]])], on: [3, URX22([[0, 1]])], tap: [0, true] } },
 ];
 
 function send(field: Field, value: ValueRule): SendSettingRule {

@@ -50,15 +50,30 @@ const URX22_ONLY: Case[] = [
     ["bus.peq.one-knob.on", { bus }, true, 593, y, "1"],
     ["bus.peq.one-knob.type", { bus }, "vocal", 594, y, "1"],
     ["bus.peq.one-knob.level", { bus }, 20, 595, y, "20"],
-    ["send.level", { source: "channel-1", destination: bus }, -10, 146 + 12 * (y / 2), 0, "-1000"],
-    ["send.pan", { source: "channel-2", destination: bus }, -17, 147 + 12 * (y / 2), 1, "-17"],
-    ["send.on", { source: "channel-1", destination: bus }, false, 148 + 12 * (y / 2), 0, "0"],
-    ["send.level", { source: "channel-3", destination: bus }, -10, 273 + 12 * (y / 2), 0, "-1000"],
-    ["send.on", { source: "channel-3", destination: bus }, false, 275 + 12 * (y / 2), 0, "0"],
-    ["send.level", { source: "fx-2", destination: bus }, -10, 343 + 10 * (y / 2), 1, "-1000"],
-    ["send.pan", { source: "fx-1", destination: bus }, -17, 344 + 10 * (y / 2), 0, "-17"],
-    ["send.on", { source: "fx-1", destination: bus }, false, 345 + 10 * (y / 2), 0, "0"],
   ]),
+  // The fifteen sends measured on URX22 (F03-G), each at its representative.
+  ...(
+    [
+      ["send.level", "channel-1", "mix-1", 146, 0],
+      ["send.level", "channel-1", "mix-2", 158, 0],
+      ["send.level", "channel-2", "mix-1", 146, 1],
+      ["send.pan", "channel-1", "mix-1", 147, 0],
+      ["send.pan", "channel-1", "mix-2", 159, 0],
+      ["send.on", "channel-1", "mix-1", 148, 0],
+      ["send.on", "channel-1", "mix-2", 160, 0],
+      ["send.level", "channel-3", "mix-1", 273, 0],
+      ["send.level", "channel-3", "mix-2", 285, 0],
+      ["send.on", "channel-3", "mix-1", 275, 0],
+      ["send.level", "fx-1", "mix-1", 343, 0],
+      ["send.level", "fx-1", "mix-2", 353, 0],
+      ["send.level", "fx-2", "mix-1", 343, 1],
+      ["send.pan", "fx-1", "mix-1", 344, 0],
+      ["send.on", "fx-1", "mix-1", 345, 0],
+    ] as const
+  ).map(([id, source, destination, paramId, y]): Case => {
+    const [value, raw] = id === "send.level" ? [-10, "-1000"] : id === "send.pan" ? [-17, "-17"] : [false, "0"];
+    return [id, { source, destination }, value, paramId, y, raw];
+  }),
   ["bus.name", { bus: "stream" }, "AB", 702, 0, "AB", "setText"],
   ["bus.color", { bus: "stream" }, "red", 704, 0, "6"],
   ...(
@@ -82,11 +97,38 @@ const UNBOUND: [string, object, unknown][] = [
     ["bus.eq.type", { bus }, "peq"],
     ["send.pan", { source: "channel-3", destination: bus }, -17],
   ]),
+  // The partner-linked sends not measured on URX22.
+  ...(
+    [
+      ["send.pan", "channel-2", "mix-1"],
+      ["send.on", "channel-2", "mix-1"],
+      ["send.level", "channel-2", "mix-2"],
+      ["send.pan", "channel-2", "mix-2"],
+      ["send.on", "channel-2", "mix-2"],
+      ["send.on", "channel-3", "mix-2"],
+      ...["channel-5", "channel-7", "channel-9"].flatMap((source) =>
+        ["mix-1", "mix-2"].flatMap((destination) => [
+          ["send.level", source, destination],
+          ["send.on", source, destination],
+        ]),
+      ),
+      ["send.pan", "fx-1", "mix-2"],
+      ["send.on", "fx-1", "mix-2"],
+      ["send.pan", "fx-2", "mix-1"],
+      ["send.on", "fx-2", "mix-1"],
+      ["send.level", "fx-2", "mix-2"],
+      ["send.pan", "fx-2", "mix-2"],
+      ["send.on", "fx-2", "mix-2"],
+    ] as const
+  ).map(([id, source, destination]): [string, object, unknown] => [id, { source, destination }, id === "send.level" ? -10 : id === "send.pan" ? -17 : false]),
 ];
 
 describe("F03-G writes evidenced on URX22 (partner follows natively)", () => {
   it("send one request at the representative on URX22 and refuse it with no request elsewhere", async () => {
     expect([...PARTNER_FOLLOWS]).toEqual(["URX22"]);
+    expect(URX22_ONLY.filter(([id]) => id.startsWith("send.")).length).toBe(15);
+    // The other 25 partner-linked sends, plus the stereo CH → MIX pans, stay unbound.
+    expect(UNBOUND.filter(([id]) => id.startsWith("send.")).length).toBe(25 + 2);
     for (const model of models) {
       for (const [id, target, value, paramId, y, raw, method] of URX22_ONLY) {
         const label = `${model} ${id} ${JSON.stringify(target)}`;

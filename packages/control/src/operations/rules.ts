@@ -27,6 +27,7 @@ import type {
   PortChoiceRule,
   SendSettingRule,
   StopsRule,
+  SendInstanceGate,
   WriteGate,
   TextIndexRule,
   ValueRule,
@@ -466,10 +467,16 @@ export function sendRuleSetting<V>(rule: SendSettingRule) {
     }
     const to = destination[1] as "mix" | "fx";
     const route = rule.routes.find((each) => each.from === from && each.to === to) ?? refuse("unsupported_operation");
-    if (write && !writesOn(route.write, model)) {
+    const number = Number(destination[2]);
+    const gate = route.write;
+    const bound =
+      typeof gate === "boolean" || Array.isArray(gate)
+        ? writesOn(gate as WriteGate, model)
+        : Object.hasOwn(gate, model) && ((gate as SendInstanceGate)[model] ?? []).some(([each, at]) => each === y && at === number);
+    if (write && !bound) {
       return refuse("unsupported_operation");
     }
-    return { at: address(route.base + route.stride * (Number(destination[2]) - 1), y), codec };
+    return { at: address(route.base + route.stride * (number - 1), y), codec };
   });
 }
 
