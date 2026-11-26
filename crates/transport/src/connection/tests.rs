@@ -1699,14 +1699,21 @@ fn repeated_bursts_keep_no_more_threads_than_they_need() {
                 "round {round}"
             );
         }
-        wait_until(|| super::lock(&connection.shared.expiry.pool).alive == 0);
+        wait_until(|| {
+            let pool = super::lock(&connection.shared.expiry.pool);
+            pool.alive == 0 && !pool.reaping
+        });
         let pool = super::lock(&connection.shared.expiry.pool);
         assert!(pool.threads.is_empty(), "round {round}");
-        assert!(pool.ids.is_empty(), "round {round}");
         assert!(
             pool.retired.len() <= 8,
             "round {round}: {} retired",
             pool.retired.len()
+        );
+        assert_eq!(
+            pool.ids.len(),
+            pool.retired.len(),
+            "round {round}: an identity for each thread not yet joined"
         );
     }
 }
@@ -3852,6 +3859,111 @@ mod notifications {
             waiting.recv_timeout(Duration::from_secs(5)).unwrap().0,
             unsent_with(RequestCause::SendTimeout)
         );
+    }
+
+    /// Holds a read's result for an unadopted notification so that a request
+    /// behind it expires, and runs `expired` as that request's callback, on its
+    /// completing thread. Returns once the hold is over and the link is free.
+    fn expire_on_a_completing_thread(
+        connection: &Arc<Connection>,
+        push: &Sender<Vec<u8>>,
+        batches: &Receiver<NotificationBatch>,
+        expired: impl FnOnce() + Send + 'static,
+    ) {
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(batches);
+        let (tx, ran) = mpsc::channel();
+        connection.submit(
+            &operation,
+            Request::GetNumeric(param(6)),
+            move |outcome, _| {
+                expired();
+                let _ = tx.send(outcome);
+            },
+        );
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            unsent_with(RequestCause::SendTimeout)
+        );
+        assert!(connection.adopt_notifications(first.ticket));
+        let (_, adoption) = held.recv_timeout(Duration::from_secs(2)).unwrap();
+        adoption.adopt();
+    }
+
+    #[test]
+    fn a_completing_thread_whose_exit_does_not_finish_holds_back_one_other_at_most() {
+        // The expired request's callback leaves a thread-local whose destructor blocks, so
+        // its thread does not finish ending. Bursts and pauses after it keep the threads
+        // still running steady: one waits for it, and the others stay to be reused.
+        struct Blocks(mpsc::Receiver<()>);
+        impl Drop for Blocks {
+            fn drop(&mut self) {
+                let _ = self.0.recv_timeout(Duration::from_secs(20));
+            }
+        }
+        thread_local! {
+            static STUCK: std::cell::RefCell<Option<Blocks>> = const { std::cell::RefCell::new(None) };
+        }
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        super::super::RUNNING.with(|counted| *counted.borrow_mut() = Some(Arc::clone(&running)));
+        let (port, push) = pushing_unit(Duration::from_millis(20));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let (release, stuck) = mpsc::channel();
+        expire_on_a_completing_thread(&connection, &push, &batches, move || {
+            STUCK.with(|slot| *slot.borrow_mut() = Some(Blocks(stuck)));
+        });
+        let operation = connection.create_operation().unwrap();
+        let mut after = Vec::new();
+        for _ in 0..4 {
+            let answered: Vec<_> = (0..4)
+                .map(|n| submit_held(&connection, &operation, 10 + n))
+                .collect();
+            for rx in answered {
+                let (outcome, adoption) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(matches!(outcome, Outcome::Success { .. }), "{outcome:?}");
+                adoption.adopt();
+            }
+            thread::sleep(super::super::LINGER * 3);
+            after.push(running.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        super::super::RUNNING.with(|counted| *counted.borrow_mut() = None);
+        assert!(
+            after[3] <= after[1],
+            "threads still running after each pause: {after:?}"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn a_close_from_a_completing_threads_exit_does_not_wait_for_itself() {
+        // The expired request's callback leaves a thread-local that closes the connection
+        // from its destructor, which runs as its completing thread ends after lingering.
+        struct Closes(Arc<Connection>, Sender<CloseOutcome>);
+        impl Drop for Closes {
+            fn drop(&mut self) {
+                let _ = self.1.send(self.0.close(Duration::from_millis(220)));
+            }
+        }
+        thread_local! {
+            static CLOSER: std::cell::RefCell<Option<Closes>> = const { std::cell::RefCell::new(None) };
+        }
+        let (port, push) = pushing_unit(Duration::from_millis(20));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let (tx, from_exit) = mpsc::channel();
+        let inner = Arc::clone(&connection);
+        expire_on_a_completing_thread(&connection, &push, &batches, move || {
+            CLOSER.with(|slot| *slot.borrow_mut() = Some(Closes(inner, tx)));
+        });
+        assert_eq!(
+            from_exit.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     }
 
     #[test]

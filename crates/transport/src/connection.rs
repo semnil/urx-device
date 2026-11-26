@@ -1328,15 +1328,21 @@ struct ExpiryPool {
     /// Threads that ended after lingering, until a later one or the close
     /// joins them.
     retired: Vec<JoinHandle<()>>,
-    /// Identities of the threads that have not ended after lingering, so a
-    /// close from one never waits for itself.
+    /// Whether a retiring thread is joining the ones retired before it; no
+    /// other retires meanwhile, and the threads stay to be reused.
+    reaping: bool,
+    /// Identities of the threads not yet joined, so a close from one — its
+    /// exit's thread-local destructors included — never waits for itself.
     ids: Vec<ThreadId>,
     stopping: bool,
 }
 
 /// How long a completing thread more than the reserved callbacks need waits
 /// for work before it ends.
+#[cfg(not(test))]
 const LINGER: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const LINGER: Duration = Duration::from_millis(250);
 
 /// One admitted callback's hold on a completing thread, until the callback
 /// has run or is dropped.
@@ -1434,24 +1440,29 @@ impl Expiry {
             if waited.timed_out()
                 && pool.queue.is_empty()
                 && !pool.stopping
+                && !pool.reaping
                 && pool.alive > self.reserved.load(Ordering::SeqCst)
             {
                 pool.alive -= 1;
                 // Retires itself, for a later thread or the close to join, and
                 // joins the threads retired before it, off every admission and
-                // close: the connection keeps no more than the threads that
-                // may still be ending.
+                // close. One thread at a time does: while it waits for one
+                // whose exit does not finish, the others stay and are reused,
+                // so the connection keeps no more threads than that.
                 let me = thread::current().id();
                 let earlier = std::mem::take(&mut pool.retired);
                 if let Some(at) = pool.threads.iter().position(|t| t.thread().id() == me) {
                     let own = pool.threads.swap_remove(at);
                     pool.retired.push(own);
                 }
-                pool.ids.retain(|id| *id != me);
+                pool.reaping = true;
                 drop(pool);
                 for thread in earlier {
+                    let id = thread.thread().id();
                     let _ = thread.join();
+                    lock(&self.pool).ids.retain(|known| *known != id);
                 }
+                lock(&self.pool).reaping = false;
                 return;
             }
         }
