@@ -12,6 +12,7 @@ import { FX_RETURN_RULES, type FX_RETURN_EFFECTS } from "./fx-return.js";
 import { OUTPUT_EQ_RULES, type GEQ_BANDS } from "./output-eq.js";
 import { OUTPUT_PEQ_RULES } from "./output-peq.js";
 import { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES, type OUTPUT_TOKENS } from "./output-routing.js";
+import { OSCILLATOR_RULES } from "./oscillator.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -149,6 +150,13 @@ export const settingDefinitions = frozen({
   "channel.cue": { readable: true, writable: true, rule: CUE_RULES["channel.cue"] },
   "bus.cue": { readable: true, writable: true, rule: CUE_RULES["bus.cue"] },
   "cue.mode": { readable: true, writable: true, rule: CUE_RULES["cue.mode"] },
+  "oscillator.on": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.on"] },
+  "oscillator.mode": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.mode"] },
+  "oscillator.frequency": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.frequency"] },
+  "oscillator.level": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.level"] },
+  "oscillator.burst-width": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.burst-width"] },
+  "oscillator.burst-interval": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.burst-interval"] },
+  "oscillator.assign": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.assign"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -222,6 +230,14 @@ export interface OutputTarget {
 
 /** A device-wide setting's target: no keys (F08-C). */
 export type DeviceTarget = Readonly<Record<PropertyKey, never>>;
+
+/** An oscillator mode (F09-O). */
+export type OscillatorMode = "sine" | "pink-noise" | "burst-noise";
+
+/** An oscillator destination: STEREO/MIX with a side, FX 1/2 without (F09-O). */
+export type OscillatorAssignTarget =
+  | { readonly bus: "stereo" | "mix-1" | "mix-2"; readonly side: "left" | "right"; readonly band?: never }
+  | { readonly bus: "fx-1" | "fx-2"; readonly side?: undefined; readonly band?: never; readonly effect?: never; readonly parameter?: never };
 
 /** The device-wide CUE Mode (F08-C). */
 export type CueMode = "mix" | "last";
@@ -436,6 +452,13 @@ export interface SettingTypes {
   "channel.cue": { target: ChannelTarget; value: boolean };
   "bus.cue": { target: BusTarget; value: boolean };
   "cue.mode": { target: DeviceTarget; value: CueMode };
+  "oscillator.on": { target: DeviceTarget; value: boolean };
+  "oscillator.mode": { target: DeviceTarget; value: OscillatorMode };
+  "oscillator.frequency": { target: DeviceTarget; value: number };
+  "oscillator.level": { target: DeviceTarget; value: number };
+  "oscillator.burst-width": { target: DeviceTarget; value: number };
+  "oscillator.burst-interval": { target: DeviceTarget; value: number };
+  "oscillator.assign": { target: OscillatorAssignTarget; value: boolean };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

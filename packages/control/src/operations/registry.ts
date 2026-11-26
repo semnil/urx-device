@@ -112,6 +112,15 @@ import {
   outputSource,
 } from "./output-routing.js";
 import {
+  oscillatorAssign,
+  oscillatorBurstInterval,
+  oscillatorBurstWidth,
+  oscillatorFrequency,
+  oscillatorLevel,
+  oscillatorMode,
+  oscillatorOn,
+} from "./oscillator.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -283,6 +292,13 @@ export const settingHandlers: SettingHandlers = {
   "channel.cue": channelCue,
   "bus.cue": busCue,
   "cue.mode": cueMode,
+  "oscillator.on": oscillatorOn,
+  "oscillator.mode": oscillatorMode,
+  "oscillator.frequency": oscillatorFrequency,
+  "oscillator.level": oscillatorLevel,
+  "oscillator.burst-width": oscillatorBurstWidth,
+  "oscillator.burst-interval": oscillatorBurstInterval,
+  "oscillator.assign": oscillatorAssign,
 };
 
 function unknownId(): Promise<never> {
