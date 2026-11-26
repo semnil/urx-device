@@ -1,7 +1,8 @@
 //! The operational connection against a fake unit endpoint.
 
 use super::{
-    open, CloseOutcome, Connection, ConnectionOptions, MAX_WAITING_BYTES, MAX_WAITING_REQUESTS,
+    open, CloseOutcome, Connection, ConnectionOptions, LinkLoss, ResponseTimeouts, Tolerance,
+    MAX_WAITING_BYTES, MAX_WAITING_REQUESTS,
 };
 use crate::discovery::SystemFirmware;
 use crate::frame;
@@ -36,6 +37,7 @@ fn options() -> ConnectionOptions {
         handshake_request_deadline: Duration::from_secs(3),
         send_deadline: Duration::from_secs(3),
         response_deadline: Duration::from_secs(3),
+        response_timeouts: ResponseTimeouts::EndConnection,
     }
 }
 
@@ -695,6 +697,7 @@ fn a_lost_push_or_a_closed_link_ends_the_connection() {
         )
     );
     assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
 
     // The unit pushes device-lost after the handshake, while nothing is active.
     let lost_idle = Peer::serve(|request| match uri_of(request) {
@@ -709,6 +712,7 @@ fn a_lost_push_or_a_closed_link_ends_the_connection() {
     let connection = connect(&lost_idle);
     wait_until(|| connection.terminal().is_some());
     assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
 
     // The unit closes the link when the first parameter request arrives.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -738,6 +742,239 @@ fn a_lost_push_or_a_closed_link_ends_the_connection() {
         )
     );
     assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    assert_eq!(connection.lost_link(), Some(LinkLoss::PeerClosed));
+}
+
+/// A connection that tolerates response deadlines (R1-T-A), with a short deadline.
+fn tolerating(limit: u32) -> ConnectionOptions {
+    ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        response_timeouts: ResponseTimeouts::Tolerate(Tolerance {
+            limit,
+            late_reply_quiet: Duration::from_millis(400),
+            late_reply_frames: 64,
+        }),
+        ..options()
+    }
+}
+
+fn timed_out() -> Outcome {
+    failed(
+        RequestCause::ResponseTimeout,
+        RequestPhase::Response,
+        Evidence::Unconfirmed,
+    )
+}
+
+/// A unit that answers the parameter GETs it receives, in order, as `plan` says: after a
+/// delay with a value, or never.
+fn answering_gets(plan: Vec<Option<(Duration, i64)>>) -> Peer {
+    let plan = Arc::new(std::sync::Mutex::new(plan.into_iter()));
+    unit(move |request| {
+        let uri = request["vdp"]["uri"].as_str().unwrap().to_string();
+        match plan.lock().unwrap().next().flatten() {
+            Some((delay, value)) => {
+                thread::sleep(delay);
+                vec![get_reply(
+                    &uri,
+                    json!({ "current_value": value, "response_code": 200 }),
+                )]
+            }
+            None => vec![],
+        }
+    })
+}
+
+#[test]
+fn a_tolerated_deadline_keeps_the_connection_and_no_later_request_takes_the_late_reply() {
+    // The first read of address 1 is answered late, the second at once: the late answer is
+    // read and dropped before the second read is sent, so the second gets its own value.
+    let peer = answering_gets(vec![
+        Some((Duration::from_millis(250), 111)),
+        Some((Duration::ZERO, 222)),
+    ]);
+    let connection = open(peer.port, ID, &tolerating(3), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let second = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(
+        outcome(&second),
+        Outcome::Success {
+            value: Some(ReadValue::Numeric(222)),
+            evidence: Evidence::Read
+        }
+    );
+    assert_eq!(connection.terminal(), None);
+    assert_eq!(parameter_uris(&peer).len(), 2);
+}
+
+#[test]
+fn the_limit_of_tolerated_deadlines_in_a_row_ends_the_connection() {
+    let peer = answering_gets(vec![None, None, None]);
+    let connection = open(peer.port, ID, &tolerating(2), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(connection.terminal(), None);
+    let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(outcome(&second), timed_out());
+    wait_until(|| connection.terminal().is_some());
+    assert_eq!(connection.terminal(), Some(RequestCause::ResponseTimeout));
+    let later = submit(&connection, &operation, Request::GetNumeric(address(3)));
+    assert_eq!(
+        outcome(&later),
+        failed(
+            RequestCause::NotConnected,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    assert_eq!(parameter_uris(&peer).len(), 2);
+}
+
+#[test]
+fn a_reply_between_tolerated_deadlines_starts_the_count_again() {
+    let peer = answering_gets(vec![None, Some((Duration::ZERO, 5)), None, None]);
+    let connection = open(peer.port, ID, &tolerating(2), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    for (param, expected) in [
+        (1, timed_out()),
+        (
+            2,
+            Outcome::Success {
+                value: Some(ReadValue::Numeric(5)),
+                evidence: Evidence::Read,
+            },
+        ),
+        (3, timed_out()),
+    ] {
+        let rx = submit(&connection, &operation, Request::GetNumeric(address(param)));
+        assert_eq!(outcome(&rx), expected, "address {param}");
+        assert_eq!(connection.terminal(), None, "address {param}");
+    }
+    let fourth = submit(&connection, &operation, Request::GetNumeric(address(4)));
+    assert_eq!(outcome(&fourth), timed_out());
+    wait_until(|| connection.terminal().is_some());
+    assert_eq!(connection.terminal(), Some(RequestCause::ResponseTimeout));
+}
+
+/// A unit that answers its first parameter GET with `first` and every later one at once with 222.
+fn late_then_prompt(first: impl Fn(&str) -> Vec<Vec<u8>> + Send + Sync + 'static) -> Peer {
+    let reads = Arc::new(std::sync::Mutex::new(0));
+    unit(move |request| {
+        let uri = request["vdp"]["uri"].as_str().unwrap().to_string();
+        let mut reads = reads.lock().unwrap();
+        *reads += 1;
+        if *reads == 1 {
+            first(&uri)
+        } else {
+            vec![get_reply(
+                &uri,
+                json!({ "current_value": 222, "response_code": 200 }),
+            )]
+        }
+    })
+}
+
+fn other_reply() -> Vec<u8> {
+    get_reply(
+        "/vd/parameters/9:0:0",
+        json!({ "current_value": 0, "response_code": 200 }),
+    )
+}
+
+#[test]
+fn the_read_for_a_late_reply_goes_past_other_frames_to_it() {
+    // The late answer to the first read comes behind two replies no request is waiting for;
+    // it is still read and dropped, so the second read gets its own value.
+    let peer = late_then_prompt(|uri| {
+        thread::sleep(Duration::from_millis(250));
+        vec![
+            other_reply(),
+            other_reply(),
+            get_reply(uri, json!({ "current_value": 111, "response_code": 200 })),
+        ]
+    });
+    let connection = open(peer.port, ID, &tolerating(3), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let second = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(
+        outcome(&second),
+        Outcome::Success {
+            value: Some(ReadValue::Numeric(222)),
+            evidence: Evidence::Read
+        }
+    );
+    assert_eq!(connection.terminal(), None);
+}
+
+#[test]
+fn the_read_for_a_late_reply_ends_at_its_frame_budget() {
+    // After the first read's deadline one reply no request is waiting for comes, and the late
+    // answer never does. With a budget of one frame the second read goes out on that frame,
+    // not after the quiet.
+    let peer = late_then_prompt(|_| {
+        thread::sleep(Duration::from_millis(400));
+        vec![other_reply()]
+    });
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        response_timeouts: ResponseTimeouts::Tolerate(Tolerance {
+            limit: 3,
+            late_reply_quiet: Duration::from_secs(5),
+            late_reply_frames: 1,
+        }),
+        ..options()
+    };
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(
+        outcome(&second),
+        Outcome::Success {
+            value: Some(ReadValue::Numeric(222)),
+            evidence: Evidence::Read
+        }
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "the second read waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_unit_lost_push_while_reading_for_a_late_reply_ends_the_connection() {
+    // The read goes unanswered past its deadline; while the late reply is read for, the unit
+    // is reported lost.
+    let peer = unit(|_| {
+        thread::sleep(Duration::from_millis(200));
+        vec![line(
+            json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "offline" } } }),
+        )]
+    });
+    let connection = open(peer.port, ID, &tolerating(3), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let waiting = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(
+        outcome(&waiting),
+        failed(
+            RequestCause::ConnectionLost,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
+    assert_eq!(parameter_uris(&peer).len(), 1);
 }
 
 #[test]
@@ -1040,6 +1277,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
         shared: Arc::new(super::Shared {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
+            loss: std::sync::Mutex::new(None),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),

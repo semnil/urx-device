@@ -61,6 +61,53 @@ pub struct ConnectionOptions {
     pub send_deadline: Duration,
     /// From a request being completely written until its reply.
     pub response_deadline: Duration,
+    /// What an app-issued request's response deadline does to the connection.
+    pub response_timeouts: ResponseTimeouts,
+}
+
+/// What an app-issued request's response deadline does to its connection.
+/// Subscription lifecycle requests and the teardown's unregistrations end the
+/// connection on their deadline either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseTimeouts {
+    /// The deadline ends the connection (N1).
+    EndConnection,
+    /// The request completes as `response_timeout` and the connection goes on
+    /// (R1-T-A); see [`Tolerance`].
+    Tolerate(Tolerance),
+}
+
+/// How a connection that tolerates response deadlines treats them (R1-T-A).
+///
+/// After a deadline, the next request is not sent until the late reply has
+/// been read and discarded: it is waited for until it arrives, until
+/// `late_reply_frames` other frames have been read, or until no frame has
+/// arrived for `late_reply_quiet`. A late reply read in that wait is dropped,
+/// so it is not taken as a later request's result; one arriving after the wait
+/// ends can be, by a later request with the same reply key. A unit-lost
+/// notification read meanwhile ends the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tolerance {
+    /// Consecutive requests whose deadline passed, with no reply received
+    /// between them, that end the connection as `response_timeout`: the
+    /// `limit`th of them does.
+    pub limit: u32,
+    /// How long the late reply is waited for with no frame arriving.
+    pub late_reply_quiet: Duration,
+    /// How many frames other than the late reply are read for it at most.
+    pub late_reply_frames: usize,
+}
+
+/// How a link that ended as `connection_lost` was lost (R1-L-A). The request
+/// cause stays `connection_lost`; this tells a consumer which wording fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkLoss {
+    /// Device Center reported the unit lost.
+    UnitLost,
+    /// The peer closed the stream.
+    PeerClosed,
+    /// The socket failed with this error.
+    SocketError(ErrorKind),
 }
 
 type Done = Box<dyn FnOnce(Outcome, ResultAdoption) + Send>;
@@ -153,6 +200,9 @@ struct State {
     /// The app-issued completion holding the wire slot.
     result: Option<HeldResult>,
     next_result: u64,
+    /// App-issued requests in a row whose tolerated response deadline passed
+    /// with no reply received since (R1-T-A).
+    timeouts: u32,
 }
 
 /// One release of a token and every caller waiting on it.
@@ -191,6 +241,9 @@ struct Shared {
     /// before reporting it, and the worker starts each write while holding
     /// this lock, so a write never starts after the end is recorded.
     link_end: Mutex<Option<RequestCause>>,
+    /// How the link was lost, recorded before a `connection_lost` end is
+    /// (R1-L-A). The first one recorded stands.
+    loss: Mutex<Option<LinkLoss>>,
     /// Signalled when the worker settles its active request.
     settled: Condvar,
     /// Signalled, with the state lock, when what a held result waits for may
@@ -392,6 +445,7 @@ impl Connection {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
+            loss: Mutex::new(None),
             settled: Condvar::new(),
             advance: Condvar::new(),
             expiry: Arc::new(Expiry::default()),
@@ -454,6 +508,15 @@ impl Connection {
     /// The cause that ended the connection, if one has.
     pub fn terminal(&self) -> Option<RequestCause> {
         self.shared.lock().terminal
+    }
+
+    /// How the link was lost, once the connection has ended as
+    /// `connection_lost` and the way it was lost is known (R1-L-A).
+    pub fn lost_link(&self) -> Option<LinkLoss> {
+        if self.terminal() != Some(RequestCause::ConnectionLost) {
+            return None;
+        }
+        *lock(&self.shared.loss)
     }
 
     /// A new operation owner, or `not_connected` once the connection is
@@ -1282,7 +1345,8 @@ fn read_frames(
     // After an overflow, replies to a request already sent still arrive;
     // further notifications are not queued, even once budget is released.
     let mut overflowed = false;
-    if sock.set_read_timeout(Some(READ_POLL)).is_err() {
+    if let Err(error) = sock.set_read_timeout(Some(READ_POLL)) {
+        note_loss(&shared, LinkLoss::SocketError(error.kind()));
         record(RequestCause::ConnectionLost);
         let _ = events.send(Event::ReadFailed(RequestCause::ConnectionLost));
         return;
@@ -1292,6 +1356,7 @@ fn read_frames(
             Ok(Some(frame)) => {
                 if let Some(json) = frame.json {
                     if lost_notification(&json) {
+                        note_loss(&shared, LinkLoss::UnitLost);
                         record(RequestCause::ConnectionLost);
                     }
                     let mut received = Received {
@@ -1328,7 +1393,14 @@ fn read_frames(
                 if !stop.load(Ordering::SeqCst) {
                     let cause = match error {
                         ReadError::Oversized { .. } => RequestCause::InvalidResponse,
-                        ReadError::Closed | ReadError::Io(_) => RequestCause::ConnectionLost,
+                        ReadError::Closed => {
+                            note_loss(&shared, LinkLoss::PeerClosed);
+                            RequestCause::ConnectionLost
+                        }
+                        ReadError::Io(kind) => {
+                            note_loss(&shared, LinkLoss::SocketError(kind));
+                            RequestCause::ConnectionLost
+                        }
                     };
                     record(cause);
                     let _ = events.send(Event::ReadFailed(cause));
@@ -1449,9 +1521,10 @@ fn serve(
             }
             None => match inbox.recv() {
                 Ok(Event::Wake) => None,
-                Ok(Event::Frame(received)) => {
-                    lost_notification(&received.message).then_some(RequestCause::ConnectionLost)
-                }
+                Ok(Event::Frame(received)) => lost_notification(&received.message).then(|| {
+                    note_loss(&shared, LinkLoss::UnitLost);
+                    RequestCause::ConnectionLost
+                }),
                 Ok(Event::ReadFailed(cause)) => Some(cause),
                 Err(_) => return,
             },
@@ -1461,6 +1534,12 @@ fn serve(
             return;
         }
     }
+}
+
+/// Records how the link was lost, unless that is already recorded; called
+/// before the `connection_lost` end it explains is recorded (R1-L-A).
+fn note_loss(shared: &Shared, loss: LinkLoss) {
+    lock(&shared.loss).get_or_insert(loss);
 }
 
 /// Records `cause` as the end of the connection unless one is recorded, and
@@ -1733,6 +1812,7 @@ impl Io<'_> {
             key: &key,
             send_end,
             cap,
+            tolerate: false,
             unstarted: &unstarted,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
@@ -2043,15 +2123,22 @@ fn execute(
             None
         }
     };
+    let tolerance = match options.response_timeouts {
+        ResponseTimeouts::Tolerate(tolerance) => Some(tolerance),
+        ResponseTimeouts::EndConnection => None,
+    };
     let outbound = Outbound {
         frame,
         key,
         send_end,
         cap: None,
+        tolerate: tolerance.is_some(),
         unstarted: &unstarted,
     };
     match exchange(sock, inbox, shared, options, outbound) {
         Ok(reply) => {
+            // Any reply, a rejection included, is the unit answering.
+            shared.lock().timeouts = 0;
             let outcome = decode(
                 request,
                 reply
@@ -2064,13 +2151,66 @@ fn execute(
                 Held::Ended(cause) => (at_delivery(outcome, cause), Some(cause)),
             }
         }
-        Err(failed) => (
-            Outcome::Failure {
+        Err(failed) => {
+            let outcome = Outcome::Failure {
                 failure: failed.failure,
                 evidence: failed.evidence,
-            },
-            failed.ends,
-        ),
+            };
+            match tolerance.filter(|_| failed.late) {
+                Some(tolerance) => {
+                    let timeouts = {
+                        let mut state = shared.lock();
+                        state.timeouts += 1;
+                        state.timeouts
+                    };
+                    if timeouts >= tolerance.limit {
+                        return (outcome, Some(RequestCause::ResponseTimeout));
+                    }
+                    (outcome, drain_late_reply(inbox, shared, key, &tolerance))
+                }
+                None => (outcome, failed.ends),
+            }
+        }
+    }
+}
+
+/// Reads past a tolerated response deadline until its late reply arrives,
+/// `late_reply_frames` other frames have arrived, or no frame has arrived for
+/// `late_reply_quiet` (R1-T-A), dropping the late reply if it arrives in that
+/// time. Returns the cause that ends the connection, if one arrives first.
+fn drain_late_reply(
+    inbox: &Receiver<Event>,
+    shared: &Shared,
+    key: &ReplyKey,
+    tolerance: &Tolerance,
+) -> Option<RequestCause> {
+    let mut frames = 0;
+    let mut last = Instant::now();
+    loop {
+        if let Some(cause) = *shared.link_end() {
+            return Some(cause);
+        }
+        let quiet = tolerance.late_reply_quiet.saturating_sub(last.elapsed());
+        if quiet.is_zero() {
+            return None;
+        }
+        match inbox.recv_timeout(quiet) {
+            // A unit-lost push is not looked for here: the reader records the end
+            // before it hands the frame on, and the check above returns it.
+            Ok(Event::Frame(received)) => {
+                if Inbound::new(received.message).reply(key).is_some() {
+                    return None;
+                }
+                frames += 1;
+                if frames >= tolerance.late_reply_frames {
+                    return None;
+                }
+                last = Instant::now();
+            }
+            Ok(Event::Wake) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Event::ReadFailed(cause)) => return Some(cause),
+            Err(RecvTimeoutError::Disconnected) => return Some(RequestCause::InternalError),
+        }
     }
 }
 
@@ -2199,6 +2339,9 @@ struct Failed {
     evidence: Evidence,
     /// The cause that ends the connection, if this failure does.
     ends: Option<RequestCause>,
+    /// A response deadline the connection tolerates (R1-T-A): its late reply
+    /// is still to be read and discarded.
+    late: bool,
 }
 
 impl Failed {
@@ -2207,6 +2350,7 @@ impl Failed {
             failure: RequestFailure::Cause { code: cause, phase },
             evidence,
             ends: ends.then_some(cause),
+            late: false,
         }
     }
 
@@ -2217,6 +2361,20 @@ impl Failed {
             },
             evidence: Evidence::NotSent,
             ends: None,
+            late: false,
+        }
+    }
+
+    /// A tolerated response deadline: unconfirmed, and the connection goes on.
+    fn tolerated() -> Self {
+        Failed {
+            failure: RequestFailure::Cause {
+                code: RequestCause::ResponseTimeout,
+                phase: RequestPhase::Response,
+            },
+            evidence: Evidence::Unconfirmed,
+            ends: None,
+            late: true,
         }
     }
 }
@@ -2230,6 +2388,8 @@ struct Outbound<'a> {
     send_end: Instant,
     /// A teardown budget's end, which also bounds the response wait.
     cap: Option<Instant>,
+    /// Whether a response deadline leaves the connection open (R1-T-A).
+    tolerate: bool,
     /// Whether a frame not yet started must not start.
     unstarted: &'a dyn Fn(&State) -> Option<Stop>,
 }
@@ -2246,6 +2406,7 @@ fn exchange(
         key,
         send_end,
         cap,
+        tolerate,
         unstarted,
     } = outbound;
     if Instant::now() >= send_end {
@@ -2307,6 +2468,7 @@ fn exchange(
         match event {
             Ok(Event::Frame(received)) => {
                 if lost_notification(&received.message) {
+                    note_loss(shared, LinkLoss::UnitLost);
                     return unconfirmed(RequestCause::ConnectionLost);
                 }
                 let inbound = Inbound::new(received.message);
@@ -2323,6 +2485,13 @@ fn exchange(
                 ending = Some(RequestCause::NotificationOverflow);
             }
             Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
+            // A tolerated deadline (R1-T-A) records no end: an overflow met
+            // while waiting, or a teardown budget's cap, still ends it.
+            Err(RecvTimeoutError::Timeout)
+                if tolerate && ending.is_none() && timeout == RequestCause::ResponseTimeout =>
+            {
+                return Err(Failed::tolerated())
+            }
             Err(RecvTimeoutError::Timeout) => return unconfirmed(ending.unwrap_or(timeout)),
             Err(RecvTimeoutError::Disconnected) => return unconfirmed(RequestCause::InternalError),
         }
@@ -2362,10 +2531,8 @@ fn write_frame<O: Outgoing>(
         if remaining.is_zero() {
             return failed(RequestCause::SendTimeout);
         }
-        if sock
-            .set_write_timeout(Some(remaining.min(WRITE_POLL)))
-            .is_err()
-        {
+        if let Err(error) = sock.set_write_timeout(Some(remaining.min(WRITE_POLL))) {
+            note_loss(shared, LinkLoss::SocketError(error.kind()));
             return failed(RequestCause::ConnectionLost);
         }
         // Held across the write: the reader cannot record an end, and a
@@ -2394,14 +2561,20 @@ fn write_frame<O: Outgoing>(
         let outcome = sock.write(&frame[written..]);
         drop(link_end);
         match outcome {
-            Ok(0) => return failed(RequestCause::ConnectionLost),
+            Ok(0) => {
+                note_loss(shared, LinkLoss::PeerClosed);
+                return failed(RequestCause::ConnectionLost);
+            }
             Ok(n) => written += n,
             Err(e)
                 if matches!(
                     e.kind(),
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                 ) => {}
-            Err(_) => return failed(RequestCause::ConnectionLost),
+            Err(e) => {
+                note_loss(shared, LinkLoss::SocketError(e.kind()));
+                return failed(RequestCause::ConnectionLost);
+            }
         }
     }
     Ok(())
