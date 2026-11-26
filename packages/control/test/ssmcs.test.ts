@@ -32,6 +32,8 @@ const paths = [
   ["channel.ssmcs.comp.release", undefined, 97, "Numeric"],
   ["channel.ssmcs.comp.ratio", undefined, 98, "Numeric"],
   ["channel.ssmcs.comp.knee", undefined, 99, "Numeric"],
+  ["channel.ssmcs.internal-threshold", undefined, 100, "Numeric"],
+  ["channel.ssmcs.internal-makeup", undefined, 101, "Numeric"],
   ["channel.ssmcs.sidechain.on", undefined, 102, "Numeric"],
   ["channel.ssmcs.sidechain.q", undefined, 103, "Numeric"],
   ["channel.ssmcs.sidechain.frequency", undefined, 104, "Numeric"],
@@ -108,7 +110,7 @@ describe("SSMCS controls (F04-M)", () => {
     }
   });
 
-  it("have no band type, no low/high Q and no public internal Threshold/Makeup", async () => {
+  it("have no band type, no low/high Q, and Threshold/Makeup only as the internal settings", async () => {
     const transport = new FakeTransport();
     const c = new OperationContext(transport, "URX44");
     for (const band of ["low", "high"]) {
@@ -124,10 +126,49 @@ describe("SSMCS controls (F04-M)", () => {
     expect((await failureOf(readAny(c, "channel.ssmcs.eq.band.on", { channel: 1, band: "low-mid" })))?.code).toBe("invalid_input");
     expect(transport.calls).toEqual([]);
     const ids = Object.keys(settingDefinitions).filter((id) => id.startsWith("channel.ssmcs."));
-    for (const id of ids) {
-      const rule = (settingDefinitions as unknown as Record<string, { rule?: { address: object } }>)[id]?.rule;
-      expect(JSON.stringify(rule?.address ?? {}), id).not.toMatch(/:10[01]\b/);
-    }
+    const at = (paramId: number) =>
+      ids.filter((id) => {
+        const rule = (settingDefinitions as unknown as Record<string, { rule?: { address: object } }>)[id]?.rule;
+        return new RegExp(`:${paramId}\\b`).test(JSON.stringify(rule?.address ?? {}));
+      });
+    expect([at(100), at(101)]).toEqual([["channel.ssmcs.internal-threshold"], ["channel.ssmcs.internal-makeup"]]);
+  });
+
+  // F18-I-C-A: the unit's own integers 0…200, unitless, refused rather than rounded off an integer.
+  describe("the internal Threshold and Makeup", () => {
+    const internal = ["channel.ssmcs.internal-threshold", "channel.ssmcs.internal-makeup"] as const;
+
+    it("round-trip every integer 0…200 with no unit", async () => {
+      for (const id of internal) {
+        await roundTrip(id, undefined, range(0, 200), (raw) => raw);
+        expect(settingDefinitions[id].rule.value).toMatchObject({ kind: "numeric-set", unit: null });
+      }
+    });
+
+    it("refuse a fraction, a value out of range or not a number, before any request", async () => {
+      for (const id of internal) {
+        const transport = new FakeTransport();
+        const c = new OperationContext(transport, "URX44V");
+        for (const bad of [-1, 201, 99.5, 0.25, 199.9999, Number.NaN, Infinity, "100", null, true]) {
+          expect(() => plan(id, bad), `${id} ${String(bad)}`).toThrow();
+          expect((await failureOf(writeAny(c, id, { channel: 1 }, bad)))?.code, `${id} ${String(bad)}`).toBe("invalid_input");
+        }
+        expect(transport.calls, id).toEqual([]);
+      }
+    });
+
+    // A raw that is not canonical integer text is the transport's to refuse (K34), before the rule.
+    it("refuse a reading outside 0…200", async () => {
+      for (const id of internal) {
+        for (const raw of ["201", "-1", "255", "65535"]) {
+          const t = new FakeTransport().script("getNumeric", read(raw));
+          expect((await failureOf(readAny(new OperationContext(t, "URX22"), id, { channel: 2 })))?.code, `${id} ${JSON.stringify(raw)}`).toBe(
+            "invalid_response",
+          );
+          expect(t.calls.length, id).toBe(1);
+        }
+      }
+    });
   });
 
   it("map every preset 1…34 to its four-digit string, and nothing else", async () => {

@@ -96,6 +96,8 @@ export const settingDefinitions = frozen({
   "channel.ssmcs.comp.release": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp.release"] },
   "channel.ssmcs.comp.ratio": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp.ratio"] },
   "channel.ssmcs.comp.knee": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.comp.knee"] },
+  "channel.ssmcs.internal-threshold": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.internal-threshold"] },
+  "channel.ssmcs.internal-makeup": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.internal-makeup"] },
   "channel.ssmcs.sidechain.on": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.sidechain.on"] },
   "channel.ssmcs.sidechain.q": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.sidechain.q"] },
   "channel.ssmcs.sidechain.frequency": { readable: true, writable: true, rule: SSMCS_RULES["channel.ssmcs.sidechain.frequency"] },
@@ -468,6 +470,8 @@ export interface SettingTypes {
   "channel.ssmcs.comp.release": { target: ChannelTarget; value: number };
   "channel.ssmcs.comp.ratio": { target: ChannelTarget; value: CompRatio };
   "channel.ssmcs.comp.knee": { target: ChannelTarget; value: CompKnee };
+  "channel.ssmcs.internal-threshold": { target: ChannelTarget; value: number };
+  "channel.ssmcs.internal-makeup": { target: ChannelTarget; value: number };
   "channel.ssmcs.sidechain.on": { target: ChannelTarget; value: boolean };
   "channel.ssmcs.sidechain.q": { target: ChannelTarget; value: number };
   "channel.ssmcs.sidechain.frequency": { target: ChannelTarget; value: number };

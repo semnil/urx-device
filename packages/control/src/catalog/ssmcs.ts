@@ -4,11 +4,14 @@
 // number preferredNumber(R40, r − 4 + 52), and Q raw r (0…60) the two-decimal
 // display of 0.5 × 32^(r / 60), both as in urx-router ced9c7d2. The preset
 // labels are the router's SWEET_SPOT_DATA_OPTIONS at the same revision. The
-// internal Threshold (100) and Makeup (101) fields have no rule.
+// internal Threshold (100) and Makeup (101) are the unit's own integers 0…200
+// (F18-I-C-A): no screen shows them, no unit is attached and a value off an
+// integer is refused rather than rounded, as urx-router 72ad658c's
+// SSMCS_INTERNAL_SETTINGS defines them.
 
 import { frozen } from "./frozen.js";
 import { ATTACK_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "./dynamics-stops.js";
-import type { ChannelBandSettingRule, ChannelSettingRule, GridRule, StopsRule } from "./rules.js";
+import type { ChannelBandSettingRule, ChannelSettingRule, GridRule, NumericSetRule, StopsRule } from "./rules.js";
 
 export const SSMCS_BANDS = frozen(["low", "mid", "high"] as const);
 
@@ -86,6 +89,9 @@ const Q: StopsRule = { kind: "stops", unit: null, stops: SSMCS_Q_STEPS_CENTI, sc
 /** Gains: dB × 10 + 180, −18 … 18 dB on 0.1 dB. */
 const GAIN: GridRule = { kind: "grid", unit: "dB", min: -18, max: 18, scale: 10, offset: 180 };
 
+/** The internal settings: exactly the integers 0…200, unitless. */
+const INTERNAL: NumericSetRule = { kind: "numeric-set", unit: null, values: Array.from({ length: 201 }, (_, raw) => raw) };
+
 const mono = (paramId: number) => ({ mono: paramId }) as const;
 const channel = (paramId: number, value: ChannelSettingRule["value"]) =>
   ({ target: "channel", address: mono(paramId), value }) satisfies ChannelSettingRule;
@@ -116,6 +122,8 @@ export const SSMCS_RULES = frozen({
     sentinel: { value: "inf", raw: `${RATIO_STOPS_RAW.length}` },
   }),
   "channel.ssmcs.comp.knee": channel(99, { kind: "choice", choices: ["soft", "medium", "hard"] }),
+  "channel.ssmcs.internal-threshold": channel(100, INTERNAL),
+  "channel.ssmcs.internal-makeup": channel(101, INTERNAL),
   "channel.ssmcs.sidechain.on": channel(102, { kind: "switch" }),
   "channel.ssmcs.sidechain.q": channel(103, Q),
   "channel.ssmcs.sidechain.frequency": channel(104, frequency(4, 124)),
