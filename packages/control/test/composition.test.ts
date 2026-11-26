@@ -174,6 +174,31 @@ describe("CURRENT composition (K36, F18)", () => {
     }
   });
 
+  it("select each bus's GEQ bank from the file's EQ Type: an unselected bank requires no values; a selected one above 48 kHz refuses the file (F18-G-A)", () => {
+    // Every GEQ value the file can hold: Link, On, Limit and the gains, STEREO's 20 Hz included.
+    const GEQ_KEYS = [543, 544, 893, 545, 636, 637, 894, ...Array.from({ length: 31 }, (_, index) => 638 + index)];
+    const without = (file: UrxfFile, keys: readonly number[]) => {
+      for (const id of keys) (file.current.params as unknown as Map<number, unknown>).delete(id);
+      return file;
+    };
+    for (const model of models) {
+      // All PEQ: the GEQ values are absent, and the plan keeps the same reasons as with them.
+      const full = planCurrent(synthesize(model), model);
+      const bare = planCurrent(without(synthesize(model), GEQ_KEYS), model);
+      const geq = (plan: typeof full) => plan.omissions.filter((o) => o.setting.startsWith("bus.geq."));
+      expect(geq(bare), model).toEqual(geq(full));
+      expect(bare.steps, model).toEqual(full.steps);
+      // MIX 1/2 PEQ, STEREO GEQ: MIX's GEQ values are still not required; STEREO's are.
+      expect(() => planCurrent(without(synthesize(model, { "497:0": 2 }), GEQ_KEYS.slice(4)), model), model).not.toThrow();
+      expect(() => planCurrent(without(synthesize(model, { "497:0": 2 }), [544]), model), model).toThrow(/invalid_input/);
+      // The rate limit: a selected Flex12GEQ above 48 kHz refuses the file; PEQ at 96 kHz plans.
+      expect(() => planCurrent(synthesize(model, { "590:0": 2, "766:0": 96000 }), model), model).toThrow(/invalid_input/);
+      expect(() => planCurrent(synthesize(model, { "497:0": 2, "766:0": 88200 }), model), model).toThrow(/invalid_input/);
+      expect(planCurrent(synthesize(model, { "766:0": 96000 }), model).fileRate, model).toBe(96000);
+      expect(planCurrent(synthesize(model, { "497:0": 2, "590:0": 2, "766:0": 44100 }), model).fileRate, model).toBe(44100);
+    }
+  });
+
   it("send a Delay's Sync, BPM, Note, the rest, then Delay Time; omit the time with Sync On (F18-D-A)", () => {
     const delay = FX_RETURN_RULES["bus.fx.parameter"].effects["mono-delay"];
     const stored: Record<string, number> = { "679:0": 1024 };

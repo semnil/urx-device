@@ -11,6 +11,7 @@ import { settingDefinitions, type SettingDefinitionBase, type SettingId } from "
 import type { Model } from "../catalog/models.js";
 import { urxfValue, type UrxfChunk, type UrxfFile } from "../catalog/urxf.js";
 import { FX_RETURN_RULES } from "../catalog/fx-return.js";
+import { OUTPUT_EQ_RULES } from "../catalog/output-eq.js";
 import type { FxParameterRule } from "../catalog/rules.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
 import { decodeFileSetting, previewSetting, validateSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
@@ -88,6 +89,20 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
   // The file's rate is part of the plan: a missing or invalid one refuses the file here (L3).
   const fileRate = value("device.sample-rate", {}) as number;
 
+  // F18-G-A: each STEREO/MIX bus's file EQ Type selects its GEQ bank; a selected bank above its rate limit refuses the file.
+  const eqType = OUTPUT_EQ_RULES["bus.eq.type"];
+  const geqSelected = new Set<string>();
+  for (const target of targetsOf(eqType, model) as { bus: string }[]) {
+    const type = value("bus.eq.type", target) as string;
+    const maxRateHz = eqType.value.limits?.[type]?.maxRateHz ?? null;
+    if (maxRateHz !== null && fileRate > maxRateHz) {
+      invalid();
+    }
+    if (type === "flex12-geq") {
+      geqSelected.add(target.bus);
+    }
+  }
+
   for (const { phase, settings } of PHASES) {
     for (const setting of settings) {
       if (setting === "bus.fx.parameter") {
@@ -99,6 +114,11 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
         continue;
       }
       for (const target of targetsOf(rule, model)) {
+        // An unselected GEQ bank is not part of the required file values (F18-G-A): one reason, not writable first.
+        if (GEQ_BANK.has(setting) && !geqSelected.has((target as { bus: string }).bus)) {
+          omit(setting, target, geqWritable(setting, target) ? "inactive_bank" : "not_writable");
+          continue;
+        }
         const requested = value(setting, target);
         const args = [setting, target, requested] as unknown as WriteArgs;
         let planned: unknown = null;
@@ -117,12 +137,7 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
           }
           throw error;
         }
-        // One reason per omission, in F18-R-A's precedence: not writable, then the bank rule, then device control.
-        // F18-G-A: with the file's EQ Type PEQ, the bus's GEQ bank is not applied.
-        if (GEQ_BANK.has(setting) && value("bus.eq.type", { bus: (target as { bus: string }).bus }) === "peq") {
-          omit(setting, target, "inactive_bank");
-          continue;
-        }
+        // One reason per omission, in F18-R-A's precedence: not writable, then the bank rule (above), then device control.
         const native = control(setting, target);
         if (native !== undefined) {
           omit(setting, target, native);
@@ -142,6 +157,15 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
     }
   }
   return { model, fileRate, steps, omissions };
+}
+
+/** Whether a GEQ bank write is bound for `target`: STEREO keeps its gains' software-write exclusion (L2). */
+function geqWritable(setting: SettingId, target: object): boolean {
+  if (setting !== "bus.geq.gain") {
+    return true;
+  }
+  const { bus, band } = target as { bus: "stereo" | "mix-1" | "mix-2"; band: string };
+  return (OUTPUT_EQ_RULES["bus.geq.gain"].address[bus].writableBands as readonly string[]).includes(band);
 }
 
 /**
