@@ -96,6 +96,10 @@ export function parseUrxf(bytes: Uint8Array): UrxfFile {
   while (at < bytes.length) {
     const record = readRecordHeader(view, bytes, at);
     if (record.tag === END_TAG) {
+      // The terminator declares no extra or body, and the file ends right after its header.
+      if (record.extraLen !== 0 || record.dataLen !== 0 || at + RECORD_HEADER !== bytes.length) {
+        throw new UrxfError("truncated", `#END at ${at} declares ${record.extraLen}+${record.dataLen} bytes, file ends at ${bytes.length}`);
+      }
       ended = true;
       break;
     }
@@ -229,6 +233,10 @@ function readValues(view: DataView, bytes: Uint8Array, at: number, length: numbe
       );
     } else if (descriptor.typecode === TC_SIGNED || descriptor.typecode === TC_UNSIGNED) {
       const signed = descriptor.typecode === TC_SIGNED;
+      // The width is checked before any element, so an empty array of an illegal width is refused too.
+      if (!NUMBER_WIDTHS.includes(descriptor.elemSize)) {
+        throw new UrxfError("bad_descriptor", `element size ${descriptor.elemSize} on parameter ${descriptor.id}`);
+      }
       params.set(
         descriptor.id,
         Array.from({ length: descriptor.count }, (_, i) => readNumber(view, cursor + i * descriptor.elemSize, descriptor.elemSize, signed)),
@@ -243,6 +251,9 @@ function readValues(view: DataView, bytes: Uint8Array, at: number, length: numbe
   }
   return params;
 }
+
+/** The element widths a numeric parameter may have. */
+const NUMBER_WIDTHS: readonly number[] = [1, 2, 4];
 
 function readNumber(view: DataView, at: number, size: number, signed: boolean): number {
   switch (size) {

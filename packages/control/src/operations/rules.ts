@@ -818,13 +818,20 @@ export function geqGainSetting(rule: GeqGainRule) {
     const planned = planOnGrid(value, range.min, range.max, 1 / rule.step);
     return planned === undefined ? refuse("invalid_input") : { planned, raw: `${Math.round(planned * rule.scale)}` as I64Text };
   };
+  /** A stored gain: an integer in the read range over the scale, off-grid values kept. */
+  const decodeGain = (raw: string) => {
+    const value = decodeInteger(raw, rule.read.min, rule.read.max);
+    return value === undefined ? undefined : value / rule.scale;
+  };
   return {
+    /** The band's address and decoder without traffic, as `read` uses them (a file value reads like a device one). */
+    locate(model: string, target: unknown): { at: ParameterAddress; text: boolean; decode: (raw: string) => number | undefined } {
+      const { leaf } = resolve(model, target, false);
+      return { at: leaf, text: false, decode: decodeGain };
+    },
     read(context: OperationContext, target: unknown): Promise<Reading<number>> {
       const { leaf } = resolve(context.model, target, false);
-      return readDecoded(context, leaf, (raw) => {
-        const value = decodeInteger(raw, rule.read.min, rule.read.max);
-        return value === undefined ? undefined : value / rule.scale;
-      });
+      return readDecoded(context, leaf, decodeGain);
     },
     /** No static plan: the range depends on the live Limit (`dryRun` reads it). */
     plan(model: string, target: unknown, requested: number): WritePlan<number> {
@@ -962,7 +969,8 @@ export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
       : { at, raw: result.raw as I64Text, planned: result.planned as V };
   };
   return {
-    read: base.read,
+    // The base handler's read, check and traffic-free locate (a file value reads like a device one).
+    ...base,
     /** A connection-free plan where `model` has no applicable prerequisite; refused where the plan needs device state. */
     plan(model: string, target: unknown, requested: V): WritePlan<V> {
       const { planned: p } = planned(model, target, requested);

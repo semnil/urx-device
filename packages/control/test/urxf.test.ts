@@ -161,3 +161,61 @@ describe("parseUrxf input type", () => {
     }
   });
 });
+
+describe("parser review fixes (PR #35)", () => {
+  const faultOf = (bytes: Uint8Array) => {
+    try {
+      parseUrxf(bytes);
+      return "accepted";
+    } catch (error) {
+      return error instanceof UrxfError ? error.fault : String(error);
+    }
+  };
+  const endRecord = (extra: Uint8Array, data: Uint8Array) => record(ascii("#END", 24), extra, data);
+  const head = () => record(ascii("#YAMAHA MBDFProjectFile", 24), concat(ascii("URX", 16)), new Uint8Array(0));
+
+  it("take #END only empty and at the end of the file", () => {
+    const current = chunk("CURRENT", CURRENT);
+    expect(faultOf(concat(head(), current, endRecord(new Uint8Array(0), new Uint8Array(0))))).toBe("accepted");
+    for (const [label, bytes] of [
+      ["END with an extra", concat(head(), current, endRecord(new Uint8Array(4), new Uint8Array(0)))],
+      ["END with a body", concat(head(), current, endRecord(new Uint8Array(0), new Uint8Array(4)))],
+      ["zero bytes after END", concat(head(), current, endRecord(new Uint8Array(0), new Uint8Array(0)), new Uint8Array(4))],
+      ["a second CURRENT after END", concat(head(), current, endRecord(new Uint8Array(0), new Uint8Array(0)), chunk("CURRENT", CURRENT))],
+      ["a second END", concat(head(), current, endRecord(new Uint8Array(0), new Uint8Array(0)), endRecord(new Uint8Array(0), new Uint8Array(0)))],
+    ] as const) {
+      expect(faultOf(bytes), label).toBe("truncated");
+    }
+  });
+
+  it("refuse an illegal numeric width even with no element", () => {
+    for (const type of ["signed", "unsigned"] as const) {
+      for (const size of [3, 5, 8]) {
+        const bytes = file(chunk("CURRENT", [...CURRENT, { id: 500, type, size, values: [], array: true }]));
+        expect(faultOf(bytes), `${type} ${size}`).toBe("bad_descriptor");
+      }
+      for (const size of [1, 2, 4]) {
+        expect(faultOf(file(chunk("CURRENT", [...CURRENT, { id: 500, type, size, values: [], array: true }]))), `${type} ${size}`).toBe("accepted");
+      }
+    }
+  });
+
+  it("decode a file's sample rate, Follow USB and GEQ gain like a device read, with no default", () => {
+    const decode = (params: Param[], id: string, target: object, model = "URX44") => {
+      try {
+        return decodeFileSetting(parseUrxf(file(chunk("CURRENT", params))).current, model, ...([id, target] as unknown as ReadArgs));
+      } catch (error) {
+        return operationFailureOf(error)?.code;
+      }
+    };
+    expect(decode([{ id: 766, type: "unsigned", size: 4, values: [48000] }], "device.sample-rate", {})).toBe(48000);
+    expect(decode([{ id: 766, type: "unsigned", size: 4, values: [32000] }], "device.sample-rate", {})).toBe("invalid_input");
+    expect(decode([], "device.sample-rate", {})).toBe("invalid_input");
+    expect(decode([{ id: 848, type: "unsigned", size: 1, values: [1] }], "device.follow-usb", {}, "URX22")).toBe(true);
+    // MIX 1 band 20 Hz left at 638 y 0; STEREO band 25 Hz left at 545 + x 1 (flattened onto the ID) y 0.
+    expect(decode([{ id: 638, type: "signed", size: 2, values: [-250] }], "bus.geq.gain", { bus: "mix-1", side: "left", band: "20" })).toBe(-2.5);
+    expect(decode([{ id: 546, type: "signed", size: 2, values: [1475] }], "bus.geq.gain", { bus: "stereo", side: "left", band: "25" })).toBe(14.75);
+    expect(decode([{ id: 638, type: "signed", size: 2, values: [1501] }], "bus.geq.gain", { bus: "mix-1", side: "left", band: "20" })).toBe("invalid_input");
+    expect(decode([{ id: 638, type: "ascii", size: 4, values: ["x"] }], "bus.geq.gain", { bus: "mix-1", side: "left", band: "20" })).toBe("invalid_input");
+  });
+});
