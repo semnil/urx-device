@@ -29,7 +29,7 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
 use std::net::{Shutdown, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle, ThreadId};
@@ -616,6 +616,15 @@ impl Connection {
                 ResultAdoption::none(),
             );
         }
+        // Its completing thread is held from now on, so that its expiry or a
+        // close never has to run `done` on the worker or the closing thread.
+        let Ok(reservation) = self.shared.expiry.reserve() else {
+            drop(state);
+            return done(
+                refuse(RequestCause::InternalError, RequestPhase::Admission),
+                ResultAdoption::none(),
+            );
+        };
         state.waiting_bytes += frame.len();
         state.waiting.push_back(Item {
             owner: operation.id,
@@ -623,7 +632,10 @@ impl Connection {
             request,
             frame,
             submitted: Instant::now(),
-            done: Box::new(done),
+            done: Box::new(move |outcome, adoption| {
+                let _reserved = reservation;
+                done(outcome, adoption);
+            }),
         });
         drop(state);
         // A held result's wait tracks the earliest send deadline.
@@ -735,41 +747,17 @@ impl Connection {
             (take_pending(&mut state), cause)
         };
         let (waiting, cause) = waiting;
-        // After the close is marked, no hold queues another expired request.
+        // What waits completes on the threads held for it at admission, which
+        // the close waits for within the budget; a close called from one of
+        // their callbacks returns `Started` instead of waiting for itself.
+        // Handed over before the threads are told to stop, so they run it
+        // first; after the close is marked, no hold queues another expired
+        // request.
+        self.shared.expiry.hand(waiting.completions(cause));
         self.shared.expiry.stop();
         // A held result stops waiting for the application.
         self.shared.advance.notify_all();
         let _ = self.events.send(Event::Wake);
-        // Waiting requests complete on their own thread, which the close
-        // waits for within the budget; a close called from one of their
-        // callbacks returns `Started` instead of waiting for itself.
-        let delivery = if waiting.is_empty() {
-            None
-        } else {
-            let (go, ready) = mpsc::channel::<()>();
-            let slot = Arc::new(Mutex::new(Some(waiting)));
-            let taken = Arc::clone(&slot);
-            match self.shared.expiry.spawner.spawn(move || {
-                let _ = ready.recv();
-                if let Some(waiting) = lock(&taken).take() {
-                    waiting.complete(cause);
-                }
-            }) {
-                Ok(handle) => {
-                    lock(&self.close.exempt).push(handle.thread().id());
-                    let _ = go.send(());
-                    Some(handle)
-                }
-                // Without a thread of their own they complete here, before
-                // the close goes on.
-                Err(_) => {
-                    if let Some(waiting) = lock(&slot).take() {
-                        waiting.complete(cause);
-                    }
-                    None
-                }
-            }
-        };
         {
             let mut state = self.shared.lock();
             while state.active || state.job {
@@ -791,7 +779,6 @@ impl Connection {
             reader_stop: Arc::clone(&self.reader_stop),
             sock: lock(&self.sock).take(),
             threads: [
-                delivery,
                 lock(&self.worker).take(),
                 lock(&self.reader).take(),
                 lock(&self.delivery).take(),
@@ -826,15 +813,15 @@ impl Connection {
     }
 
     /// Whether this thread is one the close waits for: the worker, the
-    /// notification delivery thread, the thread running the close, or the
-    /// one delivering waiting outcomes.
+    /// notification delivery thread, a completing thread, or the thread
+    /// running the close.
     fn must_not_wait(&self) -> bool {
         let me = thread::current().id();
         self.on_own_thread() || lock(&self.close.exempt).contains(&me)
     }
 
     /// Whether this is the worker, the notification delivery thread or a
-    /// thread completing expired requests.
+    /// completing thread (an expired request's, or what a close took).
     fn on_own_thread(&self) -> bool {
         let me = thread::current().id();
         self.worker_id == me
@@ -848,7 +835,7 @@ struct Teardown {
     shared: Arc<Shared>,
     reader_stop: Arc<AtomicBool>,
     sock: Option<TcpStream>,
-    threads: [Option<JoinHandle<()>>; 4],
+    threads: [Option<JoinHandle<()>>; 3],
     end: Instant,
 }
 
@@ -951,9 +938,9 @@ fn wait_for<const N: usize>(
         for thread in threads.into_iter().flatten() {
             let _ = thread.join();
         }
-        // Taken after the worker is joined: it starts no expiry thread after.
-        // Their identities stay recorded, so a close from one never waits
-        // for itself.
+        // Taken once the close is marked: no admission, and so no completing
+        // thread, follows it. Their identities stay recorded, so a close from
+        // one never waits for itself.
         let expiries = std::mem::take(&mut lock(&joining.pool).threads);
         for thread in expiries {
             let _ = thread.join();
@@ -1019,10 +1006,17 @@ impl Subscription {
             drop(state);
             return done(Err(not_connected(Phase::Subscription)));
         }
+        let Ok(reservation) = shared.expiry.reserve() else {
+            drop(state);
+            return done(Err(no_completing_thread()));
+        };
         state.jobs.push_back(Job::Activate {
             token: self.token,
             owner: operation.id,
-            done: Box::new(done),
+            done: Box::new(move |outcome| {
+                let _reserved = reservation;
+                done(outcome);
+            }),
         });
         drop(state);
         let _ = self.events.send(Event::Wake);
@@ -1050,7 +1044,15 @@ impl Subscription {
             drop(gate);
             return done(Err(not_connected(Phase::Subscription)));
         }
-        let done: LifecycleDone = Box::new(done);
+        let Ok(reservation) = shared.expiry.reserve() else {
+            drop(state);
+            drop(gate);
+            return done(Err(no_completing_thread()));
+        };
+        let done: LifecycleDone = Box::new(move |outcome| {
+            let _reserved = reservation;
+            done(outcome);
+        });
         if let Some(release) = state.releases.iter_mut().find(|r| r.token == self.token) {
             release.waiting.push(done);
             return;
@@ -1064,6 +1066,14 @@ impl Subscription {
         drop(state);
         drop(gate);
         let _ = self.events.send(Event::Wake);
+    }
+}
+
+/// A lifecycle call refused because no thread could be held to complete it.
+fn no_completing_thread() -> LifecycleFailure {
+    LifecycleFailure {
+        failure: Failure::cause(Cause::InternalError, Phase::Subscription),
+        cleanup: Cleanup::COMPLETE,
     }
 }
 
@@ -1266,118 +1276,151 @@ impl Spawner {
     }
 }
 
-/// Requests that expired during a hold, waiting for a completing thread,
-/// and those threads (K5, K6).
+/// The threads that complete admitted callbacks off the worker: a request
+/// that expired during a hold, and what a close takes (K5, K6). Each admitted
+/// callback holds one of them from its admission until it has run, so that
+/// none has to run on the worker or on the closing thread, and a blocked one
+/// delays no other.
 #[derive(Default)]
 struct Expiry {
     pool: Mutex<ExpiryPool>,
-    /// Signalled when a request is queued or the threads must stop.
+    /// Signalled when a completion is handed over or the threads must stop.
     ready: Condvar,
     spawner: Spawner,
+    /// Admitted callbacks not yet run; there are never fewer threads alive.
+    reserved: Arc<AtomicUsize>,
+}
+
+/// A callback handed to the completing threads.
+type Completion = Box<dyn FnOnce() + Send>;
+
+/// One completion handed over, and the bytes an expired request keeps
+/// charged until it has run.
+struct Entry {
+    run: Completion,
+    charged_bytes: Option<usize>,
 }
 
 #[derive(Default)]
 struct ExpiryPool {
-    queue: VecDeque<Item>,
+    queue: VecDeque<Entry>,
     /// Expired requests whose completion has not run, and their bytes: they
     /// stay charged to the waiting-request limits until then.
     charged: usize,
     charged_bytes: usize,
-    /// Threads waiting for a request, and threads started that have not yet
-    /// taken one: both will take a queued request without a new thread.
-    idle: usize,
-    starting: usize,
+    /// Threads started that have not ended.
+    alive: usize,
     threads: Vec<JoinHandle<()>>,
     /// Identities of every thread started, kept for the connection's life.
     ids: Vec<ThreadId>,
     stopping: bool,
 }
 
+/// How long a completing thread more than the reserved callbacks need waits
+/// for work before it ends.
+const LINGER: Duration = Duration::from_secs(1);
+
+/// One admitted callback's hold on a completing thread, until the callback
+/// has run or is dropped.
+struct Reservation(Arc<AtomicUsize>);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Expiry {
-    /// Queues expired requests, starting a thread for each one no idle
-    /// thread takes, so a blocked completion delays no other. Every queued
-    /// or running completion is charged, so the threads stay within the
-    /// waiting-request limit. Returns whether no thread is there to take
-    /// them, when the system starts none: the caller then completes them with
-    /// [`Expiry::complete_queued`] once it holds no lock, since their
-    /// callbacks may call into the connection.
-    #[must_use]
-    fn queue(self: &Arc<Self>, expired: VecDeque<Item>) -> bool {
+    /// Holds a completing thread for one admitted callback, starting one when
+    /// fewer are alive than callbacks reserved. A thread the system cannot
+    /// start refuses the admission.
+    fn reserve(self: &Arc<Self>) -> std::io::Result<Reservation> {
         let mut pool = lock(&self.pool);
-        for item in expired {
-            pool.charged += 1;
-            pool.charged_bytes += item.frame.len();
-            pool.queue.push_back(item);
-        }
-        let needed = pool.queue.len().saturating_sub(pool.idle + pool.starting);
-        for _ in 0..needed {
-            pool.starting += 1;
+        let reserved = self.reserved.fetch_add(1, Ordering::SeqCst) + 1;
+        let reservation = Reservation(Arc::clone(&self.reserved));
+        if pool.alive < reserved {
             let expiry = Arc::clone(self);
             // Registered before it can run: it waits for this lock first.
-            match self.spawner.spawn(move || expiry.complete()) {
-                Ok(thread) => {
-                    pool.ids.push(thread.thread().id());
-                    pool.threads.push(thread);
-                }
-                Err(_) => {
-                    pool.starting -= 1;
-                    break;
-                }
-            }
+            let thread = self.spawner.spawn(move || expiry.complete())?;
+            pool.alive += 1;
+            pool.ids.push(thread.thread().id());
+            pool.threads.push(thread);
         }
-        let orphaned = pool.idle + pool.starting == 0;
+        Ok(reservation)
+    }
+
+    /// Queues expired requests for their held threads. Every queued or
+    /// running completion is charged, so the requests stay within the
+    /// waiting-request limit.
+    fn queue(&self, expired: VecDeque<Item>) {
+        let mut pool = lock(&self.pool);
+        for item in expired {
+            let bytes = item.frame.len();
+            pool.charged += 1;
+            pool.charged_bytes += bytes;
+            pool.queue.push_back(Entry {
+                run: Box::new(move || {
+                    let timeout = Outcome::failed(
+                        RequestCause::SendTimeout,
+                        RequestPhase::Admission,
+                        Evidence::NotSent,
+                    );
+                    deliver(item.done, timeout, ResultAdoption::none());
+                }),
+                charged_bytes: Some(bytes),
+            });
+        }
         drop(pool);
         self.ready.notify_all();
-        orphaned
     }
 
-    /// Completes the queued requests on this thread, which holds no lock.
-    fn complete_queued(&self) {
-        let mut pool = lock(&self.pool);
-        while let Some(item) = pool.queue.pop_front() {
-            drop(pool);
-            let bytes = item.frame.len();
-            let timeout = Outcome::failed(
-                RequestCause::SendTimeout,
-                RequestPhase::Admission,
-                Evidence::NotSent,
-            );
-            deliver(item.done, timeout, ResultAdoption::none());
-            pool = lock(&self.pool);
-            pool.charged -= 1;
-            pool.charged_bytes -= bytes;
+    /// Hands what a close took to the held threads.
+    fn hand(&self, completions: Vec<Completion>) {
+        if completions.is_empty() {
+            return;
         }
+        let mut pool = lock(&self.pool);
+        pool.queue.extend(completions.into_iter().map(|run| Entry {
+            run,
+            charged_bytes: None,
+        }));
+        drop(pool);
+        self.ready.notify_all();
     }
 
-    /// One completing thread: completes queued requests until told to stop
-    /// with none left.
+    /// One completing thread: runs what is handed over until told to stop
+    /// with nothing left, or until it has waited [`LINGER`] with more
+    /// threads alive than callbacks reserved.
     fn complete(&self) {
         let mut pool = lock(&self.pool);
-        pool.starting -= 1;
         loop {
-            if let Some(item) = pool.queue.pop_front() {
+            if let Some(entry) = pool.queue.pop_front() {
                 drop(pool);
-                let bytes = item.frame.len();
-                let timeout = Outcome::failed(
-                    RequestCause::SendTimeout,
-                    RequestPhase::Admission,
-                    Evidence::NotSent,
-                );
-                deliver(item.done, timeout, ResultAdoption::none());
+                (entry.run)();
                 pool = lock(&self.pool);
-                pool.charged -= 1;
-                pool.charged_bytes -= bytes;
+                if let Some(bytes) = entry.charged_bytes {
+                    pool.charged -= 1;
+                    pool.charged_bytes -= bytes;
+                }
                 continue;
             }
             if pool.stopping {
+                pool.alive -= 1;
                 return;
             }
-            pool.idle += 1;
-            pool = self
+            let (next, waited) = self
                 .ready
-                .wait(pool)
+                .wait_timeout(pool, LINGER)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pool.idle -= 1;
+            pool = next;
+            if waited.timed_out()
+                && pool.queue.is_empty()
+                && !pool.stopping
+                && pool.alive > self.reserved.load(Ordering::SeqCst)
+            {
+                pool.alive -= 1;
+                return;
+            }
         }
     }
 
@@ -1802,30 +1845,41 @@ fn take_pending(state: &mut State) -> Taken {
 }
 
 impl Taken {
-    fn is_empty(&self) -> bool {
-        self.waiting.is_empty() && self.jobs.is_empty() && self.releases.is_empty()
+    /// Completes everything taken without sending anything, here.
+    fn complete(self, cause: RequestCause) {
+        for completion in self.completions(cause) {
+            completion();
+        }
     }
 
-    /// Completes everything taken without sending anything: requests unsent
-    /// with `cause`, lifecycle calls as not connected.
-    fn complete(self, cause: RequestCause) {
+    /// One completion per callback taken: requests unsent with `cause`,
+    /// lifecycle calls as not connected.
+    fn completions(self, cause: RequestCause) -> Vec<Completion> {
+        let mut completions: Vec<Completion> = Vec::new();
         for item in self.waiting {
-            deliver(
-                item.done,
-                Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
-                ResultAdoption::none(),
-            );
+            completions.push(Box::new(move || {
+                deliver(
+                    item.done,
+                    Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
+                    ResultAdoption::none(),
+                );
+            }));
         }
         for job in self.jobs {
             if let Job::Activate { done, .. } = job {
-                deliver_lifecycle(done, Err(not_connected(Phase::Subscription)));
+                completions.push(Box::new(move || {
+                    deliver_lifecycle(done, Err(not_connected(Phase::Subscription)));
+                }));
             }
         }
         for release in self.releases {
             for done in release.waiting {
-                deliver_lifecycle(done, Err(not_connected(Phase::Subscription)));
+                completions.push(Box::new(move || {
+                    deliver_lifecycle(done, Err(not_connected(Phase::Subscription)));
+                }));
             }
         }
+        completions
     }
 }
 
@@ -2401,15 +2455,9 @@ fn hold(
         if !expired.is_empty() {
             state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
             // Queued under the state lock, so a close marked after this
-            // finds them queued before it stops the threads.
-            if shared.expiry.queue(expired) {
-                // No thread to complete them: this one does, without the
-                // state lock, since their callbacks may call into the
-                // connection.
-                drop(state);
-                shared.expiry.complete_queued();
-                state = shared.lock();
-            }
+            // finds them queued before it stops the threads. Each has its
+            // thread held since its admission.
+            shared.expiry.queue(expired);
             continue;
         }
         let next = state

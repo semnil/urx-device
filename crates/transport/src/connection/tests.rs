@@ -1683,6 +1683,85 @@ fn a_close_with_no_thread_to_start_completes_waiting_requests_and_returns() {
 }
 
 #[test]
+fn a_completing_thread_no_callback_holds_ends_after_its_linger() {
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let answered = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert!(matches!(outcome(&answered), Outcome::Success { .. }));
+    let alive = || super::lock(&connection.shared.expiry.pool).alive;
+    assert_eq!(alive(), 1, "held for the request at its admission");
+    wait_until(|| alive() == 0);
+}
+
+#[test]
+fn a_waiting_callback_that_blocks_holds_up_no_close() {
+    // A read is on the wire and a write waits behind it; the close completes the write on
+    // the thread held for it at admission, whose callback does not return. With no thread
+    // to start, the close returns that it could not finish; with threads, it returns at its
+    // budget that the teardown ran out. Either way a later close returns the same.
+    for refused in [true, false] {
+        let (port, _closed) = silent_unit();
+        let options = ConnectionOptions {
+            response_deadline: Duration::from_millis(100),
+            ..options()
+        };
+        let connection = Arc::new(open(port, ID, &options, &Control::new()).unwrap());
+        let operation = connection.create_operation().unwrap();
+        let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
+        thread::sleep(Duration::from_millis(20));
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        connection.submit(
+            &operation,
+            Request::SetNumeric(address(2), 5),
+            move |outcome, _| {
+                let _ = entered_tx.send(outcome);
+                let _ = blocked.recv();
+            },
+        );
+        let (closed_tx, closed_with) = mpsc::channel();
+        let closing = Arc::clone(&connection);
+        thread::spawn(move || {
+            let close = || closing.close(Duration::from_millis(50));
+            let outcome = if refused {
+                refusing_threads(0, close)
+            } else {
+                close()
+            };
+            let _ = closed_tx.send(outcome);
+        });
+        let expected = if refused {
+            could_not_finish()
+        } else {
+            CloseOutcome::Incomplete(Failure::Cause {
+                code: Cause::TeardownTimeout,
+                phase: Phase::Teardown,
+            })
+        };
+        assert_eq!(
+            closed_with.recv_timeout(Duration::from_secs(2)),
+            Ok(expected),
+            "refused: {refused}"
+        );
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(2)).unwrap(),
+            failed(
+                RequestCause::NotConnected,
+                RequestPhase::Admission,
+                Evidence::NotSent
+            )
+        );
+        assert_eq!(
+            connection.close(Duration::from_millis(50)),
+            expected,
+            "refused: {refused}"
+        );
+        drop(release);
+    }
+}
+
+#[test]
 fn a_close_with_nothing_waiting_and_no_thread_to_start_returns() {
     let (port, closed) = silent_unit();
     let connection = open(port, ID, &options(), &Control::new()).unwrap();
@@ -3599,31 +3678,20 @@ mod notifications {
     }
 
     #[test]
-    fn a_waiting_request_expires_while_a_result_is_held_with_no_thread_to_complete_it() {
-        // The system starts no completing thread: the expired request completes on the
-        // thread that found it expired, with no lock held, so its callback can call into the
-        // connection.
+    fn an_expired_request_completes_on_its_own_thread_while_a_registration_is_held() {
+        // A registration's reply waits for a notification received before it to be adopted
+        // (K12), and a request waiting behind it expires. Its callback runs on the thread held
+        // for it since its admission, not on the worker carrying the registration: it can
+        // close the connection, even once the system starts no more threads.
         let (port, push) = pushing_unit(Duration::from_millis(200));
-        let (tx, batches) = mpsc::channel();
-        let tx = Mutex::new(tx);
-        let handler: NotificationHandler = Arc::new(move |batch| {
-            let _ = tx.lock().unwrap().send(batch);
-        });
-        let short = crate::connection::ConnectionOptions {
-            send_deadline: Duration::from_millis(80),
-            ..options()
-        };
-        let connection =
-            Arc::new(open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap());
-        let _token = activate(&connection, &[p(1)]);
-        connection
-            .shared
-            .expiry
-            .spawner
-            .refuse
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (connection, batches) = connect_short(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
         let operation = connection.create_operation().unwrap();
-        let held = submit_held(&connection, &operation, 5);
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
         thread::sleep(Duration::from_millis(20));
         push.send(notify_param(1, 1)).unwrap();
         let _first = next(&batches);
@@ -3631,16 +3699,95 @@ mod notifications {
         let (tx, waiting) = mpsc::channel();
         let inner = Arc::clone(&connection);
         connection.submit(&other, Request::GetNumeric(param(6)), move |outcome, _| {
-            // Reads the connection's state from inside the callback.
-            let _ = inner.terminal();
-            let _ = tx.send(outcome);
+            let closed = inner.close(Duration::from_millis(50));
+            let _ = tx.send((outcome, closed));
         });
+        connection
+            .shared
+            .expiry
+            .spawner
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (outcome, closed) = waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(outcome, unsent_with(RequestCause::SendTimeout));
         assert_eq!(
-            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            closed,
+            CloseOutcome::Incomplete(Failure::Cause {
+                code: Cause::InternalError,
+                phase: Phase::Teardown
+            }),
+            "no helper thread to finish the close on"
+        );
+        assert!(activated.recv_timeout(Duration::from_secs(2)).is_ok());
+        super::wait_until(|| connection.shared.expiry.charged() == (0, 0));
+    }
+
+    #[test]
+    fn a_thread_held_for_a_waiting_request_outlasts_its_linger() {
+        // The request waits behind a held result for longer than an idle completing thread
+        // lingers; its thread is still there when it expires.
+        let (port, push) = pushing_unit(Duration::from_millis(100));
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let _ = tx.lock().unwrap().send(batch);
+        });
+        let long = crate::connection::ConnectionOptions {
+            send_deadline: super::super::LINGER + Duration::from_millis(500),
+            ..options()
+        };
+        let connection =
+            Arc::new(open_with(port, ID, &long, &Control::new(), Some(handler)).unwrap());
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let _held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        let other = connection.create_operation().unwrap();
+        let waiting = submit_held(&connection, &other, 6);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap().0,
             unsent_with(RequestCause::SendTimeout)
         );
-        assert!(held.try_recv().is_err(), "still held");
-        assert_eq!(connection.shared.expiry.charged(), (0, 0));
+    }
+
+    #[test]
+    fn a_request_is_refused_when_no_thread_can_be_held_for_it() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect_short(port);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        connection
+            .shared
+            .expiry
+            .spawner
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let operation = connection.create_operation().unwrap();
+        let refused = submit_held(&connection, &operation, 5);
+        assert_eq!(
+            refused.recv_timeout(Duration::from_secs(1)).unwrap().0,
+            unsent_with(RequestCause::InternalError)
+        );
+        let (tx, lifecycle) = mpsc::channel();
+        let again = tx.clone();
+        token.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        token.release(move |outcome| {
+            let _ = again.send(outcome);
+        });
+        for call in ["activate", "release"] {
+            let outcome = lifecycle.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                outcome.map_err(|failed| failed.failure),
+                Err(Failure::Cause {
+                    code: Cause::InternalError,
+                    phase: Phase::Subscription
+                }),
+                "{call}"
+            );
+        }
     }
 
     #[test]
@@ -3898,11 +4045,9 @@ mod notifications {
             "the expired ones still count against the queue"
         );
         assert!(
-            crate::connection::lock(&connection.shared.expiry.pool)
-                .threads
-                .len()
-                <= MAX_WAITING_REQUESTS,
-            "one thread at most per charged completion"
+            crate::connection::lock(&connection.shared.expiry.pool).alive
+                <= MAX_WAITING_REQUESTS + 1,
+            "one thread at most per admitted request: the waiting limit and the one held on the wire"
         );
         release.send(()).unwrap();
         *gate.0.lock().unwrap() = true;
