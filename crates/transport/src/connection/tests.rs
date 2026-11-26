@@ -3893,6 +3893,10 @@ mod notifications {
         adoption.adopt();
     }
 
+    // Not on Windows: there a thread-local destructor runs under the process's loader lock,
+    // so one that blocks stops every thread of the test process from starting or ending,
+    // and the other cases' closes with it.
+    #[cfg(not(windows))]
     #[test]
     fn a_completing_thread_whose_exit_does_not_finish_holds_back_one_other_at_most() {
         // The expired request's callback leaves a thread-local whose destructor blocks, so
@@ -3910,7 +3914,9 @@ mod notifications {
         let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         super::super::RUNNING.with(|counted| *counted.borrow_mut() = Some(Arc::clone(&running)));
         let (port, push) = pushing_unit(Duration::from_millis(20));
-        let (connection, batches) = connect_short(port);
+        // Long enough for a burst of four reads to be sent, short enough for the one behind
+        // the hold to expire.
+        let (connection, batches) = connect_sending(port, Duration::from_secs(1));
         let _token = activate(&connection, &[p(1)]);
         let (release, stuck) = mpsc::channel();
         expire_on_a_completing_thread(&connection, &push, &batches, move || {
@@ -4043,13 +4049,21 @@ mod notifications {
 
     /// A connection with an 80 ms send deadline whose batches reach the test.
     fn connect_short(port: u16) -> (Arc<Connection>, Receiver<NotificationBatch>) {
+        connect_sending(port, Duration::from_millis(80))
+    }
+
+    /// A connection whose requests may wait `send_deadline` to be sent.
+    fn connect_sending(
+        port: u16,
+        send_deadline: Duration,
+    ) -> (Arc<Connection>, Receiver<NotificationBatch>) {
         let (tx, batches) = mpsc::channel();
         let tx = Mutex::new(tx);
         let handler: NotificationHandler = Arc::new(move |batch| {
             let _ = tx.lock().unwrap().send(batch);
         });
         let short = crate::connection::ConnectionOptions {
-            send_deadline: Duration::from_millis(80),
+            send_deadline,
             ..options()
         };
         let connection = open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap();
