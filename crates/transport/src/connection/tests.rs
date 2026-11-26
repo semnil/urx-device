@@ -1655,7 +1655,8 @@ fn a_close_with_no_thread_to_start_completes_waiting_requests_and_returns() {
     // returns that it could not finish, as does a second close; nothing panics.
     let (port, closed) = silent_unit();
     let options = ConnectionOptions {
-        response_deadline: Duration::from_millis(100),
+        // Outlasts the start of the close, which takes what waits first.
+        response_deadline: Duration::from_secs(1),
         ..options()
     };
     let connection = open(port, ID, &options, &Control::new()).unwrap();
@@ -1737,7 +1738,8 @@ fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_aft
     // threads. Each callback still gets its result once, before the close returns.
     let (port, _closed) = silent_unit();
     let options = ConnectionOptions {
-        response_deadline: Duration::from_millis(100),
+        // Outlasts the start of the close, which takes what waits first.
+        response_deadline: Duration::from_secs(1),
         ..options()
     };
     let connection = open(port, ID, &options, &Control::new()).unwrap();
@@ -1808,11 +1810,13 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
     // A read is on the wire and a write waits behind it; the close completes the write on
     // the thread held for it at admission, whose callback does not return. With no thread
     // to start, the close returns that it could not finish; with threads, it returns at its
-    // budget that the teardown ran out. Either way a later close returns the same.
+    // budget that the teardown ran out. Either way a later close returns the same. The read's
+    // response deadline outlasts the start of the close, which takes the write first; the
+    // close then waits for the read to settle before its budget starts.
     for refused in [true, false] {
         let (port, _closed) = silent_unit();
         let options = ConnectionOptions {
-            response_deadline: Duration::from_millis(100),
+            response_deadline: Duration::from_secs(1),
             ..options()
         };
         let connection = Arc::new(open(port, ID, &options, &Control::new()).unwrap());
@@ -1849,17 +1853,17 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
             })
         };
         assert_eq!(
-            closed_with.recv_timeout(Duration::from_secs(2)),
+            closed_with.recv_timeout(Duration::from_secs(5)),
             Ok(expected),
             "refused: {refused}"
         );
-        assert_eq!(
-            entered.recv_timeout(Duration::from_secs(2)).unwrap(),
-            failed(
-                RequestCause::NotConnected,
-                RequestPhase::Admission,
-                Evidence::NotSent
-            )
+        // Unsent: by the close, or by the end the read's response deadline brings first.
+        let write = entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            [RequestCause::NotConnected, RequestCause::ResponseTimeout]
+                .into_iter()
+                .any(|cause| write == failed(cause, RequestPhase::Admission, Evidence::NotSent)),
+            "refused: {refused}: {write:?}"
         );
         assert_eq!(
             connection.close(Duration::from_millis(50)),
