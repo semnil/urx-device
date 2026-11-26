@@ -70,6 +70,10 @@ const DECODER = new TextDecoder();
 
 /** Parses one byte snapshot: every chunk body, exactly one CURRENT (F18-F). */
 export function parseUrxf(bytes: Uint8Array): UrxfFile {
+  // Only bytes are a file: anything else is refused with a fault, not a runtime type error.
+  if (!(bytes instanceof Uint8Array)) {
+    throw new UrxfError("not_urxf", "not a byte array");
+  }
   if (bytes.length > URXF_MAX_BYTES) {
     throw new UrxfError("too_large", `${bytes.length} bytes`);
   }

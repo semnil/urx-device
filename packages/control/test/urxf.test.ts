@@ -147,3 +147,17 @@ describe(".urxf structure (F18-F, F18-L, F18-M)", () => {
     expect(refused("channel.fader", { channel: 9 })).toBe("invalid_input");
   });
 });
+
+describe("parseUrxf input type", () => {
+  it("refuse anything but a byte array as not_urxf, without a runtime type error", () => {
+    for (const [index, input] of [[], "file", 42, null, undefined, { length: 40 }, new ArrayBuffer(40)].entries()) {
+      let fault: unknown;
+      try {
+        parseUrxf(input as never);
+      } catch (error) {
+        fault = error instanceof UrxfError ? error.fault : error;
+      }
+      expect(fault, `input #${index}`).toBe("not_urxf");
+    }
+  });
+});
