@@ -15,5 +15,5 @@ export { PLAN_ITEM_LIMIT, planCurrent } from "../composition/plan.js";
 export type { CurrentPlan, Omission, PlannedStep } from "../composition/plan.js";
 export { applyCurrent } from "../composition/apply.js";
 export type { ApplyResult, StepResult } from "../composition/apply.js";
-export { EXCLUDED, PENDING, PHASES } from "../composition/coverage.js";
+export { EXCLUDED, PHASES } from "../composition/coverage.js";
 export type { OmissionReason } from "../composition/coverage.js";

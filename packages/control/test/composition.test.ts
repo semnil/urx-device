@@ -4,7 +4,7 @@ import type { Model } from "../src/catalog/models.js";
 import { settingDefinitions, type SettingDefinitionBase, type SettingId } from "../src/catalog/settings.js";
 import type { UrxfChunk, UrxfFile } from "../src/catalog/urxf.js";
 import { applyCurrent } from "../src/composition/apply.js";
-import { EXCLUDED, PENDING, PHASES } from "../src/composition/coverage.js";
+import { EXCLUDED, PHASES } from "../src/composition/coverage.js";
 import { PLAN_ITEM_LIMIT, planCurrent } from "../src/composition/plan.js";
 import { targetsOf } from "../src/composition/targets.js";
 import { OperationContext } from "../src/operations/context.js";
@@ -93,16 +93,30 @@ describe("CURRENT composition (K36, F18)", () => {
       expect(plan.omissions.some((o) => o.setting === "bus.fader" && (o.target as { bus: string }).bus === "mix-1")).toBe(true);
       expect(plan.steps.some((s) => s.setting === "bus.fader" && (s.target as { bus: string }).bus === "stereo")).toBe(true);
       expect(new Set(omitted("device.brightness"))).toEqual(new Set(["excluded_by_scope"]));
-      // The bus identity awaits OV-BUS: neither a step nor an omission yet.
-      expect(all.some((entry) => PENDING.some((setting) => entry.startsWith(`${setting} `)))).toBe(false);
-      // Every catalog setting is in a phase, excluded or pending.
-      const covered = new Set<string>([...PHASES.flatMap((p) => p.settings), ...Object.keys(EXCLUDED), ...PENDING]);
+      // Bus names and colors in phase 10 (OV-BUS): STEREO and FX 1/2 are steps; MIX 1/2 are not_writable omissions.
+      for (const setting of ["bus.name", "bus.color"] as const) {
+        const stepped = plan.steps.filter((s) => s.setting === setting).map((s) => [s.phase, (s.target as { bus: string }).bus]);
+        expect(stepped.slice(0, 3), `${model} ${setting}`).toEqual([
+          [10, "stereo"],
+          [10, "fx-1"],
+          [10, "fx-2"],
+        ]);
+        expect(new Set(omitted(setting)), `${model} ${setting}`).toEqual(new Set(["not_writable"]));
+        const skipped = plan.omissions.filter((o) => o.setting === setting).map((o) => (o.target as { bus: string }).bus);
+        expect(skipped.slice(0, 2), `${model} ${setting}`).toEqual(["mix-1", "mix-2"]);
+      }
+      // Every catalog setting is in a phase or excluded.
+      const covered = new Set<string>([...PHASES.flatMap((p) => p.settings), ...Object.keys(EXCLUDED)]);
       expect(Object.keys(settingDefinitions).filter((id) => !covered.has(id))).toEqual([]);
       // Structural before routing before audio; source pan before send pan; names last.
       const first = (setting: SettingId) => plan.steps.findIndex((s) => s.setting === setting);
       expect(first("channel.pan-mode")).toBeLessThan(first("channel.source"));
       expect(first("channel.pan")).toBeLessThan(first("send.on"));
-      expect(first("channel.name")).toBe(plan.steps.length - 2 * plan.steps.filter((s) => s.setting === "channel.name").length);
+      // Phase 10 closes the plan: the channel names and colors, then the bus names and colors.
+      const identity = ["channel.name", "channel.color", "bus.name", "bus.color"];
+      const tail = plan.steps.slice(first("channel.name"));
+      expect(new Set(tail.map((s) => s.setting)), model).toEqual(new Set(identity));
+      expect(tail.findIndex((s) => s.setting.startsWith("bus."))).toBe(tail.filter((s) => s.setting.startsWith("channel.")).length);
     }
   });
 

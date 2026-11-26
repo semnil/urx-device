@@ -121,8 +121,11 @@ export const PHASES: readonly { readonly phase: number; readonly settings: reado
   },
   // Per source and destination: tap, on, level, then pan (F18-PAN); then the STEREO assignments.
   { phase: 9, settings: ["send.tap", "send.on", "send.level", "send.pan", "channel.stereo-assign", "bus.stereo-assign"] },
-  // Names and colors. The bus identity rows await the OV-BUS decision and are not composed yet.
-  { phase: 10, settings: ["channel.name", "channel.color"] },
+  // Names and colors: channels, then the buses in target order. MIX 1/2 have no
+  // bound name or color write (F03-G: on URX22 a write of the representative
+  // was measured not to move the partner instance), so they are `not_writable`
+  // omissions (K36, OV-BUS).
+  { phase: 10, settings: ["channel.name", "channel.color", "bus.name", "bus.color"] },
 ];
 
 export type OmissionReason = "excluded_by_scope" | "not_writable" | "inactive_bank" | "device_controlled";
@@ -163,6 +166,3 @@ export const EXCLUDED: Readonly<Partial<Record<SettingId, OmissionReason>>> = {
   "recorder.card-present": "excluded_by_scope",
   "recorder.track-count": "excluded_by_scope",
 };
-
-/** Settings whose CURRENT handling awaits an open design decision (OV-BUS). */
-export const PENDING: readonly SettingId[] = ["bus.name", "bus.color"];
