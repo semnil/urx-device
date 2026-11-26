@@ -9,6 +9,8 @@ import type {
   BusSettingRule,
   ChannelBandSettingRule,
   ChannelSettingRule,
+  ContextStopsRule,
+  FxParameterRule,
   GridRule,
   PortChoiceRule,
   SendSettingRule,
@@ -18,8 +20,20 @@ import type {
 } from "../catalog/rules.js";
 import { planSwitch, writableName } from "./channels.js";
 import type { OperationContext } from "./context.js";
+import { OperationFailureError } from "./failure.js";
 import type { Reading, WritePlan, WriteResult } from "./results.js";
-import { address, modelOf, readDecoded, readName, readTextDecoded, refuse, targetOf, writeRaw, writeText } from "./setting-io.js";
+import {
+  address,
+  modelOf,
+  readDecoded,
+  readName,
+  readRawValue,
+  readTextDecoded,
+  refuse,
+  targetOf,
+  writeRaw,
+  writeText,
+} from "./setting-io.js";
 import type { ParameterAddress } from "./transport.js";
 
 /**
@@ -135,9 +149,9 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
     case "selector":
       return {
         text: false,
-        decode: (raw) => (raw === rule.none.raw ? rule.none.value : rule.choices.find((choice) => choice.raw === raw)?.token),
+        decode: (raw) => (raw === rule.none?.raw ? rule.none.value : rule.choices.find((choice) => choice.raw === raw)?.token),
         plan: (value) => {
-          if (value === rule.none.value) {
+          if (rule.none !== undefined && value === rule.none.value) {
             return { planned: value, raw: rule.none.raw };
           }
           const choice = rule.choices.find((each) => each.token === value);
@@ -183,7 +197,7 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
       // Only the exact sentinel raw and value: nothing near them is an alias.
       return {
         text: false,
-        decode: (raw) => (raw === sentinel.raw ? sentinel.value : finite.decode(raw)),
+        decode: (raw) => (raw === sentinel.raw || sentinel.reads?.includes(raw) === true ? sentinel.value : finite.decode(raw)),
         plan: (value) => (value === sentinel.value ? { planned: value, raw: sentinel.raw } : finite.plan(value)),
       };
     }
@@ -326,7 +340,10 @@ export function sendRuleSetting<V>(rule: SendSettingRule) {
 
 /** A bus setting whose handler is built from `rule`: the target names one bus token and nothing else. */
 export function busRuleSetting<V, I = V>(rule: BusSettingRule) {
-  const codec = codecOf(rule.value);
+  const shared = codecOf(rule.value);
+  const perBus = new Map(
+    Object.entries(rule.address).flatMap(([bus, entry]) => (entry?.value === undefined ? [] : [[bus, codecOf(entry.value)] as const])),
+  );
   return handler<V, I>((model, target, write) => {
     modelOf(model);
     const own = targetOf<{ bus?: unknown }>(target, ["bus"]);
@@ -337,7 +354,123 @@ export function busRuleSetting<V, I = V>(rule: BusSettingRule) {
     if (at === undefined || (write && !at.write)) {
       return refuse("unsupported_operation");
     }
-    return { at: address(at.paramId, at.y), codec };
+    return { at: address(at.paramId, at.y), codec: perBus.get(own.bus) ?? shared };
   });
+}
+
+/** A stop table in units of 1 / scale, raw = index (a context-stops rule's chosen table). */
+function contextCodec(rule: ContextStopsRule, stops: readonly number[]): Codec {
+  return stopsCodec({ kind: "stops", unit: rule.unit, stops, scale: rule.scale, ordinal: 0 });
+}
+
+/** A failure with no progress, raised by a prerequisite check. */
+function failed(code: "precondition_failed" | "invalid_response"): never {
+  throw new OperationFailureError({ code, phase: code === "invalid_response" ? "response" : "preparation", progress: null });
+}
+
+/**
+ * An FX-return parameter (F06-F): static checks first (bus, effect, parameter,
+ * value or the type-wide envelope), then one read of the bus's selector, which
+ * must equal the expected effect, then a Room Size read where the value needs
+ * that context, then the one parameter request. Nothing is cached between
+ * calls; no other FX bus's selector is read.
+ */
+export function fxParameterSetting<V>(rule: FxParameterRule) {
+  const resolve = (model: string, target: unknown) => {
+    modelOf(model);
+    const own = targetOf<{ bus?: unknown; effect?: unknown; parameter?: unknown }>(target, ["bus", "effect", "parameter"]);
+    const { bus, effect, parameter } = own;
+    if (typeof bus !== "string" || !rule.knownBuses.includes(bus) || typeof effect !== "string" || typeof parameter !== "string") {
+      return refuse("invalid_input");
+    }
+    const effectRule = Object.hasOwn(rule.effects, effect) ? rule.effects[effect] : undefined;
+    if (effectRule === undefined || !rule.knownParameters.includes(parameter)) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.buses, bus) ? rule.buses[bus] : undefined;
+    const selector = Object.hasOwn(effectRule.selector, bus) ? effectRule.selector[bus] : undefined;
+    const field = Object.hasOwn(effectRule.parameters, parameter) ? effectRule.parameters[parameter] : undefined;
+    if (at === undefined || selector === undefined || field === undefined) {
+      // A known bus, effect or parameter that this combination lacks.
+      return refuse("unsupported_operation");
+    }
+    return { bus, at, selector, field, effect };
+  };
+  /** The static plan check: the value, or for a context value its type-wide envelope. */
+  const staticCheck = (field: { value: ValueRule | ContextStopsRule }, effect: string, value: unknown) => {
+    if (field.value.kind === "context-stops") {
+      const envelope = field.value.envelope[effect];
+      if (typeof value !== "number" || !Number.isFinite(value) || envelope === undefined || value < envelope.min || value > envelope.max) {
+        return refuse("invalid_input");
+      }
+      return undefined;
+    }
+    const planned = codecOf(field.value).plan(value);
+    return planned === undefined || planned === "unsupported" ? refuse("invalid_input") : planned;
+  };
+  /** The prerequisite reads; the codec for the leaf. */
+  const prepare = async (context: OperationContext, resolved: ReturnType<typeof resolve>): Promise<Codec> => {
+    const { raw } = await readRawValue(context, address(resolved.at.selector, 0));
+    if (!/^(0|[1-9][0-9]*)$/.test(raw)) {
+      return failed("invalid_response");
+    }
+    const offered = Object.values(rule.effects).flatMap((each) => {
+      const own = each?.selector[resolved.bus];
+      return own === undefined ? [] : [own];
+    });
+    if (!offered.includes(raw)) {
+      return failed("invalid_response");
+    }
+    if (raw !== resolved.selector) {
+      return failed("precondition_failed");
+    }
+    const value = resolved.field.value;
+    if (value.kind !== "context-stops") {
+      return codecOf(value);
+    }
+    const room = await readRawValue(context, address(resolved.at.array, value.contextSlot));
+    const tables = value.contexts[resolved.effect] ?? [];
+    const index = decodeInteger(room.raw, 0, tables.length - 1);
+    return index === undefined ? failed("invalid_response") : contextCodec(value, tables[index] as readonly number[]);
+  };
+  const leaf = (resolved: ReturnType<typeof resolve>) => address(resolved.at.array, resolved.field.slot);
+  const plannedWith = (codec: Codec, requested: V) => {
+    const result = codec.plan(requested);
+    return result === undefined || result === "unsupported" ? refuse("invalid_input") : result;
+  };
+  return {
+    async read(context: OperationContext, target: unknown): Promise<Reading<V>> {
+      const resolved = resolve(context.model, target);
+      const codec = await prepare(context, resolved);
+      return readDecoded(context, leaf(resolved), (raw) => codec.decode(raw) as V | undefined);
+    },
+    /**
+     * No static plan: an FX-return plan needs the live selector (and Room
+     * Size), so a connection-free preview refuses it after the static checks;
+     * `dryRun` performs those reads.
+     */
+    plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      const resolved = resolve(model, target);
+      staticCheck(resolved.field, resolved.effect, requested);
+      return refuse("invalid_input");
+    },
+    /** The static checks alone: bus, effect, parameter and value or its type-wide envelope. */
+    validate(model: string, target: unknown, requested: V): void {
+      const resolved = resolve(model, target);
+      staticCheck(resolved.field, resolved.effect, requested);
+    },
+    async dryRun(context: OperationContext, target: unknown, requested: V): Promise<WritePlan<V>> {
+      const resolved = resolve(context.model, target);
+      staticCheck(resolved.field, resolved.effect, requested);
+      const result = plannedWith(await prepare(context, resolved), requested);
+      return { requested, planned: result.planned as V };
+    },
+    async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      const resolved = resolve(context.model, target);
+      staticCheck(resolved.field, resolved.effect, requested);
+      const result = plannedWith(await prepare(context, resolved), requested);
+      return writeRaw(context, leaf(resolved), result.raw as I64Text, { requested, planned: result.planned as V });
+    },
+  };
 }
 

@@ -1,19 +1,28 @@
 // The tables written out from urx-router, checked against a fixture taken
 // from that pinned revision (test/fixtures/router-ced9c7d2.json, generated
 // from DYN_*_STOPS_MS, DUCKER_DECAY_STOPS_MS, COMP_RATIO_STEPS, ssmcsQ,
-// preferredNumber(R40, …), SWEET_SPOT_DATA_OPTIONS and HPF_FREQ_STOPS_HZ), so a
+// preferredNumber(R40, …), SWEET_SPOT_DATA_OPTIONS, HPF_FREQ_STOPS_HZ and the
+// FX-return revxTimeSec, revR3TimeSec, initDelayMs, revxFreqHz and fx2FreqHz
+// at their display precision), so a
 // change to any one entry fails here independently of the implementation.
 
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { ATTACK_STOPS_RAW, DUCKER_DECAY_STOPS_RAW, HOLD_STOPS_RAW, RATIO_STOPS_RAW, RELEASE_STOPS_RAW } from "../src/catalog/dynamics-stops.js";
+import {
+  FX2_FREQUENCY_DECIHZ,
+  INITIAL_DELAY_DECIMS,
+  REV_R3_TIME_DECISECONDS,
+  REVX_FREQUENCY_HZ,
+  REVX_TIME_MS,
+} from "../src/catalog/fx-return-tables.js";
 import { HPF_WRITE_STOPS_HZ } from "../src/catalog/processing.js";
 import { SSMCS_FREQUENCY_STEPS_DECIHZ, SSMCS_PRESET_LABELS, SSMCS_Q_STEPS_CENTI } from "../src/catalog/ssmcs.js";
 import { OperationContext } from "../src/operations/context.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
-const router = JSON.parse(readFileSync(new URL("./fixtures/router-ced9c7d2.json", import.meta.url), "utf8")) as Record<string, number[] | string[]>;
+const router = JSON.parse(readFileSync(new URL("./fixtures/router-ced9c7d2.json", import.meta.url), "utf8")) as Record<string, unknown>;
 const ms = (key: string) => router[key] as number[];
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
 const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
@@ -32,6 +41,11 @@ describe("router tables (ced9c7d2)", () => {
     expect(scaled(SSMCS_FREQUENCY_STEPS_DECIHZ, 10)).toEqual(ms("ssmcsFrequencyHz"));
     expect([...SSMCS_PRESET_LABELS]).toEqual(router["sweetSpotLabels"]);
     expect([...HPF_WRITE_STOPS_HZ]).toEqual(ms("hpfStopsHz"));
+    expect(REVX_TIME_MS.map((type) => type.map((stops) => scaled(stops, 1000)))).toEqual(router["revxTimeSeconds"]);
+    expect(scaled(REV_R3_TIME_DECISECONDS, 10)).toEqual(ms("revR3TimeSeconds"));
+    expect(scaled(INITIAL_DELAY_DECIMS, 10)).toEqual(ms("initialDelayMs"));
+    expect([...REVX_FREQUENCY_HZ]).toEqual(ms("revxFrequencyHz"));
+    expect(scaled(FX2_FREQUENCY_DECIHZ, 10)).toEqual(ms("fx2FrequencyHz"));
   });
 
   it("plan, send and read every attack and decay stop through each setting that uses it", async () => {

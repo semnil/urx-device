@@ -71,6 +71,11 @@ function decoded<V>(value: V | undefined, observedAt: string): Reading<V> {
   return { value, observedAt };
 }
 
+/** The raw value of one numeric read and its receipt time (a prerequisite read). */
+export function readRawValue(context: OperationContext, at: ParameterAddress): Promise<{ raw: I64Text; observedAt: string }> {
+  return readValue(context, context.getNumeric(at));
+}
+
 export async function readDecoded<V>(
   context: OperationContext,
   at: ParameterAddress,

@@ -8,6 +8,7 @@ import { DUCKER_RULES } from "./ducker.js";
 import { SEND_RULES } from "./sends.js";
 import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE, type BUS_TOKENS } from "./buses.js";
 import { INSERT_FX_RULES, type INSERT_FX_EFFECTS } from "./insert-fx.js";
+import { FX_RETURN_RULES, type FX_RETURN_EFFECTS } from "./fx-return.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -118,6 +119,8 @@ export const settingDefinitions = frozen({
   "channel.insert-fx.on": { readable: true, writable: true, rule: INSERT_FX_RULES["channel.insert-fx.on"] },
   "bus.insert-fx.type": { readable: true, writable: true, rule: INSERT_FX_RULES["bus.insert-fx.type"] },
   "bus.insert-fx.on": { readable: true, writable: true, rule: INSERT_FX_RULES["bus.insert-fx.on"] },
+  "bus.fx.type": { readable: true, writable: true, rule: FX_RETURN_RULES["bus.fx.type"] },
+  "bus.fx.parameter": { readable: true, writable: true, rule: FX_RETURN_RULES["bus.fx.parameter"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -169,6 +172,16 @@ export interface ChannelSsmcsBandTarget {
 export interface BusTarget {
   readonly bus: (typeof BUS_TOKENS)[number];
   readonly band?: never;
+  readonly effect?: never;
+  readonly parameter?: never;
+}
+
+/** One FX-return parameter: the FX bus, the expected effect and the parameter name (F06-F). */
+export interface FxParameterTarget {
+  readonly bus: (typeof BUS_TOKENS)[number];
+  readonly effect: FxReturnType;
+  readonly parameter: string;
+  readonly band?: never;
 }
 
 /** One existing send, by source and destination token (F05-S). */
@@ -206,6 +219,11 @@ export type GateRange = number | "-inf";
 /** A compressor ratio: finite N for N:1, or infinity (F04-D). */
 export type CompRatio = number | "inf";
 export type CompKnee = "soft" | "medium" | "hard";
+
+/** An FX-return effect (F06-F). */
+export type FxReturnType = (typeof FX_RETURN_EFFECTS)[number];
+/** An FX-return parameter value: a number in its unit, "thru", a switch or a note token (F06-V). */
+export type FxParameterValue = number | string | boolean;
 
 /** An Insert-FX selection (F06-I). */
 export type InsertFxType = "none" | (typeof INSERT_FX_EFFECTS)[number];
@@ -313,6 +331,8 @@ export interface SettingTypes {
   "channel.insert-fx.on": { target: ChannelTarget; value: boolean };
   "bus.insert-fx.type": { target: BusTarget; value: InsertFxType };
   "bus.insert-fx.on": { target: BusTarget; value: boolean };
+  "bus.fx.type": { target: BusTarget; value: FxReturnType };
+  "bus.fx.parameter": { target: FxParameterTarget; value: FxParameterValue };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.
