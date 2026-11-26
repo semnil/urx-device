@@ -433,28 +433,105 @@ fn a_reply_that_keeps_arriving_in_pieces_still_stops_at_its_deadline() {
     );
 }
 
+/// A unit whose `/vd/synchronize` reply pauses after its first piece: it
+/// signals `first_sent`, waits for `release`, then sends the rest in 20
+/// pieces `pace` apart (at once when `pace` is zero). `/vd/device` is
+/// answered whole.
+fn stalling_unit(
+    first_sent: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    pace: Duration,
+) -> u16 {
+    use std::io::Write;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().unwrap();
+        for request in BufReader::new(stream).lines() {
+            let Ok(request) = request else { return };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            match uri_of(&request) {
+                "/vd/synchronize" => {
+                    let reply = get_reply("/vd/synchronize", online("<device-id-a>"));
+                    let (first, rest) = reply.split_at(8);
+                    let _ = writer.write_all(first);
+                    let _ = writer.flush();
+                    let _ = first_sent.send(());
+                    let _ = release.recv();
+                    if pace.is_zero() {
+                        let _ = writer.write_all(rest);
+                    } else {
+                        for piece in rest.chunks(rest.len().div_ceil(20)) {
+                            thread::sleep(pace);
+                            if writer
+                                .write_all(piece)
+                                .and_then(|()| writer.flush())
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                "/vd/device" => {
+                    let _ = writer.write_all(&get_reply(
+                        "/vd/device",
+                        firm_list(json!([{ "firm_name": "System", "firm_version": "9.9.9" }])),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    });
+    port
+}
+
 #[test]
 fn a_reply_that_keeps_arriving_in_pieces_is_cancellable() {
-    let a = dribbling_unit();
-    let center = center(&[(a.port, "URX44V")]);
+    // Cancelled once the first piece of the reply is out. The rest keeps
+    // arriving every 20 ms, inside the 50 ms poll, for about 400 ms after the
+    // cancel: a loop that reads on while data arrives, to the end of the line
+    // or of the reply, fails the bound.
+    let (first_sent, first) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let unit = stalling_unit(first_sent, released, Duration::from_millis(20));
+    let hub = center(&[(unit, "URX44V")]);
     let control = Control::new();
     let canceller = control.clone();
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(80));
-        canceller.cancel();
+        if first.recv().is_ok() {
+            canceller.cancel();
+            let _ = release.send(());
+        }
     });
-    let started = Instant::now();
     assert_eq!(
-        discover(&options(center.port), &control),
+        discover(&options(hub.port), &control),
         Err(Failure::Cancelled {
             phase: Phase::Discovery
         })
     );
+    let returned = Instant::now();
+    let cancelled = control.cancelled_at().expect("cancelled");
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        returned.duration_since(cancelled) < Duration::from_millis(200),
         "{:?}",
-        started.elapsed()
+        returned.duration_since(cancelled)
     );
+
+    // The same unit without the cancel: the reply completes and discovery succeeds.
+    let (first_sent, first) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let unit = stalling_unit(first_sent, released, Duration::from_millis(0));
+    let hub = center(&[(unit, "URX44V")]);
+    thread::spawn(move || {
+        if first.recv().is_ok() {
+            let _ = release.send(());
+        }
+    });
+    assert!(discover(&options(hub.port), &Control::new()).is_ok());
 }
 
 #[test]
