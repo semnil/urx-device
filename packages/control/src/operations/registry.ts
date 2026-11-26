@@ -137,6 +137,7 @@ import {
 } from "./device.js";
 import { integrationActive, integrationPostFaderSource, knobBank, panelSendsTarget } from "./integration-panel.js";
 import { knobAssignment } from "./knob.js";
+import { recorderCardPresent, recorderSource, recorderState, recorderTrackCount, sceneCurrent, sceneCursor } from "./scene-recorder.js";
 import {
   compOn,
   eqOn,
@@ -339,6 +340,12 @@ export const settingHandlers: SettingHandlers = {
   "integration.active": integrationActive,
   "integration.post-fader-source": integrationPostFaderSource,
   "panel.sends-target": panelSendsTarget,
+  "scene.current": sceneCurrent,
+  "scene.cursor": sceneCursor,
+  "recorder.state": recorderState,
+  "recorder.card-present": recorderCardPresent,
+  "recorder.track-count": recorderTrackCount,
+  "recorder.source": recorderSource,
 };
 
 function unknownId(): Promise<never> {

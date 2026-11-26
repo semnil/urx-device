@@ -14,6 +14,7 @@ import type {
   DeviceSettingRule,
   OutputSettingRule,
   OutputSideSettingRule,
+  TrackSettingRule,
   ContextStopsRule,
   FxParameterRule,
   GeqGainRule,
@@ -925,5 +926,20 @@ export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
       return writeRaw(context, at, raw, { requested, planned: p });
     },
   };
+}
+
+/** A recorder track setting whose handler is built from `rule`: the target names a track only. */
+export function trackRuleSetting<V>(rule: TrackSettingRule) {
+  return handler<V>((model, target) => {
+    const known = modelOf(model);
+    const own = targetOf<{ track?: unknown }>(target, ["track"]);
+    if (typeof own.track !== "number" || !Number.isInteger(own.track) || own.track < 1 || own.track > rule.tracks) {
+      return refuse("invalid_input");
+    }
+    if (!rule.models.includes(known)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(rule.paramId, own.track - 1), codec: codecOf(rule.value, known) };
+  });
 }
 

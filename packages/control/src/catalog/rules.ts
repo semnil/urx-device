@@ -6,7 +6,7 @@
 import type { ChannelKind } from "./channels.js";
 
 /** A public unit; null for unitless numbers. */
-export type ValueUnit = "dB" | "ms" | "s" | "min" | "Hz" | "%" | "bpm" | "ratio" | null;
+export type ValueUnit = "dB" | "ms" | "s" | "min" | "Hz" | "%" | "bpm" | "ratio" | "tracks" | null;
 
 /** A named value outside the finite range, with its exact raw value. */
 export interface Sentinel {
@@ -406,7 +406,17 @@ export interface KnobAssignmentRule {
   readonly triples: readonly (readonly [string, string, string])[];
 }
 
+/** A recorder track setting (F16-R): the target names a track 1…`tracks`; y = track − 1. */
+export interface TrackSettingRule {
+  readonly target: "track";
+  readonly tracks: number;
+  readonly paramId: number;
+  readonly models: readonly string[];
+  readonly value: ValueRule;
+}
+
 export type SettingRule =
+  | TrackSettingRule
   | KnobAssignmentRule
   | DeviceSettingRule
   | OutputSettingRule

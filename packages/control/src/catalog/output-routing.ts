@@ -57,7 +57,8 @@ const known = [...new Set(Object.values(byModel).flatMap((each) => each.map((lan
 const busLanes = (...buses: string[]) => buses.flatMap((bus) => [`${bus}-left`, `${bus}-right`]);
 const channelLanes = [...new Set(MODELS.flatMap((model) => lanes(model).map((lane) => lane.token).filter((token) => token.startsWith("channel-"))))];
 
-const source = (writes: readonly string[], tagged = false): PortChoiceRule => ({
+/** The F07-R source-lane codec with its own write list (shared by the recorder sources, F16-R). */
+export const sourceLaneRule = (writes: readonly string[], tagged = false): PortChoiceRule => ({
   kind: "port-choice",
   none: { value: "none", raw: "4294967295" },
   known,
@@ -67,13 +68,13 @@ const source = (writes: readonly string[], tagged = false): PortChoiceRule => ({
 });
 
 /** MAIN and LINE: none, STEREO, STREAMING, MIX 1/2 and MONITOR 1/2 lanes. */
-const ANALOG = source(["none", ...busLanes("stereo", "stream", "mix-1", "mix-2", "monitor-1", "monitor-2")]);
+const ANALOG = sourceLaneRule(["none", ...busLanes("stereo", "stream", "mix-1", "mix-2", "monitor-1", "monitor-2")]);
 /** USB outputs: none, STEREO, STREAMING, MIX 1/2 and every channel lane the model has. */
-const USB = source(["none", ...busLanes("stereo", "stream", "mix-1", "mix-2"), ...channelLanes]);
+const USB = sourceLaneRule(["none", ...busLanes("stereo", "stream", "mix-1", "mix-2"), ...channelLanes]);
 /** MONITOR 1/2: none, STEREO and MIX 1/2 lanes, written plain (F08-M). */
-const MONITOR = source(["none", ...busLanes("stereo", "mix-1", "mix-2")]);
+const MONITOR = sourceLaneRule(["none", ...busLanes("stereo", "mix-1", "mix-2")]);
 /** STREAMING: STEREO and MIX 1/2 lanes only, written tagged. */
-const STREAM = source(busLanes("stereo", "mix-1", "mix-2"), true);
+const STREAM = sourceLaneRule(busLanes("stereo", "mix-1", "mix-2"), true);
 
 /** Output destinations: the source-selectable ones and the fixed PHONES outputs. */
 export const OUTPUT_TOKENS = frozen(["main", "line", "usb-main-a", "usb-main-b", "usb-main-c", "usb-sub", "phones-1", "phones-2"] as const);
