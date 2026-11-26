@@ -104,9 +104,14 @@ describe("Insert-FX selector and on (F06-I)", () => {
         }
         expect(none.calls).toEqual([]);
       }
-      // MONITOR has no bus token here (F08-M names monitor-1 / monitor-2): `monitor` is an unknown name.
+      // MONITOR buses are known (F08-M: monitor-1 / monitor-2) and take no Insert-FX; a bare `monitor` is an unknown name.
       const none = new FakeTransport();
       for (const id of ["bus.insert-fx.type", "bus.insert-fx.on"]) {
+        for (const bus of ["monitor-1", "monitor-2"]) {
+          const c = new OperationContext(none, model);
+          expect((await failureOf(readAny(c, id, { bus })))?.code, `${id} ${bus}`).toBe("unsupported_operation");
+          expect((await failureOf(writeAny(c, id, { bus }, id.endsWith(".on") ? true : "none")))?.code, `${id} ${bus}`).toBe("unsupported_operation");
+        }
         expect((await failureOf(readAny(new OperationContext(none, model), id, { bus: "monitor" })))?.code, id).toBe("invalid_input");
       }
       expect(none.calls).toEqual([]);

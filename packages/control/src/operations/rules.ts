@@ -9,8 +9,14 @@ import type {
   BusSettingRule,
   ChannelBandSettingRule,
   ChannelSettingRule,
+  BusBandSettingRule,
+  BusSideSettingRule,
+  DeviceSettingRule,
+  OutputSettingRule,
+  OutputSideSettingRule,
   ContextStopsRule,
   FxParameterRule,
+  GeqGainRule,
   GridRule,
   PortChoiceRule,
   SendSettingRule,
@@ -131,12 +137,13 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
       return choices.find((choice) => choice.id === id)?.token;
     },
     plan: (value) => {
+      const writable = (token: string) => rule.writes === undefined || rule.writes.includes(token);
       if (value === rule.none.value) {
-        return { planned: value, raw: rule.none.raw };
+        return writable(value) ? { planned: value, raw: rule.none.raw } : "unsupported";
       }
       const choice = choices.find((each) => each.token === value);
-      if (choice !== undefined) {
-        return { planned: value, raw: `${choice.id}` };
+      if (choice !== undefined && writable(choice.token)) {
+        return { planned: value, raw: `${rule.tagged === true ? BigInt(choice.id) + PORT_TAG : choice.id}` };
       }
       return rule.known.includes(value as string) ? "unsupported" : undefined;
     },
@@ -269,16 +276,40 @@ export function ruleSetting<V>(rule: ChannelSettingRule) {
 }
 
 /**
+ * Each band's codec. For per-band rules, a choice another band takes (a
+ * known filter type on the wrong band) plans as unsupported, apart from an
+ * unknown name, which stays invalid.
+ */
+function bandCodecs(value: ChannelBandSettingRule["value"], bands: readonly string[]): Map<string, Codec> {
+  if (value.kind !== "by-band") {
+    return new Map(bands.map((band) => [band, codecOf(value)]));
+  }
+  const rules = Object.entries(value.rules).flatMap(([band, each]) => (each === undefined ? [] : [[band, each] as const]));
+  const siblings = new Set(rules.flatMap(([, each]) => (each.kind === "choice" ? each.choices : [])));
+  return new Map(
+    rules.map(([band, each]) => {
+      const codec = codecOf(each);
+      return [
+        band,
+        {
+          ...codec,
+          plan: (requested: unknown) => {
+            const planned = codec.plan(requested);
+            return planned === undefined && typeof requested === "string" && siblings.has(requested) ? "unsupported" : planned;
+          },
+        },
+      ] as const;
+    }),
+  );
+}
+
+/**
  * A band setting whose handler is built from `rule`: the target names a
  * channel and exactly one band, and takes no side.
  */
 export function bandRuleSetting<V>(rule: ChannelBandSettingRule) {
   const value = rule.value;
-  const codecs = new Map<string, Codec>(
-    value.kind === "by-band"
-      ? Object.entries(value.rules).flatMap(([band, each]) => (each === undefined ? [] : [[band, codecOf(each)] as const]))
-      : rule.bands.map((band) => [band, codecOf(value)]),
-  );
+  const codecs = bandCodecs(value, rule.bands);
   return handler<V>((model, target) => {
     const own = targetOf<{ channel?: unknown; band?: unknown; side?: unknown }>(target, ["channel", "band", "side"]);
     if (typeof own.band !== "string" || !rule.bands.includes(own.band)) {
@@ -346,15 +377,18 @@ export function busRuleSetting<V, I = V>(rule: BusSettingRule) {
   );
   return handler<V, I>((model, target, write) => {
     modelOf(model);
-    const own = targetOf<{ bus?: unknown }>(target, ["bus"]);
-    if (typeof own.bus !== "string" || !rule.known.includes(own.bus)) {
+    // A side key is taken only as undefined, as for the band targets.
+    const own = targetOf<{ bus?: unknown; side?: unknown }>(target, ["bus", "side"]);
+    if (own.side !== undefined || typeof own.bus !== "string" || !rule.known.includes(own.bus)) {
       return refuse("invalid_input");
     }
     const at = Object.hasOwn(rule.address, own.bus) ? rule.address[own.bus] : undefined;
     if (at === undefined || (write && !at.write)) {
       return refuse("unsupported_operation");
     }
-    return { at: address(at.paramId, at.y), codec: perBus.get(own.bus) ?? shared };
+    const value = at.value ?? rule.value;
+    const codec = value.kind === "port-choice" ? codecOf(value, model) : (perBus.get(own.bus) ?? shared);
+    return { at: address(at.paramId, at.y), codec };
   });
 }
 
@@ -472,5 +506,241 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
       return writeRaw(context, leaf(resolved), result.raw as I64Text, { requested, planned: result.planned as V });
     },
   };
+}
+
+const SIDES = ["left", "right"] as const;
+
+/** The bus and side a target names, and nothing else (`extra` keys allowed besides). */
+function busSide(model: string, target: unknown, known: readonly string[], extra: readonly string[] = []) {
+  modelOf(model);
+  const own = targetOf<{ bus?: unknown; side?: unknown; band?: unknown }>(target, ["bus", "side", ...extra]);
+  if (typeof own.bus !== "string" || !known.includes(own.bus) || !SIDES.includes(own.side as "left")) {
+    return refuse("invalid_input");
+  }
+  return { bus: own.bus, side: own.side as (typeof SIDES)[number], band: own.band };
+}
+
+/** A per-side bus setting whose handler is built from `rule`: the target names a bus and one side. */
+export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
+  // A port choice depends on the model; any other codec is built once.
+  const fixed = rule.value.kind === "port-choice" ? undefined : codecOf(rule.value);
+  return handler<V>((model, target, write) => {
+    const { bus, side } = busSide(model, target, rule.known);
+    const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
+    if (at === undefined || (write && !at.write)) {
+      return refuse("unsupported_operation");
+    }
+    const codec = at.value === undefined ? (fixed ?? codecOf(rule.value, model)) : codecOf(at.value, model);
+    const paramId = typeof at.paramId === "number" ? at.paramId : at.paramId[side];
+    return { at: address(paramId, at.y[side]), codec };
+  });
+}
+
+/**
+ * The one representative EQ Type read a GEQ write or dry run makes first
+ * (F07-G): the required type proceeds, another known type is
+ * `precondition_failed`, any other value `invalid_response`.
+ */
+async function requireEqType(context: OperationContext, rule: GeqGainRule, at: { paramId: number; y: number }): Promise<void> {
+  const type = await readRawValue(context, address(at.paramId, at.y));
+  const token = rule.eqType.choices.find((choice) => choice.raw === type.raw)?.token;
+  if (token === undefined) {
+    failed("invalid_response");
+  }
+  if (token !== rule.eqType.required) {
+    failed("precondition_failed");
+  }
+}
+
+/**
+ * A GEQ bank setting other than gain (F07-G: On, Link, Limit) built on
+ * `base`: reads go straight to the field; a write or dry run checks the
+ * target and value, then reads the bus's EQ Type once (`requireEqType`),
+ * then the write makes its one request. A connection-free preview refuses
+ * it, since it needs the live type; `validate` makes the static checks.
+ */
+export function eqTypeGated<V, I = V>(base: ReturnType<typeof handler<V, I>>, gain: GeqGainRule) {
+  /**
+   * The caller's target, checked and read once before any request: its keys
+   * must be `bus` and `side` only (anything else is refused before any other
+   * value is read), and the type read and the write then address the same
+   * bus and side even if the caller's object changes meanwhile.
+   */
+  const fixed = (target: unknown): unknown => {
+    const own = targetOf<{ bus?: unknown; side?: unknown }>(target, ["bus", "side"]);
+    const copy: { bus?: unknown; side?: unknown } = {};
+    if (Object.hasOwn(own, "bus")) {
+      copy.bus = own.bus;
+    }
+    if (Object.hasOwn(own, "side")) {
+      copy.side = own.side;
+    }
+    return Object.freeze(copy);
+  };
+  const eqTypeOf = (target: unknown) => {
+    const bus = (target as { bus?: unknown }).bus as string;
+    return (gain.address[bus] as { eqType: { paramId: number; y: number } }).eqType;
+  };
+  return {
+    ...base,
+    plan(model: string, target: unknown, requested: I): WritePlan<I> {
+      base.plan(model, target, requested);
+      return refuse("invalid_input");
+    },
+    validate(model: string, target: unknown, requested: I): void {
+      base.plan(model, target, requested);
+    },
+    async dryRun(context: OperationContext, target: unknown, requested: I): Promise<WritePlan<I>> {
+      const own = fixed(target);
+      const plan = base.plan(context.model, own, requested);
+      await requireEqType(context, gain, eqTypeOf(own));
+      return plan;
+    },
+    async write(context: OperationContext, target: unknown, requested: I): Promise<WriteResult<I>> {
+      const own = fixed(target);
+      base.plan(context.model, own, requested);
+      await requireEqType(context, gain, eqTypeOf(own));
+      return base.write(context, own, requested);
+    },
+  };
+}
+
+/**
+ * Flex12GEQ band gain (F07-G): a read takes the band's address directly; a
+ * write (or dry-run) first reads the bus's EQ Type, which must be the GEQ,
+ * then the side's Limit, whose range bounds the request before rounding.
+ */
+export function geqGainSetting(rule: GeqGainRule) {
+  const resolve = (model: string, target: unknown, write: boolean) => {
+    const { bus, side, band } = busSide(model, target, rule.known, ["band"]);
+    if (typeof band !== "string" || !rule.bands.includes(band)) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
+    if (at === undefined || (write && !at.writableBands.includes(band))) {
+      return refuse("unsupported_operation");
+    }
+    const index = rule.bands.indexOf(band);
+    const leaf: ParameterAddress =
+      at.perBand === "x"
+        ? { paramId: at.paramId, x: `${index}`, y: `${at.y[side]}` }
+        : address(at.paramId + index, at.y[side]);
+    return { at, side, leaf };
+  };
+  const union = { min: Math.min(...rule.limits.map((limit) => limit.min)), max: Math.max(...rule.limits.map((limit) => limit.max)) };
+  const staticCheck = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) && value >= union.min && value <= union.max ? value : refuse("invalid_input");
+  /** The EQ Type and Limit reads; the side's current range. */
+  const prepare = async (context: OperationContext, resolved: ReturnType<typeof resolve>) => {
+    await requireEqType(context, rule, resolved.at.eqType);
+    const limit = await readRawValue(context, address(resolved.at.limit, resolved.at.y[resolved.side]));
+    const index = decodeInteger(limit.raw, 0, rule.limits.length - 1);
+    return index === undefined ? failed("invalid_response") : (rule.limits[index] as { min: number; max: number });
+  };
+  const planWithin = (range: { min: number; max: number }, value: number) => {
+    const planned = planOnGrid(value, range.min, range.max, 1 / rule.step);
+    return planned === undefined ? refuse("invalid_input") : { planned, raw: `${Math.round(planned * rule.scale)}` as I64Text };
+  };
+  return {
+    read(context: OperationContext, target: unknown): Promise<Reading<number>> {
+      const { leaf } = resolve(context.model, target, false);
+      return readDecoded(context, leaf, (raw) => {
+        const value = decodeInteger(raw, rule.read.min, rule.read.max);
+        return value === undefined ? undefined : value / rule.scale;
+      });
+    },
+    /** No static plan: the range depends on the live Limit (`dryRun` reads it). */
+    plan(model: string, target: unknown, requested: number): WritePlan<number> {
+      resolve(model, target, true);
+      staticCheck(requested);
+      return refuse("invalid_input");
+    },
+    /** The static checks alone: the target and the union of every Limit's range. */
+    validate(model: string, target: unknown, requested: number): void {
+      resolve(model, target, true);
+      staticCheck(requested);
+    },
+    async dryRun(context: OperationContext, target: unknown, requested: number): Promise<WritePlan<number>> {
+      const resolved = resolve(context.model, target, true);
+      const value = staticCheck(requested);
+      const { planned } = planWithin(await prepare(context, resolved), value);
+      return { requested, planned };
+    },
+    async write(context: OperationContext, target: unknown, requested: number): Promise<WriteResult<number>> {
+      const resolved = resolve(context.model, target, true);
+      // Static checks before any read.
+      const value = staticCheck(requested);
+      const { planned, raw } = planWithin(await prepare(context, resolved), value);
+      return writeRaw(context, resolved.leaf, raw, { requested, planned });
+    },
+  };
+}
+
+/** A bus band setting whose handler is built from `rule`: the target names a bus and one band. */
+export function busBandRuleSetting<V>(rule: BusBandSettingRule) {
+  const value = rule.value;
+  const codecs = bandCodecs(value, rule.bands);
+  return handler<V>((model, target, write) => {
+    modelOf(model);
+    // A side key is taken only as undefined, as for the channel band targets.
+    const own = targetOf<{ bus?: unknown; band?: unknown; side?: unknown }>(target, ["bus", "band", "side"]);
+    if (
+      own.side !== undefined ||
+      typeof own.bus !== "string" ||
+      !rule.known.includes(own.bus) ||
+      typeof own.band !== "string" ||
+      !rule.bands.includes(own.band)
+    ) {
+      return refuse("invalid_input");
+    }
+    const bands = Object.hasOwn(rule.address, own.bus) ? rule.address[own.bus] : undefined;
+    const at = bands !== undefined && Object.hasOwn(bands, own.band) ? bands[own.band] : undefined;
+    const codec = codecs.get(own.band);
+    if (at === undefined || codec === undefined || (write && !at.write)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(at.paramId, at.y), codec };
+  });
+}
+
+/** An output per-side setting whose handler is built from `rule`: the target names an output and one side. */
+export function outputSideRuleSetting<V>(rule: OutputSideSettingRule) {
+  return handler<V>((model, target) => {
+    const known = modelOf(model);
+    const own = targetOf<{ output?: unknown; side?: unknown }>(target, ["output", "side"]);
+    if (typeof own.output !== "string" || !rule.known.includes(own.output) || !SIDES.includes(own.side as "left")) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.address, own.output) ? rule.address[own.output] : undefined;
+    if (at === undefined || !at.models.includes(known)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(at.paramId, at.y[own.side as "left" | "right"]), codec: codecOf(at.value ?? rule.value, known) };
+  });
+}
+
+/** An output setting whose handler is built from `rule`: the target names an output only. */
+export function outputRuleSetting<V>(rule: OutputSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target) => {
+    modelOf(model);
+    // A side key is taken only as undefined, as the target type declares.
+    const own = targetOf<{ output?: unknown; side?: unknown }>(target, ["output", "side"]);
+    if (own.side !== undefined || typeof own.output !== "string" || !rule.known.includes(own.output)) {
+      return refuse("invalid_input");
+    }
+    const at = Object.hasOwn(rule.address, own.output) ? rule.address[own.output] : undefined;
+    return at === undefined ? refuse("unsupported_operation") : { at: address(at.paramId, at.y), codec };
+  });
+}
+
+/** A device-wide setting whose handler is built from `rule`: the target has no keys. */
+export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target) => {
+    modelOf(model);
+    targetOf<object>(target, []);
+    return { at: address(rule.address.paramId, rule.address.y), codec };
+  });
 }
 

@@ -9,6 +9,9 @@ import { SEND_RULES } from "./sends.js";
 import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE, type BUS_TOKENS } from "./buses.js";
 import { INSERT_FX_RULES, type INSERT_FX_EFFECTS } from "./insert-fx.js";
 import { FX_RETURN_RULES, type FX_RETURN_EFFECTS } from "./fx-return.js";
+import { OUTPUT_EQ_RULES, type GEQ_BANDS } from "./output-eq.js";
+import { OUTPUT_PEQ_RULES } from "./output-peq.js";
+import { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES, type OUTPUT_TOKENS } from "./output-routing.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -121,6 +124,31 @@ export const settingDefinitions = frozen({
   "bus.insert-fx.on": { readable: true, writable: true, rule: INSERT_FX_RULES["bus.insert-fx.on"] },
   "bus.fx.type": { readable: true, writable: true, rule: FX_RETURN_RULES["bus.fx.type"] },
   "bus.fx.parameter": { readable: true, writable: true, rule: FX_RETURN_RULES["bus.fx.parameter"] },
+  "bus.eq.type": { readable: true, writable: false, rule: OUTPUT_EQ_RULES["bus.eq.type"] },
+  "bus.eq.on": { readable: true, writable: false, rule: OUTPUT_EQ_RULES["bus.eq.on"] },
+  "bus.geq.link": { readable: true, writable: true, rule: OUTPUT_EQ_RULES["bus.geq.link"] },
+  "bus.geq.on": { readable: true, writable: true, rule: OUTPUT_EQ_RULES["bus.geq.on"] },
+  "bus.geq.limit": { readable: true, writable: true, rule: OUTPUT_EQ_RULES["bus.geq.limit"] },
+  "bus.geq.gain": { readable: true, writable: true, rule: OUTPUT_EQ_RULES["bus.geq.gain"] },
+  "bus.peq.band.on": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.on"] },
+  "bus.peq.band.type": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.type"] },
+  "bus.peq.band.q": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.q"] },
+  "bus.peq.band.frequency": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.frequency"] },
+  "bus.peq.band.gain": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.band.gain"] },
+  "bus.peq.one-knob.on": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.on"] },
+  "bus.peq.one-knob.type": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.type"] },
+  "bus.peq.one-knob.level": { readable: true, writable: true, rule: OUTPUT_PEQ_RULES["bus.peq.one-knob.level"] },
+  "bus.delay.on": { readable: true, writable: true, rule: STREAM_DELAY_RULES["bus.delay.on"] },
+  "bus.delay.time": { readable: true, writable: true, rule: STREAM_DELAY_RULES["bus.delay.time"] },
+  "bus.delay.frame-rate": { readable: true, writable: true, rule: STREAM_DELAY_RULES["bus.delay.frame-rate"] },
+  "output.source": { readable: true, writable: true, rule: OUTPUT_SOURCE_RULES["output.source"] },
+  "bus.source": { readable: true, writable: true, rule: OUTPUT_SOURCE_RULES["bus.source"] },
+  "bus.mono": { readable: true, writable: true, rule: MONITOR_RULES["bus.mono"] },
+  "bus.cue-interrupt": { readable: true, writable: true, rule: MONITOR_RULES["bus.cue-interrupt"] },
+  "output.level": { readable: true, writable: true, rule: MONITOR_RULES["output.level"] },
+  "channel.cue": { readable: true, writable: true, rule: CUE_RULES["channel.cue"] },
+  "bus.cue": { readable: true, writable: true, rule: CUE_RULES["bus.cue"] },
+  "cue.mode": { readable: true, writable: true, rule: CUE_RULES["cue.mode"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -171,9 +199,52 @@ export interface ChannelSsmcsBandTarget {
 /** One bus by its token (F05-B). */
 export interface BusTarget {
   readonly bus: (typeof BUS_TOKENS)[number];
+  /** A whole bus takes no side; one given is undefined only. */
+  readonly side?: undefined;
   readonly band?: never;
   readonly effect?: never;
   readonly parameter?: never;
+}
+
+/** One side of an output bus (F07-G). */
+export interface BusSideTarget {
+  readonly bus: (typeof BUS_TOKENS)[number];
+  readonly side: "left" | "right";
+  readonly band?: never;
+}
+
+/** A whole output destination (F08-M: the PHONES levels). */
+export interface OutputTarget {
+  readonly output: (typeof OUTPUT_TOKENS)[number];
+  readonly side?: undefined;
+  readonly band?: never;
+}
+
+/** A device-wide setting's target: no keys (F08-C). */
+export type DeviceTarget = Readonly<Record<PropertyKey, never>>;
+
+/** The device-wide CUE Mode (F08-C). */
+export type CueMode = "mix" | "last";
+
+/** One side of a physical or USB output destination (F07-R). */
+export interface OutputSideTarget {
+  readonly output: "main" | "line" | "usb-main-a" | "usb-main-b" | "usb-main-c" | "usb-sub";
+  readonly side: "left" | "right";
+  readonly band?: never;
+}
+
+/** One output PEQ band of a bus (F07-P). It takes no side. */
+export interface BusBandTarget {
+  readonly bus: (typeof BUS_TOKENS)[number];
+  readonly band: EqBand;
+  readonly side?: undefined;
+}
+
+/** One Flex12GEQ band of one side of an output bus, by its exact Hz identifier (F07-G). */
+export interface BusSideBandTarget {
+  readonly bus: (typeof BUS_TOKENS)[number];
+  readonly side: "left" | "right";
+  readonly band: (typeof GEQ_BANDS)[number];
 }
 
 /** One FX-return parameter: the FX bus, the expected effect and the parameter name (F06-F). */
@@ -224,6 +295,13 @@ export type CompKnee = "soft" | "medium" | "hard";
 export type FxReturnType = (typeof FX_RETURN_EFFECTS)[number];
 /** An FX-return parameter value: a number in its unit, "thru", a switch or a note token (F06-V). */
 export type FxParameterValue = number | string | boolean;
+
+/** An output EQ type (F07-G). */
+export type OutputEqType = "peq" | "flex12-geq";
+/** A Flex12GEQ Link direction (F07-G). */
+export type GeqLink = "off" | "left-to-right" | "right-to-left";
+/** A Flex12GEQ Limit (F07-G). */
+export type GeqLimit = "plus-minus-15" | "plus-minus-12" | "plus-minus-6" | "minus-24-to-0";
 
 /** An Insert-FX selection (F06-I). */
 export type InsertFxType = "none" | (typeof INSERT_FX_EFFECTS)[number];
@@ -333,6 +411,31 @@ export interface SettingTypes {
   "bus.insert-fx.on": { target: BusTarget; value: boolean };
   "bus.fx.type": { target: BusTarget; value: FxReturnType };
   "bus.fx.parameter": { target: FxParameterTarget; value: FxParameterValue };
+  "bus.eq.type": { target: BusTarget; value: OutputEqType };
+  "bus.eq.on": { target: BusTarget; value: boolean };
+  "bus.geq.link": { target: BusTarget; value: GeqLink };
+  "bus.geq.on": { target: BusSideTarget; value: boolean };
+  "bus.geq.limit": { target: BusSideTarget; value: GeqLimit };
+  "bus.geq.gain": { target: BusSideBandTarget; value: number };
+  "bus.peq.band.on": { target: BusBandTarget; value: boolean };
+  "bus.peq.band.type": { target: BusBandTarget; value: EqBandType };
+  "bus.peq.band.q": { target: BusBandTarget; value: number };
+  "bus.peq.band.frequency": { target: BusBandTarget; value: number };
+  "bus.peq.band.gain": { target: BusBandTarget; value: number };
+  "bus.peq.one-knob.on": { target: BusTarget; value: boolean };
+  "bus.peq.one-knob.type": { target: BusTarget; value: EqOneKnobType };
+  "bus.peq.one-knob.level": { target: BusTarget; value: number };
+  "bus.delay.on": { target: BusTarget; value: boolean };
+  "bus.delay.time": { target: BusTarget; value: number };
+  "bus.delay.frame-rate": { target: BusTarget; value: string };
+  "output.source": { target: OutputSideTarget; value: string };
+  "bus.source": { target: BusSideTarget; value: string };
+  "bus.mono": { target: BusTarget; value: boolean };
+  "bus.cue-interrupt": { target: BusTarget; value: boolean };
+  "output.level": { target: OutputTarget; value: number };
+  "channel.cue": { target: ChannelTarget; value: boolean };
+  "bus.cue": { target: BusTarget; value: boolean };
+  "cue.mode": { target: DeviceTarget; value: CueMode };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

@@ -90,6 +90,10 @@ export interface PortChoiceRule {
   readonly none: Sentinel;
   readonly known: readonly string[];
   readonly byModel: { readonly [model: string]: readonly { readonly token: string; readonly id: number }[] };
+  /** The tokens a write may send, `none` included where listed; absent: every readable token and `none`. */
+  readonly writes?: readonly string[];
+  /** Whether a write sends the identifier with the high tag bit set. */
+  readonly tagged?: boolean;
 }
 
 /**
@@ -253,4 +257,116 @@ export interface FxParameterRule {
   readonly knownParameters: readonly string[];
 }
 
-export type SettingRule = ChannelSettingRule | ChannelBandSettingRule | SendSettingRule | BusSettingRule | FxParameterRule;
+/** One side of a bus: its parameter ID and the y of each side. */
+export interface BusSideAddress {
+  /** One ID for both sides, or one per side. */
+  readonly paramId: number | { readonly left: number; readonly right: number };
+  readonly y: { readonly left: number; readonly right: number };
+  readonly write: boolean;
+  /** This bus's own value rule, replacing the shared one. */
+  readonly value?: ValueRule;
+}
+
+/** A per-side bus setting: the target names a bus and a side. */
+export interface BusSideSettingRule {
+  readonly target: "bus-side";
+  readonly known: readonly string[];
+  readonly address: { readonly [bus: string]: BusSideAddress | undefined };
+  readonly value: ValueRule;
+}
+
+/**
+ * Flex12GEQ band gain (F07-G): the target names a bus, a side and a band
+ * identifier. A write first reads the bus's EQ Type (representative y), which
+ * must be `type`, then the side's Limit, whose range bounds the request
+ * before rounding to `step`. Raw = dB × scale.
+ */
+export interface GeqGainRule {
+  readonly target: "bus-side-band";
+  readonly known: readonly string[];
+  readonly bands: readonly string[];
+  readonly address: {
+    readonly [bus: string]:
+      | {
+          /** The ID of band 0; `perBand` "x" steps x by the band index, "id" steps the ID. */
+          readonly paramId: number;
+          readonly perBand: "x" | "id";
+          readonly y: { readonly left: number; readonly right: number };
+          /** The bands a write may address; the others are read-only. */
+          readonly writableBands: readonly string[];
+          readonly eqType: { readonly paramId: number; readonly y: number };
+          readonly limit: number;
+        }
+      | undefined;
+  };
+  readonly eqType: { readonly required: string; readonly choices: readonly { readonly token: string; readonly raw: string }[] };
+  readonly limits: readonly { readonly token: string; readonly min: number; readonly max: number }[];
+  readonly unit: "dB";
+  readonly scale: number;
+  readonly step: number;
+  readonly read: { readonly min: number; readonly max: number };
+}
+
+/**
+ * A band setting of a bus (F07-P): the target names a bus and one band. A
+ * band without an address lacks the setting; `write` false leaves the write
+ * unbound.
+ */
+export interface BusBandSettingRule {
+  readonly target: "bus-band";
+  readonly known: readonly string[];
+  readonly bands: readonly string[];
+  readonly address: {
+    readonly [bus: string]: { readonly [band: string]: { readonly paramId: number; readonly y: number; readonly write: boolean } | undefined } | undefined;
+  };
+  readonly value: ValueRule | ByBandRule;
+}
+
+/**
+ * An output destination's per-side setting (F07-R): the target names an
+ * output and a side. An output a model lacks is unsupported there; an address
+ * entry's `value` replaces the shared value rule for that output.
+ */
+export interface OutputSideSettingRule {
+  readonly target: "output-side";
+  readonly known: readonly string[];
+  readonly address: {
+    readonly [output: string]:
+      | {
+          readonly paramId: number;
+          readonly y: { readonly left: number; readonly right: number };
+          readonly models: readonly string[];
+          readonly value?: ValueRule;
+        }
+      | undefined;
+  };
+  readonly value: ValueRule;
+}
+
+/** An output destination's whole setting (F08-M): the target names an output only. */
+export interface OutputSettingRule {
+  readonly target: "output";
+  readonly known: readonly string[];
+  readonly address: { readonly [output: string]: { readonly paramId: number; readonly y: number } | undefined };
+  readonly value: ValueRule;
+}
+
+/** A device-wide setting (F08-C): the target is empty. */
+export interface DeviceSettingRule {
+  readonly target: "device";
+  readonly address: { readonly paramId: number; readonly y: number };
+  readonly value: ValueRule;
+}
+
+export type SettingRule =
+  | DeviceSettingRule
+  | OutputSettingRule
+  | OutputSideSettingRule
+  | BusBandSettingRule
+  | ChannelSettingRule
+  | ChannelBandSettingRule
+  | SendSettingRule
+  | BusSettingRule
+  | FxParameterRule
+  | BusSideSettingRule
+  | GeqGainRule;
