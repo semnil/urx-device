@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { settingHandlers } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -110,6 +111,16 @@ describe("recorder (F16-R)", () => {
     expect(() => plan("none", { track: 1 }, "URX22")).toThrow(/unsupported_operation/);
     for (const raw of ["12", "340", "-1"]) {
       expect((await observe("recorder.source", raw, "URX44", { track: 1 })) as { code?: string }, raw).toMatchObject({ code: "invalid_response" });
+    }
+  });
+});
+
+describe("scene and recorder reads expose no write path", () => {
+  it("have no plan, write, validation or dry run in the public handler table", () => {
+    for (const id of ["scene.current", "scene.cursor", "recorder.state", "recorder.card-present", "recorder.track-count"] as const) {
+      const handler = settingHandlers[id] as unknown as Record<string, unknown>;
+      expect(["plan", "write", "validate", "dryRun"].filter((key) => key in handler), id).toEqual([]);
+      expect(typeof handler["read"], id).toBe("function");
     }
   });
 });
