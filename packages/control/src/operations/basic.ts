@@ -4,7 +4,7 @@
 
 import { BASIC_RULES } from "../catalog/basic-rules.js";
 import type { ChannelColor, ChannelName, FaderLevel, PanMode, Polarity, ProcessingMode, RecPoint } from "../catalog/settings.js";
-import { channelSideRuleSetting, inputRuleSetting, pairRuleSetting, ruleSetting, sourceRuleSetting } from "./rules.js";
+import { channelSideRuleSetting, inputRuleSetting, pairRuleSetting, readOnly, ruleSetting, sourceRuleSetting } from "./rules.js";
 
 const rules = BASIC_RULES;
 
@@ -12,7 +12,7 @@ export const inputGain = inputRuleSetting<number>(rules["input.gain"]);
 export const inputPhantom = inputRuleSetting<boolean>(rules["input.phantom"]);
 export const inputHiZ = inputRuleSetting<boolean>(rules["input.hi-z"]);
 export const inputClipSafe = inputRuleSetting<boolean>(rules["input.clip-safe"]);
-export const inputClipSafeActive = inputRuleSetting<boolean>(rules["input.clip-safe-active"]);
+export const inputClipSafeActive = readOnly(inputRuleSetting<boolean>(rules["input.clip-safe-active"]));
 export const sourceGain = sourceRuleSetting<number>(rules["source.gain"]);
 
 export const channelOn = ruleSetting<boolean>(rules["channel.on"]);
@@ -20,7 +20,7 @@ export const channelFader = ruleSetting<FaderLevel>(rules["channel.fader"]);
 export const channelPan = ruleSetting<number>(rules["channel.pan"]);
 export const channelPolarity = channelSideRuleSetting<Polarity>(rules["channel.polarity"]);
 export const channelSource = channelSideRuleSetting<string>(rules["channel.source"]);
-export const channelStereoLink = pairRuleSetting<boolean>(rules["channel.stereo-link"]);
+export const channelStereoLink = readOnly(pairRuleSetting<boolean>(rules["channel.stereo-link"]));
 export const channelPanMode = pairRuleSetting<PanMode>(rules["channel.pan-mode"]);
 export const channelName = ruleSetting<ChannelName, string>(rules["channel.name"]);
 export const channelColor = ruleSetting<ChannelColor>(rules["channel.color"]);

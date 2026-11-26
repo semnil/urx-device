@@ -1,3 +1,4 @@
+import { settingHandlers } from "../src/operations/registry.js";
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
 import { BASIC_RULES } from "../src/catalog/basic-rules.js";
@@ -226,6 +227,49 @@ describe("setting rules (K35 definition metadata)", () => {
         expect(plan(id, target, rule.sentinel.value), id).toBe(rule.sentinel.value);
         expect(await wire(id, target, rule.sentinel.value), id).toBe(rule.sentinel.raw);
         expect(await observed(id, target, rule.sentinel.raw), id).toEqual({ value: rule.sentinel.value });
+      }
+    }
+  });
+});
+
+describe("every read-only setting exposes no write path", () => {
+  it("has no plan, write, validation or dry run where the setting has no write on any target", () => {
+    for (const id of [
+      "input.clip-safe-active",
+      "channel.stereo-link",
+      "device.console-lock",
+      "knob.bank",
+      "integration.active",
+      "scene.current",
+      "scene.cursor",
+      "recorder.state",
+      "recorder.card-present",
+      "recorder.track-count",
+    ]) {
+      expect((settingDefinitions as Record<string, { writable: boolean }>)[id]?.writable, id).toBe(false);
+      const handler = (settingHandlers as unknown as Record<string, Record<string, unknown>>)[id] ?? {};
+      expect(["plan", "write", "validate", "dryRun"].filter((key) => key in handler), id).toEqual([]);
+    }
+  });
+
+  it("sends nothing from a direct write where every target's write is unbound", async () => {
+    for (const [id, target, value] of [
+      ["send.pan", { source: "channel-1", destination: "mix-1" }, 0],
+      ["bus.type", { bus: "mix-1" }, "fixed"],
+      ["bus.eq.type", { bus: "stereo" }, "peq"],
+      ["bus.eq.on", { bus: "mix-1" }, true],
+    ] as const) {
+      for (const model of ["URX22", "URX44", "URX44V"] as const) {
+        const none = new FakeTransport();
+        const handler = (settingHandlers as unknown as Record<string, { write: (c: OperationContext, t: unknown, v: unknown) => Promise<unknown> }>)[id];
+        const code = await Promise.resolve()
+          .then(() => handler?.write(new OperationContext(none, model), target, value))
+          .then(
+          () => "accepted",
+          (error: unknown) => operationFailureOf(error)?.code,
+        );
+        expect(code, `${model} ${id}`).toBe("unsupported_operation");
+        expect(none.calls, `${model} ${id}`).toEqual([]);
       }
     }
   });
