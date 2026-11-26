@@ -809,6 +809,10 @@ export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
       planned(model, target, requested);
       return refuse("invalid_input");
     },
+    /** The static checks alone: model, target and value; the prerequisites are read by the operation. */
+    validate(model: string, target: unknown, requested: V): void {
+      planned(model, target, requested);
+    },
     async dryRun(context: OperationContext, target: unknown, requested: V): Promise<WritePlan<V>> {
       const { planned: p } = planned(context.model, target, requested);
       await prepare(context);

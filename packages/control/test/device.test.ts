@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { dryRunSetting, previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, previewSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -115,6 +115,15 @@ describe("clock (F11-C) and Console Lock read (F20-L)", () => {
     expect(await dryRunSetting(new OperationContext(transport, "URX44"), "device.sample-rate", {}, 176400)).toEqual({ requested: 176400, planned: 176400 });
     expect(transport.calls.map((call) => call.address.paramId)).toEqual([848, 836]);
     expect(() => previewSetting("URX44", "device.sample-rate", {}, 48000)).toThrow(/invalid_input/);
+    // Without a device, validation checks the value only: the prerequisites are the operation's reads.
+    for (const model of ["URX22", "URX44", "URX44V"]) {
+      for (const rate of [44100, 48000, 88200, 96000, 176400, 192000]) {
+        expect(() => validateSetting(model, "device.sample-rate", {}, rate), `${model} ${rate}`).not.toThrow();
+      }
+      expect(() => validateSetting(model, "device.sample-rate", {}, 32000), model).toThrow(/invalid_input/);
+      expect(() => validateSetting(model, "device.follow-usb", {}, true), model).not.toThrow();
+      expect(() => validateSetting(model, "device.follow-usb", {}, "on" as never), model).toThrow(/invalid_input/);
+    }
     for (const [id, raw, value] of [
       ["device.sample-rate", "44100", 44100],
       ["device.sample-rate", "192000", 192000],
