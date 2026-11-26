@@ -47,19 +47,24 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
           ["bus.geq.on", ids.geqOn, "0", false, true, "1"],
           ["bus.geq.limit", ids.limit, "3", "minus-24-to-0", "plus-minus-6", "2"],
         ] as const) {
-          const transport = new FakeTransport().script("getNumeric", read(raw)).script("setNumeric", accepted);
+          const transport = new FakeTransport().script("getNumeric", read(raw), read("2")).script("setNumeric", accepted);
           const c = new OperationContext(transport, "URX44");
           expect((await readAny(c, id, { bus, side })).value, `${bus} ${side} ${id}`).toBe(value);
           await writeAny(c, id, { bus, side }, write);
+          // The write reads the representative EQ Type first (F07-G), then sends once.
           expect(transport.calls.map(({ address, value: sent }) => ({ address, sent }))).toEqual([
             { address: at(paramId, ids[side]), sent: undefined },
+            { address: at(ids.type, ids.rep), sent: undefined },
             { address: at(paramId, ids[side]), sent: wire },
           ]);
         }
       }
-      const link = new FakeTransport().script("setNumeric", accepted);
+      const link = new FakeTransport().script("getNumeric", read("2")).script("setNumeric", accepted);
       await writeAny(new OperationContext(link, "URX44"), "bus.geq.link", { bus }, "left-to-right");
-      expect(link.calls.map(({ address, value }) => ({ address, value }))).toEqual([{ address: at(ids.link, ids.rep), value: "1" }]);
+      expect(link.calls.map(({ address, value }) => ({ address, value }))).toEqual([
+        { address: at(ids.type, ids.rep), value: undefined },
+        { address: at(ids.link, ids.rep), value: "1" },
+      ]);
     }
     // EQ Type and EQ On writes await F03-G evidence: known read-only settings.
     for (const id of ["bus.eq.type", "bus.eq.on"]) {
@@ -70,6 +75,38 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
     for (const raw of ["1", "3"]) {
       const transport = new FakeTransport().script("getNumeric", read(raw));
       expect((await failureOf(readAny(new OperationContext(transport, "URX44"), "bus.eq.type", { bus: "stereo" })))?.code, raw).toBe("invalid_response");
+    }
+  });
+
+  it("write or dry-run GEQ On, Link and Limit only while the bus's EQ Type is Flex12GEQ", async () => {
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      for (const [bus, ids] of Object.entries(BUS)) {
+        for (const [id, target, value] of [
+          ["bus.geq.on", { bus, side: "right" }, true],
+          ["bus.geq.link", { bus }, "off"],
+          ["bus.geq.limit", { bus, side: "left" }, "plus-minus-12"],
+        ] as const) {
+          const label = `${model} ${bus} ${id}`;
+          for (const [type, code] of [
+            ["0", "precondition_failed"],
+            ["1", "invalid_response"],
+          ] as const) {
+            const transport = new FakeTransport().script("getNumeric", read(type));
+            expect((await failureOf(writeAny(new OperationContext(transport, model), id, target, value)))?.code, `${label} ${type}`).toBe(code);
+            expect(transport.calls.map(({ method, address }) => [method, address]), label).toEqual([["getNumeric", at(ids.type, ids.rep)]]);
+          }
+          const dry = new FakeTransport().script("getNumeric", read("2"));
+          expect((await dryRunSetting(new OperationContext(dry, model), ...([id, target, value] as unknown as WriteArgs))).planned, label).toBe(value);
+          expect(dry.calls.map(({ method }) => method), label).toEqual(["getNumeric"]);
+          // No connection-free plan (the type is live); the static checks still run.
+          expect(() => validateSetting(model, ...([id, target, value] as unknown as WriteArgs)), label).not.toThrow();
+          expect(() => validateSetting(model, ...([id, target, "bogus"] as unknown as WriteArgs)), label).toThrow(/invalid_input/);
+          // A refused target or value sends nothing, the type read included.
+          const none = new FakeTransport();
+          expect((await failureOf(writeAny(new OperationContext(none, model), id, target, "bogus")))?.code, label).toBe("invalid_input");
+          expect(none.calls, label).toEqual([]);
+        }
+      }
     }
   });
 

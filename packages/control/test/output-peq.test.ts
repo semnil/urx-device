@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { EQ_BANDS } from "../src/catalog/eq.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { previewSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -60,6 +60,31 @@ describe("output PEQ (F07-P)", () => {
         expect((await readAny(new OperationContext(transport, "URX44"), `bus.peq.one-knob.${field}`, { bus })).value).toBe(value);
         expect(transport.calls[0]?.address).toEqual({ paramId: anchor + offset, x: "0", y: `${y}` });
       }
+    }
+  });
+
+  it("refuse a filter type the other band takes as unsupported, and an unknown name as invalid, on bus and channel EQ alike", async () => {
+    const cases = [
+      ["bus.peq.band.type", { bus: "stereo", band: "low" }, "lpf", "unsupported_operation"],
+      ["bus.peq.band.type", { bus: "stereo", band: "high" }, "hpf", "unsupported_operation"],
+      ["channel.eq.band.type", { channel: 1, band: "low" }, "lpf", "unsupported_operation"],
+      ["channel.eq.band.type", { channel: 1, band: "high" }, "hpf", "unsupported_operation"],
+      ["bus.peq.band.type", { bus: "stereo", band: "low" }, "LPF", "invalid_input"],
+      ["channel.eq.band.type", { channel: 1, band: "high" }, "notch", "invalid_input"],
+    ] as const;
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      for (const [id, target, value, code] of cases) {
+        const label = `${model} ${id} ${JSON.stringify(target)} ${value}`;
+        const args = [id, target, value] as unknown as WriteArgs;
+        expect(() => previewSetting(model, ...args), label).toThrow(new RegExp(code));
+        expect(() => validateSetting(model, ...args), label).toThrow(new RegExp(code));
+        const none = new FakeTransport();
+        expect((await failureOf(writeSetting(new OperationContext(none, model), ...args)))?.code, label).toBe(code);
+        expect(none.calls, label).toEqual([]);
+      }
+      // The band's own types still plan.
+      expect(previewSetting(model, "bus.peq.band.type", { bus: "stereo", band: "low" }, "hpf").planned).toBe("hpf");
+      expect(previewSetting(model, "channel.eq.band.type", { channel: 1, band: "high" }, "lpf").planned).toBe("lpf");
     }
   });
 

@@ -199,6 +199,8 @@ export interface ChannelSsmcsBandTarget {
 /** One bus by its token (F05-B). */
 export interface BusTarget {
   readonly bus: (typeof BUS_TOKENS)[number];
+  /** A whole bus takes no side; one given is undefined only. */
+  readonly side?: undefined;
   readonly band?: never;
   readonly effect?: never;
   readonly parameter?: never;
@@ -219,9 +221,7 @@ export interface OutputTarget {
 }
 
 /** A device-wide setting's target: no keys (F08-C). */
-export interface DeviceTarget {
-  readonly band?: never;
-}
+export type DeviceTarget = { readonly [key: string]: never };
 
 /** The device-wide CUE Mode (F08-C). */
 export type CueMode = "mix" | "last";

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
+import type { BusSideTarget, ChannelTarget } from "../src/catalog/settings.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
@@ -168,5 +169,35 @@ describe("CUE flags and mode (F08-C)", () => {
       const transport = new FakeTransport().script("getNumeric", read(raw));
       expect((await failureOf(readAny(new OperationContext(transport, "URX44"), "cue.mode", {})))?.code, raw).toBe("invalid_response");
     }
+  });
+  it("type each setting's target as the runtime takes it: a whole bus or output with side undefined, a device-wide setting with no keys", async () => {
+    // side: undefined is the omitted side, on a whole bus and on PHONES alike: same single request.
+    for (const [id, plain, withSide, paramId] of [
+      ["bus.on", { bus: "monitor-1" }, { bus: "monitor-1", side: undefined }, 723],
+      ["output.level", { output: "phones-2" }, { output: "phones-2", side: undefined }, 725],
+    ] as const) {
+      for (const target of [plain, withSide]) {
+        const transport = new FakeTransport().script("getNumeric", read("1"));
+        await readAny(new OperationContext(transport, "URX44"), id, target);
+        expect(transport.calls.map(({ address }) => address.paramId), `${id} ${JSON.stringify(target)}`).toEqual([paramId]);
+      }
+    }
+    const side: BusSideTarget = { bus: "stereo", side: "left" };
+    const channel: ChannelTarget = { channel: 1 };
+    const checks = () => {
+      const c = new OperationContext(new FakeTransport(), "URX44");
+      // @ts-expect-error a sided bus target is not a whole-bus target
+      void readSetting(c, "bus.on", side);
+      // @ts-expect-error a device-wide setting takes no keys
+      void readSetting(c, "cue.mode", channel);
+      void readSetting(c, "cue.mode", {});
+      void readSetting(c, "bus.on", { bus: "stereo" });
+    };
+    expect(typeof checks).toBe("function");
+    // The same refusals at run time, before any request.
+    const none = new FakeTransport();
+    expect((await failureOf(readAny(new OperationContext(none, "URX44"), "bus.on", side)))?.code).toBe("invalid_input");
+    expect((await failureOf(readAny(new OperationContext(none, "URX44"), "cue.mode", channel)))?.code).toBe("invalid_input");
+    expect(none.calls).toEqual([]);
   });
 });
