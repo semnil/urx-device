@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GEQ_BANDS } from "../src/catalog/output-eq.js";
+import { GEQ_BANDS, OUTPUT_EQ_RULES } from "../src/catalog/output-eq.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { dryRunSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
@@ -131,6 +131,19 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
       const result = await gainWrite(bus as keyof typeof BUS, side as "left", band, value, "2", "0");
       expect(result.outcome, `${bus} ${side} ${band} ${value}`).toEqual({ code });
       expect(result.calls).toEqual([]);
+    }
+  });
+
+  it("carry F07-G's rate limit for help: Flex12GEQ to 48 kHz, PEQ without a ceiling", () => {
+    const value = OUTPUT_EQ_RULES["bus.eq.type"].value;
+    expect(value.kind).toBe("selector");
+    if (value.kind !== "selector") return;
+    expect(value.limits).toEqual({
+      peq: { maxRateHz: null, monoOnly: false, slot: null },
+      "flex12-geq": { maxRateHz: 48000, monoOnly: false, slot: null },
+    });
+    for (const token of [...Object.getOwnPropertyNames(Object.prototype), "geq", "none"]) {
+      expect(value.limits?.[token], token).toBeUndefined();
     }
   });
 

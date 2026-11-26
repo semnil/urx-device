@@ -5,7 +5,7 @@
 // Limit and band gain write the named side once.
 
 import { BUS_TOKENS } from "./buses.js";
-import { frozen } from "./frozen.js";
+import { byToken, frozen } from "./frozen.js";
 import type { BusSettingRule, BusSideSettingRule, GeqGainRule, SelectorRule } from "./rules.js";
 
 export const GEQ_BANDS = frozen([
@@ -24,7 +24,20 @@ const EQ_TYPES = [
   { token: "peq", raw: "0" },
   { token: "flex12-geq", raw: "2" },
 ] as const;
-const EQ_TYPE: SelectorRule = { kind: "selector", known: ["peq", "flex12-geq"], choices: EQ_TYPES };
+/**
+ * F07-G's definition limit, for help: Flex12GEQ runs up to 48 kHz (a rate
+ * change above it returns the bus to PEQ). A definition, not a measurement;
+ * nothing reads the rate.
+ */
+const EQ_TYPE: SelectorRule = {
+  kind: "selector",
+  known: ["peq", "flex12-geq"],
+  choices: EQ_TYPES,
+  limits: byToken({
+    peq: { maxRateHz: null, monoOnly: false, slot: null },
+    "flex12-geq": { maxRateHz: 48000, monoOnly: false, slot: null },
+  }),
+};
 
 function representative(stereo: number, mix: number, write: boolean): BusSettingRule["address"] {
   return {
