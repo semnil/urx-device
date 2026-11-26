@@ -78,10 +78,7 @@ const URX22_ONLY: Case[] = [
   ["bus.color", { bus: "stream" }, "red", 704, 0, "6"],
   ...(
     [
-      ["aux", 9],
       ["usb-main-a", 13],
-      ["usb-main-b", 14],
-      ["usb-main-c", 15],
       ["usb-sub", 16],
     ] as const
   ).map(([source, paramId]): Case => ["source.gain", { source }, -3, paramId, 0, "-300"]),
@@ -97,6 +94,8 @@ const UNBOUND: [string, object, unknown][] = [
     ["bus.eq.type", { bus }, "peq"],
     ["send.pan", { source: "channel-3", destination: bus }, -17],
   ]),
+  // The source gains whose lanes' audio is not on record on URX22.
+  ...(["aux", "usb-main-b", "usb-main-c"] as const).map((source): [string, object, unknown] => ["source.gain", { source }, -3]),
   // The partner-linked sends not measured on URX22.
   ...(
     [
