@@ -541,6 +541,9 @@ describe("CURRENT composition (K36, F18)", () => {
       // The refused step reports the same first cause.
       expect([result.error, ...result.steps.map((s) => `${s.outcome} ${s.error}`)], JSON.stringify(notes)).toEqual([code, "accepted null", `not_sent ${code}`, "not_sent null"]);
     }
+    // During the lock read, a lock before an invalid read value: the lock's cause stays, nothing is read or sent after.
+    const reading = await apply((t) => t.script("getNumeric", after(t, [lock("1")], read("3"))));
+    expect([reading.result.error, reading.t.calls.length]).toEqual(["precondition_failed", 1]);
     // During the rate read, an invalid lock value before a mismatched rate: the lock's cause stays.
     const early = await apply((t) => t.script("getNumeric", read("0"), after(t, [lock("2")], read("96000"))));
     expect(early.result.error).toBe("invalid_response");

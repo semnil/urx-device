@@ -64,7 +64,8 @@ export class ConsoleLockGuard implements WriteGuard {
   /**
    * Begins one write operation under the guard: attaches `context`, then
    * makes its one fresh strict lock read. A locked unit, a latched stop, or
-   * a failed read rejects (the context detached), and no setting is sent.
+   * a failed read rejects (the context detached), and no setting is sent;
+   * a stop latched before the rejection is its cause.
    * A context on another connection than the guard's is refused before any
    * request: the lock it observes would not be that connection's.
    * The returned function detaches the context once its operation is done.
@@ -87,6 +88,11 @@ export class ConsoleLockGuard implements WriteGuard {
       this.#refuseIfStopped();
     } catch (error) {
       detach();
+      // The operation's first stopping cause stays, whatever the lock read then returned.
+      const failure = operationFailureOf(error);
+      if (context.stopping !== undefined && failure !== undefined && failure.code !== context.stopping) {
+        throw new OperationFailureError({ code: context.stopping, phase: failure.phase, progress: failure.progress });
+      }
       throw error;
     }
     return detach;

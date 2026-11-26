@@ -120,6 +120,25 @@ describe("Console Lock write guard (F20-L-A)", () => {
     expect(t.finished).toBe(1);
   });
 
+  it("keep a stop latched during the lock read as the cause, whatever the read returns", async () => {
+    for (const [note, reply, code] of [
+      ["1", read("3"), "precondition_failed"],
+      ["2", { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } }, "invalid_response"],
+    ] as const) {
+      const t = new FakeTransport();
+      t.script("getNumeric", {
+        then(resolve: (record: unknown) => void) {
+          t.notify({ kind: "numeric", address: lock, value: note });
+          resolve(reply);
+        },
+      });
+      const c = new OperationContext(t, "URX44");
+      const guard = await ConsoleLockGuard.open(c);
+      expect((await failureOf(guard.begin(c)))?.code, note).toBe(code);
+      expect(t.calls.filter((call) => call.method.startsWith("set"))).toEqual([]);
+    }
+  });
+
   it("leave an operation that is not attached alone: a read-only line still reads after a lock", async () => {
     const t = new FakeTransport().script("getNumeric", read("0"), read("1"));
     const writer = new OperationContext(t, "URX44");
