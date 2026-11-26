@@ -4,7 +4,7 @@ import { FX2_FREQUENCY_DECIHZ, INITIAL_DELAY_DECIMS, REVX_FREQUENCY_HZ, REVX_TIM
 import type { StopsRule, ValueRule } from "../src/catalog/rules.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { dryRunSetting, previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, previewSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -230,6 +230,65 @@ describe("FX returns (F06-F, F06-V)", () => {
     const plain = new FakeTransport();
     expect((await dryAny(new OperationContext(plain, "URX44"), "channel.fader", { channel: 1 }, -3)).planned).toBe(-3);
     expect(plain.calls).toEqual([]);
+  });
+
+  it("validate every FX parameter write without a device: the static checks, and no plan", () => {
+    const effects = FX_RETURN_RULES["bus.fx.parameter"].effects;
+    let checked = 0;
+    for (const [effect, rule] of Object.entries(effects)) {
+      for (const [bus, selector] of Object.entries(rule?.selector ?? {})) {
+        if (selector === undefined) continue;
+        for (const [parameter, field] of Object.entries(rule?.parameters ?? {})) {
+          if (field === undefined) continue;
+          const target = { bus, effect, parameter };
+          const label = `${bus} ${effect} ${parameter}`;
+          if (field.value.kind === "context-stops") {
+            const envelope = field.value.envelope[effect];
+            if (envelope === undefined) continue;
+            for (const value of [envelope.min, envelope.max]) {
+              expect(() => validateSetting("URX44", "bus.fx.parameter", target as never, value as never), `${label} ${value}`).not.toThrow();
+              checked += 1;
+            }
+            for (const value of [envelope.min - 0.001, envelope.max + 0.001, Number.NaN, "1"]) {
+              expect(() => validateSetting("URX44", "bus.fx.parameter", target as never, value as never), `${label} ${value}`).toThrow(/invalid_input/);
+            }
+            continue;
+          }
+          for (const [, value] of rawsOf(field.value)) {
+            expect(() => validateSetting("URX44", "bus.fx.parameter", target as never, value as never), `${label} ${String(value)}`).not.toThrow();
+            checked += 1;
+          }
+          expect(() => validateSetting("URX44", "bus.fx.parameter", target as never, {} as never), label).toThrow(/invalid_input/);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(1000);
+    // Target checks: the other bus's effect is unsupported; an unknown effect or parameter is invalid.
+    for (const [target, code] of [
+      [{ bus: "fx-2", effect: "rev-x-hall", parameter: "reverb-time" }, "unsupported_operation"],
+      [{ bus: "fx-1", effect: "rev-x", parameter: "reverb-time" }, "invalid_input"],
+      [{ bus: "fx-1", effect: "mono-delay", parameter: "tempo" }, "invalid_input"],
+      [{ bus: "stereo", effect: "mono-delay", parameter: "bpm" }, "unsupported_operation"],
+      [{ bus: "mix-3", effect: "mono-delay", parameter: "bpm" }, "invalid_input"],
+    ] as const) {
+      expect(() => validateSetting("URX44", "bus.fx.parameter", target as never, 120 as never), JSON.stringify(target)).toThrow(new RegExp(code));
+    }
+    // A setting whose plan needs no device state validates as its preview does.
+    expect(() => validateSetting("URX44", "channel.fader", { channel: 1 }, -3)).not.toThrow();
+    expect(() => validateSetting("URX44", "channel.fader", { channel: 1 }, 99)).toThrow(/invalid_input/);
+  });
+
+  it("type an FX-parameter target as no plain bus target", () => {
+    const fx = { bus: "fx-1", effect: "mono-delay", parameter: "bpm" } as const;
+    const checks = () => {
+      // @ts-expect-error an FX-parameter target is not a bus target
+      void readSetting(new OperationContext(new FakeTransport(), "URX44"), "bus.fx.type", fx);
+      // @ts-expect-error nor for a write
+      void previewSetting("URX44", "bus.fx.type", fx, "mono-delay");
+      void readSetting(new OperationContext(new FakeTransport(), "URX44"), "bus.fx.parameter", fx);
+      void readSetting(new OperationContext(new FakeTransport(), "URX44"), "bus.fx.type", { bus: "fx-1" });
+    };
+    expect(typeof checks).toBe("function");
   });
 });
 

@@ -454,6 +454,11 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
       staticCheck(resolved.field, resolved.effect, requested);
       return refuse("invalid_input");
     },
+    /** The static checks alone: bus, effect, parameter and value or its type-wide envelope. */
+    validate(model: string, target: unknown, requested: V): void {
+      const resolved = resolve(model, target);
+      staticCheck(resolved.field, resolved.effect, requested);
+    },
     async dryRun(context: OperationContext, target: unknown, requested: V): Promise<WritePlan<V>> {
       const resolved = resolve(context.model, target);
       staticCheck(resolved.field, resolved.effect, requested);

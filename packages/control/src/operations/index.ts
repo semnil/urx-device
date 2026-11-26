@@ -5,7 +5,7 @@ export { OperationFailureError, operationFailureOf } from "./failure.js";
 export type { OperationCause, OperationFailure, OperationPhase } from "./failure.js";
 export { validateNameRead, validateNumericRead, validatePost, validateTextRead } from "./native.js";
 export type * from "./native.js";
-export { dryRunSetting, previewSetting, readSetting, settingHandlers, writeSetting } from "./registry.js";
+export { dryRunSetting, previewSetting, readSetting, settingHandlers, validateSetting, writeSetting } from "./registry.js";
 export type { ReadHandler, SettingHandlers, WriteHandler } from "./registry.js";
 export type * from "./results.js";
 export type * from "./transport.js";

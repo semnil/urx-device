@@ -128,6 +128,11 @@ export interface WriteHandler<K extends SettingId> extends ReadHandler<K> {
   /** The validated plan; it sends nothing (preview). */
   plan(model: string, target: Target<K>, value: Input<K>): WritePlan<Input<K>>;
   /**
+   * The state-independent checks of the target and value, throwing their
+   * refusal; no traffic. Absent where they are the plan's own checks.
+   */
+  validate?(model: string, target: Target<K>, value: Input<K>): void;
+  /**
    * The plan with the operation's required prerequisite reads, sending no
    * write (O13); absent where the plan needs no device state.
    */
@@ -313,6 +318,22 @@ export function writeSetting<A extends WriteArgs>(
 export function previewSetting<A extends WriteArgs>(model: string, ...[id, target, value]: A): WritePlan<Input<A[0]>> {
   const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
   return handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
+}
+
+/**
+ * Validates a write of `value` without a device (B2): the setting, target and
+ * value checks that do not depend on device state, throwing the refusal they
+ * give. A setting whose plan needs device state (an FX-return parameter)
+ * checks what it can without it; its remaining checks run with the
+ * operation's prerequisite reads.
+ */
+export function validateSetting<A extends WriteArgs>(model: string, ...[id, target, value]: A): void {
+  const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
+  if (handler.validate === undefined) {
+    handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
+  } else {
+    handler.validate(model, target as Target<A[0]>, value as Input<A[0]>);
+  }
 }
 
 /**

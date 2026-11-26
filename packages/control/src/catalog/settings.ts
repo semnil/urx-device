@@ -172,6 +172,8 @@ export interface ChannelSsmcsBandTarget {
 export interface BusTarget {
   readonly bus: (typeof BUS_TOKENS)[number];
   readonly band?: never;
+  readonly effect?: never;
+  readonly parameter?: never;
 }
 
 /** One FX-return parameter: the FX bus, the expected effect and the parameter name (F06-F). */
