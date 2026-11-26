@@ -5,8 +5,10 @@ import type { I64Text } from "../src/catalog/i64.js";
 import type {
   ParameterAddress,
   Transport,
+  TransportNotification,
   TransportOperation,
   TransportRequest,
+  TransportSubscription,
 } from "../src/operations/transport.js";
 
 export type Method = "getNumeric" | "getText" | "getName" | "setNumeric" | "setText";
@@ -42,6 +44,48 @@ export class FakeTransport implements Transport {
         this.finished += 1;
       },
     };
+  }
+
+  /** Admitted subscriptions in order, with their routes and lifecycle. */
+  readonly subscriptions: {
+    addresses: readonly ParameterAddress[];
+    deliver: (notification: TransportNotification) => void;
+    state: "prepared" | "active" | "released";
+  }[] = [];
+  /** When set, `activate` rejects with it (after the subscription is marked released). */
+  activation: Error | undefined;
+
+  prepareSubscription(
+    addresses: readonly ParameterAddress[],
+    _operation: TransportOperation,
+    deliver: (notification: TransportNotification) => void,
+  ): TransportSubscription {
+    const entry = { addresses, deliver, state: "prepared" as "prepared" | "active" | "released" };
+    this.subscriptions.push(entry);
+    return {
+      activate: async () => {
+        if (this.activation !== undefined) {
+          entry.state = "released";
+          throw this.activation;
+        }
+        entry.state = "active";
+      },
+      release: async () => {
+        entry.state = "released";
+      },
+    };
+  }
+
+  /** Routes `notification` to every active subscription to its address (a bulk change to all). */
+  notify(notification: TransportNotification): void {
+    for (const entry of this.subscriptions) {
+      if (entry.state !== "active") continue;
+      const hit =
+        notification.kind === "bulk-change" ||
+        notification.kind === "meter" ||
+        entry.addresses.some((a) => a.paramId === notification.address.paramId && a.x === notification.address.x && a.y === notification.address.y);
+      if (hit) entry.deliver(notification);
+    }
   }
 
   getNumeric(address: ParameterAddress, request: TransportRequest): Promise<unknown> {

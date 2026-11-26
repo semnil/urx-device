@@ -7,6 +7,7 @@ import { applyCurrent } from "../src/composition/apply.js";
 import { EXCLUDED, PHASES } from "../src/composition/coverage.js";
 import { PLAN_ITEM_LIMIT, planCurrent } from "../src/composition/plan.js";
 import { targetsOf } from "../src/composition/targets.js";
+import { ConsoleLockGuard } from "../src/operations/console-lock.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { settingHandlers, validateSetting, type WriteArgs } from "../src/operations/registry.js";
@@ -180,18 +181,51 @@ describe("CURRENT composition (K36, F18)", () => {
     const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
     const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
     const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
-    const mismatch = new FakeTransport().script("getNumeric", read("96000"));
-    const refused = await applyCurrent(new OperationContext(mismatch, "URX22"), file, head);
+    // Each import is one guarded write operation: the lock read (895) first, then the rate (766).
+    const apply = async (transport: FakeTransport, dryRun = false) => {
+      const context = new OperationContext(transport, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      try {
+        return await applyCurrent(context, file, head, { guard, dryRun });
+      } finally {
+        await guard.release();
+      }
+    };
+    const mismatch = new FakeTransport().script("getNumeric", read("0"), read("96000"));
+    const refused = await apply(mismatch);
     expect(refused.error).toBe("precondition_failed");
-    expect(mismatch.calls.map((c) => c.method)).toEqual(["getNumeric"]);
-    const transport = new FakeTransport().script("getNumeric", read("48000")).script("setNumeric", accepted, accepted, rejected).script("setText", accepted);
-    const result = await applyCurrent(new OperationContext(transport, "URX22"), file, head);
+    expect(mismatch.calls.map((c) => c.address.paramId)).toEqual([895, 766]);
+    const transport = new FakeTransport().script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, rejected).script("setText", accepted);
+    const result = await apply(transport);
     expect(result.error).toBe("device_rejected");
     expect(result.steps.map((s) => s.outcome)).toEqual(["accepted", "accepted", "rejected", "not_sent", "not_sent"]);
     expect(transport.calls.filter((c) => c.method.startsWith("set")).length).toBe(3);
-    const dry = new FakeTransport().script("getNumeric", read("48000"));
-    const preview = await applyCurrent(new OperationContext(dry, "URX22"), file, head, { dryRun: true });
+    const dry = new FakeTransport().script("getNumeric", read("0"), read("48000"));
+    const preview = await apply(dry, true);
     expect(preview.error).toBeNull();
+    expect(dry.calls.map((c) => c.address.paramId).slice(0, 2)).toEqual([895, 766]);
     expect(dry.calls.filter((c) => c.method.startsWith("set"))).toEqual([]);
+    // A locked unit stops the import before the rate read and any write.
+    const locked = new FakeTransport().script("getNumeric", read("1"));
+    const stopped = await apply(locked);
+    expect(stopped.error).toBe("precondition_failed");
+    expect(stopped.steps.every((s) => s.outcome === "not_sent")).toBe(true);
+    expect(locked.calls.map((c) => c.address.paramId)).toEqual([895]);
+    // A lock during the import stops the unsent steps; the accepted ones stay.
+    const mid = new FakeTransport().script("getNumeric", read("0"), read("48000"));
+    let sent = 0;
+    mid.script(
+      "setNumeric",
+      ...[0, 1, 2, 3, 4].map(() => ({
+        then(resolve: (record: unknown) => void) {
+          sent += 1;
+          if (sent === 2) mid.notify({ kind: "numeric", address: { paramId: 895, x: "0", y: "0" }, value: "1" });
+          resolve(accepted);
+        },
+      })),
+    ).script("setText", accepted);
+    const interrupted = await apply(mid);
+    expect(interrupted.error).toBe("precondition_failed");
+    expect(interrupted.steps.map((s) => s.outcome).slice(0, 3)).toEqual(["accepted", "accepted", "not_sent"]);
   });
 });

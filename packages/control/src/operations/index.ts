@@ -1,6 +1,8 @@
 // Operations entry point: semantic operations over a caller-supplied
 // transport. It may import the catalog; the catalog never imports it (K1).
+export { CONSOLE_LOCK_ADDRESS, ConsoleLockGuard } from "./console-lock.js";
 export { OperationContext } from "./context.js";
+export type { WriteGuard } from "./context.js";
 export { OperationFailureError, operationFailureOf } from "./failure.js";
 export type { OperationCause, OperationFailure, OperationPhase } from "./failure.js";
 export { validateNameRead, validateNumericRead, validatePost, validateTextRead } from "./native.js";

@@ -1,10 +1,12 @@
-// Executing a CURRENT plan (K36, O11, L3): one device sample-rate read
-// compared with the file's before the first write, then each step's own
-// operation in order. The first failure stops the unsent steps; accepted
+// Executing a CURRENT plan (K36, O11, L3): the whole import is one logical
+// operation under the caller's Console Lock guard (F20-L-A), whose one lock
+// read comes first; then one device sample-rate read compared with the
+// file's before the first write, then each step's own operation in order. The first failure stops the unsent steps; accepted
 // steps are kept, and nothing is rolled back, retried or read back. A
 // dry-run performs the same prerequisite reads and sends no setting write.
 
 import type { UrxfFile } from "../catalog/urxf.js";
+import type { ConsoleLockGuard } from "../operations/console-lock.js";
 import type { OperationContext } from "../operations/context.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
 import { decodeFileSetting, dryRunSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
@@ -36,8 +38,18 @@ async function checkRate(context: OperationContext, file: UrxfFile): Promise<voi
   }
 }
 
-/** Applies (or, with `dryRun`, plans with the prerequisite reads) `plan` from `file`. */
-export async function applyCurrent(context: OperationContext, file: UrxfFile, plan: CurrentPlan, options: { dryRun?: boolean } = {}): Promise<ApplyResult> {
+/**
+ * Applies (or, with `dryRun`, plans with the prerequisite reads) `plan` from
+ * `file` as one write operation under `options.guard`, which the caller has
+ * opened and releases: its lock read precedes the rate check, a lock stops
+ * the unsent steps, and a dry run makes the same reads.
+ */
+export async function applyCurrent(
+  context: OperationContext,
+  file: UrxfFile,
+  plan: CurrentPlan,
+  options: { readonly guard: ConsoleLockGuard; readonly dryRun?: boolean },
+): Promise<ApplyResult> {
   const results: StepResult[] = plan.steps.map((step) => ({ ...step, outcome: "not_sent", error: null }));
   const failWith = (index: number, error: unknown, outcome: WriteOutcome): ApplyResult => {
     const failure = operationFailureOf(error);
@@ -45,6 +57,27 @@ export async function applyCurrent(context: OperationContext, file: UrxfFile, pl
     results[index] = { ...step, outcome, error: failure?.code ?? "internal_error" };
     return { steps: results, error: failure?.code ?? "internal_error" };
   };
+  let detach: () => void;
+  try {
+    detach = await options.guard.begin(context);
+  } catch (error) {
+    return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error" };
+  }
+  try {
+    return await run(context, file, plan, results, failWith, options.dryRun === true);
+  } finally {
+    detach();
+  }
+}
+
+async function run(
+  context: OperationContext,
+  file: UrxfFile,
+  plan: CurrentPlan,
+  results: StepResult[],
+  failWith: (index: number, error: unknown, outcome: WriteOutcome) => ApplyResult,
+  dryRun: boolean,
+): Promise<ApplyResult> {
   try {
     await checkRate(context, file);
   } catch (error) {
@@ -53,7 +86,7 @@ export async function applyCurrent(context: OperationContext, file: UrxfFile, pl
   for (const [index, step] of plan.steps.entries()) {
     const args = [step.setting, step.target, step.requested] as unknown as WriteArgs;
     try {
-      if (options.dryRun === true) {
+      if (dryRun) {
         const planned = await dryRunSetting(context, ...args);
         results[index] = { ...step, planned: planned.planned, outcome: "not_sent", error: null };
       } else {
