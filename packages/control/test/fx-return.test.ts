@@ -252,6 +252,18 @@ describe("FX returns (F06-F, F06-V)", () => {
       unverified: ["fx_type_matches", "revx_room_size"],
     });
     expect(hallNow.calls.length).toBe(2);
+    // Another REV-X type is selected now: its layout defines the same Room Size slot, so it is read and checked.
+    const roomNow = new FakeTransport().script("getNumeric", read("1"), read("31"));
+    expect(await dryRunSettingAfter(new OperationContext(roomNow, "URX44"), typeChanging, "bus.fx.parameter", time, 0.93)).toEqual({
+      requested: 0.93,
+      planned: null,
+      unverified: ["fx_type_matches", "revx_room_size"],
+    });
+    expect(roomNow.calls.length).toBe(2);
+    const badRoom = new FakeTransport().script("getNumeric", read("2"), read("32"));
+    expect((await failureOf(dryRunSettingAfter(new OperationContext(badRoom, "URX44"), typeChanging, "bus.fx.parameter", time, 0.93)))?.code).toBe(
+      "invalid_response",
+    );
     // A parameter without a context keeps its static plan; an invalid selector is still an error.
     const delayParam = { bus: "fx-1", effect: "mono-delay", parameter: "bpm" } as const;
     const revxNow = new FakeTransport().script("getNumeric", read("0"));

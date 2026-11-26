@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { dryRunSetting, dryRunSettingAfter, previewSetting, readSetting, settingHandlers, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import type { WritePlan } from "../src/operations/results.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -186,6 +187,40 @@ describe("device review fixes (PR #31)", () => {
     }
     // URX44/V read the recorder first, so their preview needs the device.
     expect(() => previewSetting("URX44", "device.follow-usb", {}, true)).toThrow(/invalid_input/);
+  });
+
+  it("use the affected set as it was at the call, whatever the caller changes meanwhile", async () => {
+    const affected = new Set<"follow_usb_off">();
+    // Follow USB reads on; the caller adds the condition while the read is pending.
+    const t = new FakeTransport().script("getNumeric", {
+      then(resolve: (record: unknown) => void) {
+        affected.add("follow_usb_off");
+        resolve(read("1"));
+      },
+    });
+    expect((await failureOf(dryRunSettingAfter(new OperationContext(t, "URX22"), affected, "device.sample-rate", {}, 48000)))?.code).toBe("precondition_failed");
+    const shrinking = new Set(["follow_usb_off"] as const) as Set<"follow_usb_off">;
+    const u = new FakeTransport().script("getNumeric", {
+      then(resolve: (record: unknown) => void) {
+        shrinking.clear();
+        resolve(read("1"));
+      },
+    });
+    expect((await dryRunSettingAfter(new OperationContext(u, "URX22"), shrinking, "device.sample-rate", {}, 48000)).unverified).toEqual(["follow_usb_off"]);
+  });
+
+  it("type a dry run with no earlier writes, and a direct three-argument handler call, with a set planned value", async () => {
+    const check = async () => {
+      const c = new OperationContext(new FakeTransport(), "URX22");
+      const plan: WritePlan<number> = await dryRunSetting(c, "device.brightness", {}, 5);
+      void plan.planned.toFixed();
+      const direct = await settingHandlers["device.sample-rate"].dryRun?.(c, {}, 48000);
+      void direct?.planned.toFixed();
+      const after = await dryRunSettingAfter(c, new Set(), "device.brightness", {}, 5);
+      // @ts-expect-error a plan after unsent writes may leave the value unplanned
+      void after.planned.toFixed();
+    };
+    expect(typeof check).toBe("function");
   });
 
   it("leave Follow USB unverified for a rate set after an unsent Follow USB write (O13), and nothing else", async () => {

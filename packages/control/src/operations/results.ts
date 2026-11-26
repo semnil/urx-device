@@ -41,6 +41,11 @@ export interface DryRunPlan<V> {
   readonly unverified: readonly UnverifiedCondition[];
 }
 
+/** A dry run's plan with no earlier unsent write (O13): the value it would send, and nothing unverified. */
+export interface VerifiedPlan<V> extends WritePlan<V> {
+  readonly unverified: readonly UnverifiedCondition[];
+}
+
 /** A write the unit accepted (W1): acceptance, not readback. */
 export interface WriteResult<V> extends WritePlan<V> {
   readonly outcome: "accepted";

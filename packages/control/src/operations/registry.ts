@@ -154,7 +154,7 @@ import {
   inputPhantom,
   sourceGain,
 } from "./inputs.js";
-import type { DryRunPlan, Reading, UnverifiedCondition, WritePlan, WriteResult } from "./results.js";
+import type { DryRunPlan, Reading, UnverifiedCondition, VerifiedPlan, WritePlan, WriteResult } from "./results.js";
 
 type Target<K extends SettingId> = SettingTypes[K]["target"];
 type Value<K extends SettingId> = SettingTypes[K]["value"];
@@ -186,7 +186,10 @@ export interface WriteHandler<K extends SettingId> extends ReadHandler<K> {
    * `affected` is one an earlier unsent write can change: it is still read
    * where its address is known, and reported unverified instead of refused.
    */
-  dryRun?(context: OperationContext, target: Target<K>, value: Input<K>, affected: ReadonlySet<UnverifiedCondition>): Promise<DryRunPlan<Input<K>>>;
+  dryRun?: {
+    (context: OperationContext, target: Target<K>, value: Input<K>): Promise<VerifiedPlan<Input<K>>>;
+    (context: OperationContext, target: Target<K>, value: Input<K>, affected: ReadonlySet<UnverifiedCondition>): Promise<DryRunPlan<Input<K>>>;
+  };
   write(context: OperationContext, target: Target<K>, value: Input<K>): Promise<WriteResult<Input<K>>>;
 }
 
@@ -436,8 +439,15 @@ export function validateSetting<A extends WriteArgs>(model: string, ...[id, targ
  * prerequisite reads (O13): no setting write is sent. A setting whose plan
  * needs no device state reads nothing and plans as `previewSetting` does.
  */
-export function dryRunSetting<A extends WriteArgs>(context: OperationContext, ...args: A): Promise<DryRunPlan<Input<A[0]>>> {
-  return dryRunSettingAfter(context, new Set(), ...args);
+export function dryRunSetting<A extends WriteArgs>(context: OperationContext, ...[id, target, value]: A): Promise<VerifiedPlan<Input<A[0]>>> {
+  return settled(() => {
+    const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    if (handler.dryRun === undefined) {
+      const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
+      return Promise.resolve({ requested: plan.requested, planned: plan.planned, unverified: [] });
+    }
+    return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>);
+  });
 }
 
 /**
