@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { GEQ_BANDS, OUTPUT_EQ_RULES } from "../src/catalog/output-eq.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { dryRunSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -145,6 +145,20 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
     for (const token of [...Object.getOwnPropertyNames(Object.prototype), "geq", "none"]) {
       expect(value.limits?.[token], token).toBeUndefined();
     }
+  });
+
+  it("validate a gain write without a device against every Limit's range together", () => {
+    const target = { bus: "mix-1", side: "left", band: "1000" } as const;
+    for (const value of [-24, -0.5, 0, 15]) {
+      expect(() => validateSetting("URX44", "bus.geq.gain", target, value), `${value}`).not.toThrow();
+    }
+    for (const value of [-24.5, 15.5, Number.NaN, "3"]) {
+      expect(() => validateSetting("URX44", "bus.geq.gain", target, value as never), `${value}`).toThrow(/invalid_input/);
+    }
+    // STEREO writes the 20 Hz band only; an unknown band is invalid.
+    expect(() => validateSetting("URX44", "bus.geq.gain", { bus: "stereo", side: "left", band: "20" }, 3)).not.toThrow();
+    expect(() => validateSetting("URX44", "bus.geq.gain", { bus: "stereo", side: "left", band: "25" }, 3)).toThrow(/unsupported_operation/);
+    expect(() => validateSetting("URX44", "bus.geq.gain", { bus: "mix-1", side: "left", band: "21" } as never, 3)).toThrow(/invalid_input/);
   });
 
   it("dry-run a gain with the two reads and no write", async () => {

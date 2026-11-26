@@ -568,6 +568,11 @@ export function geqGainSetting(rule: GeqGainRule) {
       staticCheck(requested);
       return refuse("invalid_input");
     },
+    /** The static checks alone: the target and the union of every Limit's range. */
+    validate(model: string, target: unknown, requested: number): void {
+      resolve(model, target, true);
+      staticCheck(requested);
+    },
     async dryRun(context: OperationContext, target: unknown, requested: number): Promise<WritePlan<number>> {
       const resolved = resolve(context.model, target, true);
       const value = staticCheck(requested);
