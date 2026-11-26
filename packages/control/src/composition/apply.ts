@@ -115,15 +115,20 @@ async function watchRate(context: OperationContext, fileRate: number): Promise<R
     return { error: "internal_error", release: async () => null };
   }
   let subscription: TransportSubscription | undefined;
+  // The subscription's release failure first, then the owner's; neither replaces the result.
   const release = async () => {
+    let cleanup: string | null = null;
     try {
       await subscription?.release();
-      return null;
     } catch (error) {
-      return operationFailureOf(error)?.code ?? "internal_error";
-    } finally {
-      operation.finish();
+      cleanup = operationFailureOf(error)?.code ?? "internal_error";
     }
+    try {
+      operation.finish();
+    } catch {
+      cleanup ??= "internal_error";
+    }
+    return cleanup;
   };
   try {
     subscription = context.transport.prepareSubscription([RATE_ADDRESS], operation, (notification) => watch.deliver(notification));

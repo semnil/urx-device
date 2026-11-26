@@ -35,7 +35,8 @@ export class ConsoleLockGuard implements WriteGuard {
    * Registers the guard's lock subscription on the context's connection
    * (K9): it settles once the registration is accepted, and nothing is read
    * yet. A refused admission or a failed registration rejects with its
-   * cause, the guard's own resources released.
+   * cause, the guard's own resources released; where that release fails
+   * too, its code is the failure's `progress.cleanup`.
    */
   static async open(context: OperationContext): Promise<ConsoleLockGuard> {
     let operation: TransportOperation;
@@ -49,9 +50,13 @@ export class ConsoleLockGuard implements WriteGuard {
       guard.#subscription = context.transport.prepareSubscription([CONSOLE_LOCK_ADDRESS], operation, (notification) => guard.#deliver(notification));
       await guard.#subscription.activate();
     } catch (error) {
-      // The failed registration is the first failure; a failing release does not replace it.
-      await guard.release().catch(() => undefined);
-      throw operationFailureOf(error) === undefined ? new OperationFailureError({ code: "internal_error", phase: "admission", progress: null }) : error;
+      // The failed registration is the first failure; a failing release is reported beside it.
+      const cleanup = await guard.release().then(
+        () => null,
+        (failure: unknown) => operationFailureOf(failure)?.code ?? "internal_error",
+      );
+      const failure = operationFailureOf(error) ?? { code: "internal_error" as const, phase: "admission" as const };
+      throw new OperationFailureError({ code: failure.code, phase: failure.phase, progress: cleanup === null ? null : { cleanup } });
     }
     return guard;
   }
@@ -98,14 +103,27 @@ export class ConsoleLockGuard implements WriteGuard {
     return detach;
   }
 
-  /** Releases the guard's subscription and owner; repeated calls join one completion. */
+  /**
+   * Releases the guard's subscription and owner; repeated calls join one
+   * completion, which rejects with the first failure (the subscription's,
+   * then the owner's).
+   */
   release(): Promise<void> {
     this.#released ??= (async () => {
       this.#attached.clear();
+      let failure: unknown;
       try {
         await this.#subscription?.release();
-      } finally {
+      } catch (error) {
+        failure = error;
+      }
+      try {
         this.#operation.finish();
+      } catch {
+        failure ??= new OperationFailureError({ code: "internal_error", phase: "preparation", progress: null });
+      }
+      if (failure !== undefined) {
+        throw failure;
       }
     })();
     return this.#released;

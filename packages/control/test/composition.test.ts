@@ -597,6 +597,31 @@ describe("CURRENT composition (K36, F18)", () => {
     // Every write accepted: the release is the first failure.
     const all = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted).script("setText", accepted, accepted));
     expect(outcomes(all)).toEqual(["connection_lost", "connection_lost", "accepted", "accepted"]);
+    // The observation's owner fails to finish: the results are still returned, the failure in cleanup.
+    const finishing = async (build: (t: FakeTransport) => void) => {
+      const t = new FakeTransport();
+      build(t);
+      const context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      t.finishFailure = new Error("adapter failure");
+      try {
+        return await applyCurrent(context, head, { guard });
+      } finally {
+        await guard.release().catch(() => undefined);
+      }
+    };
+    expect(outcomes(await finishing((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted).script("setText", accepted, accepted)))).toEqual([
+      "internal_error",
+      "internal_error",
+      "accepted",
+      "accepted",
+    ]);
+    expect(outcomes(await finishing((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, rejected).script("setText", accepted, rejected)))).toEqual([
+      "device_rejected",
+      "internal_error",
+      "accepted",
+      "rejected",
+    ]);
     // A released observation reports no cleanup failure.
     const t = new FakeTransport().script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted).script("setText", accepted, accepted);
     const context = new OperationContext(t, "URX22");

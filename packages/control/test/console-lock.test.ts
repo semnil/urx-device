@@ -115,9 +115,19 @@ describe("Console Lock write guard (F20-L-A)", () => {
   it("keep a failed registration's cause when its release also fails", async () => {
     const t = new FakeTransport();
     t.activation = new OperationFailureError({ code: "device_rejected", phase: "response", progress: null });
-    t.releaseFailure = new OperationFailureError({ code: "connection_lost", phase: "response", progress: null });
-    expect((await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44"))))?.code).toBe("device_rejected");
+    t.releaseFailure = new OperationFailureError({ code: "teardown_timeout", phase: "response", progress: null });
+    const failure = await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44")));
+    expect([failure?.code, failure?.progress]).toEqual(["device_rejected", { cleanup: "teardown_timeout" }]);
     expect(t.finished).toBe(1);
+    // A released registration failure carries no cleanup code.
+    const clean = new FakeTransport();
+    clean.activation = new OperationFailureError({ code: "device_rejected", phase: "response", progress: null });
+    expect((await failureOf(ConsoleLockGuard.open(new OperationContext(clean, "URX44"))))?.progress).toBeNull();
+    // The owner's failing finish is the release's failure where the subscription released.
+    const owner = new FakeTransport();
+    const guard = await ConsoleLockGuard.open(new OperationContext(owner, "URX44"));
+    owner.finishFailure = new Error("adapter failure");
+    expect((await failureOf(guard.release()))?.code).toBe("internal_error");
   });
 
   it("keep a stop latched during the lock read as the cause, whatever the read returns", async () => {

@@ -42,6 +42,9 @@ export class FakeTransport implements Transport {
       },
       finish: () => {
         this.finished += 1;
+        if (this.finishFailure !== undefined) {
+          throw this.finishFailure;
+        }
       },
     };
   }
@@ -56,6 +59,8 @@ export class FakeTransport implements Transport {
   activation: Error | undefined;
   /** When set, `release` rejects with it (after the subscription is marked released). */
   releaseFailure: Error | undefined;
+  /** When set, an operation's `finish` throws it (after counting the call). */
+  finishFailure: Error | undefined;
 
   prepareSubscription(
     addresses: readonly ParameterAddress[],
