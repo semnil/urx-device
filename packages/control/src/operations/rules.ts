@@ -560,6 +560,22 @@ async function requireEqType(context: OperationContext, rule: GeqGainRule, at: {
  * it, since it needs the live type; `validate` makes the static checks.
  */
 export function eqTypeGated<V, I = V>(base: ReturnType<typeof handler<V, I>>, gain: GeqGainRule) {
+  /**
+   * The caller's target, read once before any request: the type read and the
+   * write then address the same bus and side even if the caller's object
+   * changes meanwhile. Every own key is kept, so the handler's checks still
+   * refuse what they refuse.
+   */
+  const fixed = (target: unknown): unknown => {
+    if (typeof target !== "object" || target === null || Object.getPrototypeOf(target) !== Object.prototype) {
+      return target;
+    }
+    const copy: Record<PropertyKey, unknown> = {};
+    for (const key of Reflect.ownKeys(target)) {
+      copy[key] = (target as Record<PropertyKey, unknown>)[key];
+    }
+    return Object.freeze(copy);
+  };
   const eqTypeOf = (target: unknown) => {
     const bus = (target as { bus?: unknown }).bus as string;
     return (gain.address[bus] as { eqType: { paramId: number; y: number } }).eqType;
@@ -574,14 +590,16 @@ export function eqTypeGated<V, I = V>(base: ReturnType<typeof handler<V, I>>, ga
       base.plan(model, target, requested);
     },
     async dryRun(context: OperationContext, target: unknown, requested: I): Promise<WritePlan<I>> {
-      const plan = base.plan(context.model, target, requested);
-      await requireEqType(context, gain, eqTypeOf(target));
+      const own = fixed(target);
+      const plan = base.plan(context.model, own, requested);
+      await requireEqType(context, gain, eqTypeOf(own));
       return plan;
     },
     async write(context: OperationContext, target: unknown, requested: I): Promise<WriteResult<I>> {
-      base.plan(context.model, target, requested);
-      await requireEqType(context, gain, eqTypeOf(target));
-      return base.write(context, target, requested);
+      const own = fixed(target);
+      base.plan(context.model, own, requested);
+      await requireEqType(context, gain, eqTypeOf(own));
+      return base.write(context, own, requested);
     },
   };
 }

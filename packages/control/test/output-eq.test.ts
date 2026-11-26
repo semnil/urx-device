@@ -110,6 +110,38 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
     }
   });
 
+  it("write the bus and side whose EQ Type was read, even when the caller's target changes meanwhile", async () => {
+    for (const [id, value] of [
+      ["bus.geq.on", true],
+      ["bus.geq.link", "off"],
+      ["bus.geq.limit", "plus-minus-12"],
+    ] as const) {
+      for (const run of ["write", "dry-run"] as const) {
+        const target: { bus: string; side?: string } = id === "bus.geq.link" ? { bus: "mix-1" } : { bus: "mix-1", side: "left" };
+        // The EQ Type answer arrives only after the caller has moved its object to MIX 2, right.
+        const moved = {
+          then(resolve: (record: unknown) => void) {
+            target.bus = "mix-2";
+            if (target.side !== undefined) target.side = "right";
+            resolve(read("2"));
+          },
+        };
+        const transport = new FakeTransport().script("getNumeric", moved).script("setNumeric", accepted);
+        const c = new OperationContext(transport, "URX44");
+        const args = [id, target, value] as unknown as WriteArgs;
+        if (run === "write") {
+          await writeSetting(c, ...args);
+        } else {
+          await dryRunSetting(c, ...args);
+        }
+        const field = id === "bus.geq.on" ? 636 : id === "bus.geq.link" ? 637 : 894;
+        // MIX 1's type (590, y 0), then for a write MIX 1's left field (y 0): never MIX 2's (y 2 / 3).
+        const expected = [at(590, 0), ...(run === "write" ? [at(field, 0)] : [])];
+        expect(transport.calls.map(({ address }) => address), `${id} ${run}`).toEqual(expected);
+      }
+    }
+  });
+
   it("read every band's gain at its address, keeping off-grid values", async () => {
     for (const [bus, ids] of Object.entries(BUS)) {
       for (const side of ["left", "right"] as const) {

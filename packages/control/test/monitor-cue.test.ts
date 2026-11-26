@@ -184,12 +184,15 @@ describe("CUE flags and mode (F08-C)", () => {
     }
     const side: BusSideTarget = { bus: "stereo", side: "left" };
     const channel: ChannelTarget = { channel: 1 };
+    const tag = Symbol("adapter-tag");
     const checks = () => {
       const c = new OperationContext(new FakeTransport(), "URX44");
       // @ts-expect-error a sided bus target is not a whole-bus target
       void readSetting(c, "bus.on", side);
       // @ts-expect-error a device-wide setting takes no keys
       void readSetting(c, "cue.mode", channel);
+      // @ts-expect-error no symbol key either
+      void readSetting(c, "cue.mode", { [tag]: true });
       void readSetting(c, "cue.mode", {});
       void readSetting(c, "bus.on", { bus: "stereo" });
     };
@@ -198,6 +201,7 @@ describe("CUE flags and mode (F08-C)", () => {
     const none = new FakeTransport();
     expect((await failureOf(readAny(new OperationContext(none, "URX44"), "bus.on", side)))?.code).toBe("invalid_input");
     expect((await failureOf(readAny(new OperationContext(none, "URX44"), "cue.mode", channel)))?.code).toBe("invalid_input");
+    expect((await failureOf(readAny(new OperationContext(none, "URX44"), "cue.mode", { [tag]: true })))?.code).toBe("invalid_input");
     expect(none.calls).toEqual([]);
   });
 });

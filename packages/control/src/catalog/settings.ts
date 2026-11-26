@@ -221,7 +221,7 @@ export interface OutputTarget {
 }
 
 /** A device-wide setting's target: no keys (F08-C). */
-export type DeviceTarget = { readonly [key: string]: never };
+export type DeviceTarget = Readonly<Record<PropertyKey, never>>;
 
 /** The device-wide CUE Mode (F08-C). */
 export type CueMode = "mix" | "last";
