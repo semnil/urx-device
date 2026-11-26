@@ -220,6 +220,10 @@ struct Shared {
     /// Signalled when a batch can be formed or delivery must stop.
     deliverable: Condvar,
     delivery_stop: AtomicBool,
+    /// Holds the next sent request's response deadline from starting until
+    /// signalled, for a case that closes while that request is on the wire.
+    #[cfg(test)]
+    response_gate: Mutex<Option<Receiver<()>>>,
 }
 
 impl Shared {
@@ -445,6 +449,8 @@ impl Connection {
                 .map(|_| Mutex::new(Queue::new(generation))),
             deliverable: Condvar::new(),
             delivery_stop: AtomicBool::new(false),
+            #[cfg(test)]
+            response_gate: Mutex::new(None),
         });
         let (events, inbox) = mpsc::channel();
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -2650,6 +2656,10 @@ fn exchange(
             let ends = written > 0 || cause != RequestCause::SendTimeout;
             return Err(Failed::new(cause, RequestPhase::Send, evidence, ends));
         }
+    }
+    #[cfg(test)]
+    if let Some(gate) = lock(&shared.response_gate).take() {
+        let _ = gate.recv();
     }
     let response_end = Instant::now() + options.response_deadline;
     let (response_end, timeout) = match cap {
