@@ -14,7 +14,7 @@
 
 use crate::delivery::{BatchTicket, NotificationBatch, NotificationRecord, Queue};
 use crate::discovery::{get, lost_notification, system_firmware, SystemFirmware};
-use crate::frame::{self, Frame, FrameReader, ReadError, MAX_FRAME_BYTES};
+use crate::frame::{self, FrameReader, ReadError, MAX_FRAME_BYTES};
 use crate::lifecycle::{
     Cause, Cleanup, CleanupState, Control, Failure, LifecycleFailure, LifecycleOutcome, Phase,
 };
@@ -30,7 +30,7 @@ use std::io::{ErrorKind, Write};
 use std::net::{Shutdown, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,47 +61,6 @@ pub struct ConnectionOptions {
     pub send_deadline: Duration,
     /// From a request being completely written until its reply.
     pub response_deadline: Duration,
-    /// What an app-issued request's response deadline does to the connection.
-    pub response_timeouts: ResponseTimeouts,
-}
-
-/// What an app-issued request's response deadline does to its connection.
-/// Subscription lifecycle requests and the teardown's unregistrations end the
-/// connection on their deadline either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseTimeouts {
-    /// The deadline ends the connection (N1).
-    EndConnection,
-    /// The request completes as `response_timeout` and the connection goes on
-    /// (R1-T-A); see [`Tolerance`].
-    Tolerate(Tolerance),
-}
-
-/// How a connection that tolerates response deadlines treats them (R1-T-A).
-///
-/// The request completes at its deadline. Its reply is still owed until it
-/// arrives, until `late_reply_frames` frames of any kind have arrived since
-/// the deadline, or until no frame has arrived for `late_reply_quiet`. Every
-/// one of these is judged by the time each frame was read off the socket, in
-/// that order, whatever holds up the threads that act on it: an owed reply
-/// is dropped when it arrives, and a request with the same reply key is not
-/// sent while one is owed, nor before every frame that had arrived by the
-/// time it stopped being owed is judged. Requests with other keys are sent as
-/// usual. A reply that arrives after it is no longer owed is still that
-/// request's own, and dropped, until a request with the same key is sent; one
-/// arriving after that can be taken by the newer request. A unit-lost
-/// notification ends the connection as always.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Tolerance {
-    /// Requests in a row whose deadline passed, with no reply to any sent
-    /// request received between them, that end the connection as
-    /// `response_timeout`: the `limit`th of them does. A reply counts as
-    /// between two deadlines by the time it was read.
-    pub limit: u32,
-    /// How long an owed reply is waited for with no frame arriving.
-    pub late_reply_quiet: Duration,
-    /// How many frames, of any kind, arrive at most while a reply is owed.
-    pub late_reply_frames: usize,
 }
 
 /// How a link that ended as `connection_lost` was lost (R1-L-A). The request
@@ -206,18 +165,6 @@ struct State {
     /// The app-issued completion holding the wire slot.
     result: Option<HeldResult>,
     next_result: u64,
-    /// App-issued requests in a row whose tolerated response deadline passed
-    /// with no reply to a sent request received since (R1-T-A).
-    timeouts: u32,
-    /// The request on the wire, when the connection tolerates deadlines.
-    inflight: Option<Inflight>,
-    /// Late replies still owed, oldest first (R1-T-A).
-    late: Vec<Late>,
-    /// Replies no longer owed but still their requests' own (R1-T-A).
-    stale: Vec<ReplyKey>,
-    /// Whether the reader has changed what the worker waits on and has not
-    /// yet read everything that had arrived by then (R1-T-A).
-    unsettled: bool,
 }
 
 /// One release of a token and every caller waiting on it.
@@ -273,203 +220,6 @@ struct Shared {
     /// Signalled when a batch can be formed or delivery must stop.
     deliverable: Condvar,
     delivery_stop: AtomicBool,
-}
-
-/// The request on the wire, as the reader judges replies to it, when the
-/// connection tolerates response deadlines (R1-T-A). The reader sees every
-/// frame in the order it arrives, so it alone decides whether a reply came
-/// before the deadline, and counts the deadline into the run.
-struct Inflight {
-    key: ReplyKey,
-    /// The response deadline, once the frame is written.
-    deadline: Option<Instant>,
-    /// How its deadline is tolerated, for an app-issued request; `None` for
-    /// a lifecycle or teardown request, whose deadline ends the connection.
-    tolerance: Option<Tolerance>,
-    verdict: InflightVerdict,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InflightVerdict {
-    Waiting,
-    Answered,
-    /// The deadline passed with no reply; whether it ended the run.
-    Expired {
-        ends: bool,
-    },
-}
-
-/// The reply still owed to a request whose response deadline was tolerated
-/// (R1-T-A). The reader drops it when it arrives, counts the frames that
-/// arrive meanwhile and ends the wait; a request with the same key is not
-/// sent while it is owed.
-struct Late {
-    key: ReplyKey,
-    /// The deadline, or the last frame since then.
-    last: Instant,
-    /// Frames that have arrived since the deadline.
-    seen: u64,
-    tolerance: Tolerance,
-}
-
-impl Late {
-    /// Whether the wait had ended by `at`: no frame for `late_reply_quiet`.
-    fn quiet_by(&self, at: Instant) -> bool {
-        at.saturating_duration_since(self.last) >= self.tolerance.late_reply_quiet
-    }
-
-    fn quiet_end(&self) -> Instant {
-        self.last + self.tolerance.late_reply_quiet
-    }
-}
-
-/// The read timeout while a change waits to be announced: the reader looks
-/// for anything more that has arrived before the worker acts on it.
-const SETTLE_POLL: Duration = Duration::from_millis(1);
-
-/// How many replies no longer owed are still recognised as theirs, oldest
-/// forgotten first (R1-T-A).
-const MAX_STALE_REPLIES: usize = 64;
-
-impl State {
-    /// A reply no longer owed, still its request's own until a request with
-    /// the same key is sent.
-    fn forget_late(&mut self, key: ReplyKey) {
-        if self.stale.len() == MAX_STALE_REPLIES {
-            self.stale.remove(0);
-        }
-        self.stale.push(key);
-    }
-
-    /// Everything due by `at`, in time order (R1-T-A): the request's deadline,
-    /// counted into the run, and owed replies whose quiet has ended. Returns
-    /// whether anything the worker waits on changed.
-    fn advance(&mut self, at: Instant) -> bool {
-        let mut changed = false;
-        let mut expired = None;
-        if let Some(inflight) = self.inflight.as_mut() {
-            if let (InflightVerdict::Waiting, Some(deadline), Some(tolerance)) =
-                (inflight.verdict, inflight.deadline, inflight.tolerance)
-            {
-                if deadline <= at {
-                    self.timeouts += 1;
-                    let ends = self.timeouts >= tolerance.limit;
-                    inflight.verdict = InflightVerdict::Expired { ends };
-                    if !ends {
-                        expired = Some((inflight.key.clone(), deadline, tolerance));
-                    }
-                    changed = true;
-                }
-            }
-        }
-        if let Some((key, deadline, tolerance)) = expired {
-            if tolerance.late_reply_frames == 0 {
-                self.forget_late(key);
-            } else {
-                self.late.push(Late {
-                    key,
-                    last: deadline,
-                    seen: 0,
-                    tolerance,
-                });
-            }
-        }
-        let mut quiet = Vec::new();
-        self.late.retain(|late| {
-            let over = late.quiet_by(at);
-            if over {
-                quiet.push(late.key.clone());
-            }
-            !over
-        });
-        changed |= !quiet.is_empty();
-        for key in quiet {
-            self.forget_late(key);
-        }
-        changed
-    }
-
-    /// One frame the reader completed at `at`, after [`State::advance`] to
-    /// `at` (R1-T-A). `message` is `None` for a frame that cannot be a reply.
-    /// A reply to the request on the wire is its answer; an owed reply, or
-    /// one no longer owed that is still its request's own, is dropped; any of
-    /// these ends the run. Every other frame counts toward each owed reply,
-    /// which is no longer owed once its frame budget is reached. Returns
-    /// whether the frame is dropped, and whether anything the worker waits
-    /// on changed.
-    fn note_frame(&mut self, message: Option<&Value>, at: Instant) -> (bool, bool) {
-        let Some(message) = message else {
-            return (false, self.count_frame(at));
-        };
-        if self.inflight.is_none() && self.late.is_empty() && self.stale.is_empty() {
-            return (false, false);
-        }
-        let inbound = Inbound::new(message.clone());
-        if let Some(inflight) = self.inflight.as_mut() {
-            if inflight.verdict == InflightVerdict::Waiting
-                && inbound.reply(&inflight.key).is_some()
-            {
-                inflight.verdict = InflightVerdict::Answered;
-                self.timeouts = 0;
-                return (false, false);
-            }
-        }
-        if let Some(at_late) = self
-            .late
-            .iter()
-            .position(|late| inbound.reply(&late.key).is_some())
-        {
-            self.late.remove(at_late);
-            self.timeouts = 0;
-            let changed = self.count_frame(at);
-            return (true, true | changed);
-        }
-        if let Some(at_stale) = self
-            .stale
-            .iter()
-            .position(|key| inbound.reply(key).is_some())
-        {
-            self.stale.remove(at_stale);
-            self.timeouts = 0;
-            return (true, self.count_frame(at));
-        }
-        (false, self.count_frame(at))
-    }
-
-    /// Counts a frame toward each owed reply. Returns whether any reached its
-    /// frame budget.
-    fn count_frame(&mut self, at: Instant) -> bool {
-        let mut full = Vec::new();
-        self.late.retain_mut(|late| {
-            late.seen += 1;
-            late.last = at;
-            let more = late.seen < late.tolerance.late_reply_frames as u64;
-            if !more {
-                full.push(late.key.clone());
-            }
-            more
-        });
-        let changed = !full.is_empty();
-        for key in full {
-            self.forget_late(key);
-        }
-        changed
-    }
-
-    /// When the reader must next look at the time: the request's deadline or
-    /// the end of an owed reply's quiet.
-    fn next_due(&self) -> Option<Instant> {
-        let deadline = self.inflight.as_ref().and_then(|inflight| {
-            (inflight.verdict == InflightVerdict::Waiting && inflight.tolerance.is_some())
-                .then_some(inflight.deadline)
-                .flatten()
-        });
-        let quiet = self.late.iter().map(Late::quiet_end).min();
-        match (deadline, quiet) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
-    }
 }
 
 impl Shared {
@@ -575,9 +325,6 @@ enum CloseState {
 pub struct Operation {
     id: u64,
     shared: Weak<Shared>,
-    /// The worker's inbox, to wake it when a request it waits to send is
-    /// cancelled.
-    events: Sender<Event>,
 }
 
 /// Opens the unit at `port`, which must report `online` with identity
@@ -720,13 +467,6 @@ impl Connection {
         &self.firmware
     }
 
-    /// Requests in a row whose tolerated response deadline passed with no
-    /// reply to any sent request since (R1-T-A); always 0 under
-    /// [`ResponseTimeouts::EndConnection`].
-    pub fn timeouts_in_a_row(&self) -> u32 {
-        self.shared.lock().timeouts
-    }
-
     /// The cause that ended the connection, if one has.
     pub fn terminal(&self) -> Option<RequestCause> {
         self.shared.lock().terminal
@@ -755,7 +495,6 @@ impl Connection {
         Ok(Operation {
             id: state.next_owner,
             shared: Arc::downgrade(&self.shared),
-            events: self.events.clone(),
         })
     }
 
@@ -1257,9 +996,6 @@ impl Operation {
             state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
             (mine, *gate)
         };
-        // A request of this owner the worker waits to send, behind an owed
-        // reply (R1-T-A), stops waiting now rather than at the next frame.
-        let _ = self.events.send(Event::Wake);
         for item in cancelled {
             // Once the end is recorded, the waiting requests end with it.
             let outcome = match ended {
@@ -1557,309 +1293,90 @@ fn deliver_notifications(shared: &Shared, handler: &NotificationHandler, events:
     }
 }
 
-/// What the receiving thread hands the reader: a frame with the time it was
-/// read off the socket, a read that found nothing more, or the read's
-/// failure.
-enum Arrival {
-    Frame(Frame, Instant),
-    Nothing(Instant),
-    Failed(ReadError),
-}
-
-/// What the reader tells the receiving thread about when to look at the
-/// time (R1-T-A): the next deadline or quiet end, and whether a change waits
-/// to be announced. Atomics, so receiving takes no lock.
-struct Timing {
-    base: Instant,
-    /// Nanoseconds after `base`; `u64::MAX` when nothing is due.
-    due: AtomicU64,
-    unsettled: AtomicBool,
-}
-
-impl Timing {
-    fn new() -> Self {
-        Timing {
-            base: Instant::now(),
-            due: AtomicU64::new(u64::MAX),
-            unsettled: AtomicBool::new(false),
-        }
-    }
-
-    fn set(&self, due: Option<Instant>, unsettled: bool) {
-        let due = due.map_or(u64::MAX, |due| {
-            u64::try_from(due.saturating_duration_since(self.base).as_nanos())
-                .unwrap_or(u64::MAX - 1)
-        });
-        self.due.store(due, Ordering::SeqCst);
-        self.unsettled.store(unsettled, Ordering::SeqCst);
-    }
-
-    /// The read timeout to use now.
-    fn poll(&self) -> Duration {
-        if self.unsettled.load(Ordering::SeqCst) {
-            return SETTLE_POLL;
-        }
-        match self.due.load(Ordering::SeqCst) {
-            u64::MAX => READ_POLL,
-            due => (self.base + Duration::from_nanos(due))
-                .saturating_duration_since(Instant::now())
-                .clamp(SETTLE_POLL, READ_POLL),
-        }
-    }
-}
-
-/// The frame bytes handed to the reader and not yet taken by it, at most.
-/// Past it the receiving thread stops reading, so the socket's own flow
-/// control holds the unit back, as when one thread both read and judged.
-const MAX_ARRIVAL_BYTES: usize = 4 << 20;
-
-/// Arrivals between the two threads at most, frames and empty reads alike.
-const MAX_ARRIVALS: usize = 4096;
-
-/// The frame bytes between the receiving thread and the reader.
-struct Backlog {
-    bytes: Mutex<usize>,
-    room: Condvar,
-    /// Set once the reader has stopped taking arrivals.
-    done: AtomicBool,
-}
-
-impl Backlog {
-    fn new() -> Self {
-        Backlog {
-            bytes: Mutex::new(0),
-            room: Condvar::new(),
-            done: AtomicBool::new(false),
-        }
-    }
-
-    /// Waits until `len` more bytes fit, or the reader or the connection has
-    /// stopped; returns whether they were taken.
-    fn reserve(&self, len: usize, stop: &AtomicBool) -> bool {
-        let mut bytes = lock(&self.bytes);
-        while *bytes > 0 && *bytes + len > MAX_ARRIVAL_BYTES {
-            if stop.load(Ordering::SeqCst) || self.done.load(Ordering::SeqCst) {
-                return false;
-            }
-            bytes = self
-                .room
-                .wait_timeout(bytes, READ_POLL)
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .0;
-        }
-        *bytes += len;
-        true
-    }
-
-    fn release(&self, len: usize) {
-        let mut bytes = lock(&self.bytes);
-        *bytes = bytes.saturating_sub(len);
-        self.room.notify_all();
-    }
-
-    fn finish(&self) {
-        self.done.store(true, Ordering::SeqCst);
-        let _bytes = lock(&self.bytes);
-        self.room.notify_all();
-    }
-}
-
-/// Reads the socket and stamps each frame with the time it was read, and
-/// nothing else: it takes no lock the reader holds, so nothing the reader
-/// waits on holds up the times (R1-T-A). A frame already buffered was read
-/// with the frames before it. It stops reading while the reader is
-/// [`MAX_ARRIVAL_BYTES`] or [`MAX_ARRIVALS`] behind.
-fn receive(
+/// Receives frames until told to stop or the link fails.
+fn read_frames(
     mut sock: TcpStream,
     mut reader: FrameReader,
-    arrivals: SyncSender<Arrival>,
-    stop: Arc<AtomicBool>,
-    timing: Arc<Timing>,
-    backlog: Arc<Backlog>,
-) {
-    let mut poll = None;
-    let mut last_read = Instant::now();
-    while !stop.load(Ordering::SeqCst) {
-        let wanted = timing.poll();
-        if poll != Some(wanted) {
-            if let Err(error) = sock.set_read_timeout(Some(wanted)) {
-                let _ = arrivals.send(Arrival::Failed(ReadError::Io(error.kind())));
-                return;
-            }
-            poll = Some(wanted);
-        }
-        let buffered = reader.has_buffered_frame();
-        let read = reader.read_once(&mut sock);
-        let at = if buffered { last_read } else { Instant::now() };
-        last_read = at;
-        let arrival = match read {
-            Ok(Some(frame)) => {
-                if !backlog.reserve(frame.len, &stop) {
-                    return;
-                }
-                Arrival::Frame(frame, at)
-            }
-            Ok(None) => Arrival::Nothing(at),
-            Err(error) => {
-                if !stop.load(Ordering::SeqCst) {
-                    let _ = arrivals.send(Arrival::Failed(error));
-                }
-                return;
-            }
-        };
-        if arrivals.send(arrival).is_err() {
-            return;
-        }
-    }
-}
-
-/// Receives frames until told to stop or the link fails: one thread reads
-/// and stamps them, and this one judges them in that order.
-fn read_frames(
-    sock: TcpStream,
-    reader: FrameReader,
     events: Sender<Event>,
     stop: Arc<AtomicBool>,
     shared: Arc<Shared>,
 ) {
-    let (arrivals_tx, arrivals) = mpsc::sync_channel(MAX_ARRIVALS);
-    let timing = Arc::new(Timing::new());
-    let backlog = Arc::new(Backlog::new());
-    let receiving = {
-        let stop = Arc::clone(&stop);
-        let timing = Arc::clone(&timing);
-        let backlog = Arc::clone(&backlog);
-        thread::spawn(move || receive(sock, reader, arrivals_tx, stop, timing, backlog))
-    };
-    judge_frames(&arrivals, &events, &stop, &shared, &timing, &backlog);
-    // The receiving thread ends with the socket or once nothing takes its
-    // arrivals; it is waited for here so the reader's thread outlives it.
-    backlog.finish();
-    drop(arrivals);
-    let _ = receiving.join();
-}
-
-/// Judges each arrival in the order it was read, at the time it was read.
-fn judge_frames(
-    arrivals: &Receiver<Arrival>,
-    events: &Sender<Event>,
-    stop: &AtomicBool,
-    shared: &Shared,
-    timing: &Timing,
-    backlog: &Backlog,
-) {
     let record = |cause| {
-        record_end(shared, cause);
+        record_end(&shared, cause);
     };
     // After an overflow, replies to a request already sent still arrive;
     // further notifications are not queued, even once budget is released.
     let mut overflowed = false;
-    // A change to what the worker waits on is announced only once everything
-    // that had arrived by then is judged, so a frame received before the
-    // change is never judged after the worker acts on it (R1-T-A).
-    let mut unsettled = false;
-    let changed = |unsettled: &mut bool, state: &mut State, changed: bool| {
-        if changed {
-            state.unsettled = true;
-            *unsettled = true;
-        }
-    };
+    if let Err(error) = sock.set_read_timeout(Some(READ_POLL)) {
+        note_loss(&shared, LinkLoss::SocketError(error.kind()));
+        record(RequestCause::ConnectionLost);
+        let _ = events.send(Event::ReadFailed(RequestCause::ConnectionLost));
+        return;
+    }
     while !stop.load(Ordering::SeqCst) {
-        // What the receiving thread reads for until the next arrival.
-        timing.set(shared.lock().next_due(), unsettled);
-        let Ok(arrival) = arrivals.recv() else { return };
-        if let Arrival::Frame(frame, _) = &arrival {
-            backlog.release(frame.len);
-        }
-        let at = match &arrival {
-            Arrival::Frame(_, at) | Arrival::Nothing(at) => *at,
-            Arrival::Failed(_) => Instant::now(),
-        };
-        // Everything due by then is decided before the frame read then.
-        {
-            let mut state = shared.lock();
-            let woke = state.advance(at);
-            changed(&mut unsettled, &mut state, woke);
-        }
-        match arrival {
-            Arrival::Frame(frame, at) => {
-                let Some(json) = frame.json else {
-                    let mut state = shared.lock();
-                    let woke = state.note_frame(None, at).1;
-                    changed(&mut unsettled, &mut state, woke);
-                    continue;
-                };
-                if lost_notification(&json) {
-                    note_loss(shared, LinkLoss::UnitLost);
-                    record(RequestCause::ConnectionLost);
-                }
-                let mut received = Received {
-                    message: json,
-                    len: frame.len,
-                    received_at_ms: now_ms(),
-                    cutoff: 0,
-                };
-                // Recipients and budget are decided here, at receipt.
-                match route(shared, &received, !overflowed) {
-                    Routed::NotNotification => {}
-                    Routed::Queued | Routed::Dropped => {
-                        let mut state = shared.lock();
-                        let woke = state.note_frame(None, at).1;
-                        changed(&mut unsettled, &mut state, woke);
-                        continue;
+        match reader.read_frame(&mut sock) {
+            Ok(Some(frame)) => {
+                if let Some(json) = frame.json {
+                    if lost_notification(&json) {
+                        note_loss(&shared, LinkLoss::UnitLost);
+                        record(RequestCause::ConnectionLost);
                     }
-                    Routed::Overflow => {
-                        if !overflowed {
-                            overflowed = true;
-                            record(RequestCause::NotificationOverflow);
-                            let _ =
-                                events.send(Event::ReadFailed(RequestCause::NotificationOverflow));
+                    let mut received = Received {
+                        message: json,
+                        len: frame.len,
+                        received_at_ms: now_ms(),
+                        cutoff: 0,
+                    };
+                    // Recipients and budget are decided here, at receipt.
+                    match route(&shared, &received, !overflowed) {
+                        Routed::NotNotification => {}
+                        Routed::Queued | Routed::Dropped => continue,
+                        Routed::Overflow => {
+                            if !overflowed {
+                                overflowed = true;
+                                record(RequestCause::NotificationOverflow);
+                                let _ = events
+                                    .send(Event::ReadFailed(RequestCause::NotificationOverflow));
+                            }
+                            continue;
                         }
-                        let mut state = shared.lock();
-                        let woke = state.note_frame(None, at).1;
-                        changed(&mut unsettled, &mut state, woke);
-                        continue;
+                    }
+                    received.cutoff = shared
+                        .notifications
+                        .as_ref()
+                        .map_or(0, |queue| lock(queue).accepted());
+                    if events.send(Event::Frame(received)).is_err() {
+                        return;
                     }
                 }
-                received.cutoff = shared
-                    .notifications
-                    .as_ref()
-                    .map_or(0, |queue| lock(queue).accepted());
-                // Judged and handed over under one hold of the state lock, so
-                // the worker never sees the request on the wire change between
-                // the two.
-                let mut state = shared.lock();
-                let (dropped, woke) = state.note_frame(Some(&received.message), at);
-                changed(&mut unsettled, &mut state, woke);
-                if !dropped && events.send(Event::Frame(received)).is_err() {
-                    return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if !stop.load(Ordering::SeqCst) {
+                    let cause = match error {
+                        ReadError::Oversized { .. } => RequestCause::InvalidResponse,
+                        ReadError::Closed => {
+                            note_loss(&shared, LinkLoss::PeerClosed);
+                            RequestCause::ConnectionLost
+                        }
+                        ReadError::Io(kind) => {
+                            note_loss(&shared, LinkLoss::SocketError(kind));
+                            RequestCause::ConnectionLost
+                        }
+                    };
+                    record(cause);
+                    let _ = events.send(Event::ReadFailed(cause));
                 }
-            }
-            // Nothing more had arrived by then: a change is announced now.
-            Arrival::Nothing(_) if unsettled => {
-                shared.lock().unsettled = false;
-                unsettled = false;
-                let _ = events.send(Event::Wake);
-            }
-            Arrival::Nothing(_) => {}
-            Arrival::Failed(error) => {
-                let cause = match error {
-                    ReadError::Oversized { .. } => RequestCause::InvalidResponse,
-                    ReadError::Closed => {
-                        note_loss(shared, LinkLoss::PeerClosed);
-                        RequestCause::ConnectionLost
-                    }
-                    ReadError::Io(kind) => {
-                        note_loss(shared, LinkLoss::SocketError(kind));
-                        RequestCause::ConnectionLost
-                    }
-                };
-                record(cause);
-                let _ = events.send(Event::ReadFailed(cause));
                 return;
             }
         }
     }
+}
+
+/// Records how the link was lost, unless that is already recorded; called
+/// before the `connection_lost` end it explains is recorded (R1-L-A).
+fn note_loss(shared: &Shared, loss: LinkLoss) {
+    lock(&shared.loss).get_or_insert(loss);
 }
 
 /// The worker: runs admitted requests one at a time until the connection
@@ -1985,12 +1502,6 @@ fn serve(
             return;
         }
     }
-}
-
-/// Records how the link was lost, unless that is already recorded; called
-/// before the `connection_lost` end it explains is recorded (R1-L-A).
-fn note_loss(shared: &Shared, loss: LinkLoss) {
-    lock(&shared.loss).get_or_insert(loss);
 }
 
 /// Records `cause` as the end of the connection unless one is recorded, and
@@ -2263,7 +1774,6 @@ impl Io<'_> {
             key: &key,
             send_end,
             cap,
-            tolerate: false,
             unstarted: &unstarted,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
@@ -2574,29 +2084,11 @@ fn execute(
             None
         }
     };
-    let tolerance = match options.response_timeouts {
-        ResponseTimeouts::Tolerate(tolerance) => Some(tolerance),
-        ResponseTimeouts::EndConnection => None,
-    };
-    if let Some(cause) = await_late_reply(inbox, shared, key, send_end, &unstarted) {
-        let failure = RequestFailure::Cause {
-            code: cause,
-            phase: RequestPhase::Admission,
-        };
-        return (
-            Outcome::Failure {
-                failure,
-                evidence: Evidence::NotSent,
-            },
-            Some(cause),
-        );
-    }
     let outbound = Outbound {
         frame,
         key,
         send_end,
         cap: None,
-        tolerate: tolerance.is_some(),
         unstarted: &unstarted,
     };
     match exchange(sock, inbox, shared, options, outbound) {
@@ -2613,77 +2105,15 @@ fn execute(
                 Held::Ended(cause) => (at_delivery(outcome, cause), Some(cause)),
             }
         }
-        Err(failed) => {
-            let outcome = Outcome::Failure {
+        Err(failed) => (
+            Outcome::Failure {
                 failure: failed.failure,
                 evidence: failed.evidence,
-            };
-            (outcome, failed.ends)
-        }
+            },
+            failed.ends,
+        ),
     }
 }
-
-/// Waits, before a request is sent, until no reply with its `key` is owed
-/// (R1-T-A). The reader decides when one is no longer owed and wakes the
-/// worker; the wait ends early at `send_end` or once the request must not
-/// start, leaving those to the send. Returns the cause that ends the
-/// connection, if one arrives first.
-fn await_late_reply(
-    inbox: &Receiver<Event>,
-    shared: &Shared,
-    key: &ReplyKey,
-    send_end: Instant,
-    unstarted: &dyn Fn(&State) -> Option<Stop>,
-) -> Option<RequestCause> {
-    loop {
-        if let Some(cause) = *shared.link_end() {
-            return Some(cause);
-        }
-        {
-            let state = shared.lock();
-            if unstarted(&state).is_some() {
-                return None;
-            }
-            // A reply with this key that just stopped being owed may still
-            // have arrived unread; the reader announces when it has read it.
-            let owed = state.late.iter().any(|late| &late.key == key)
-                || (state.unsettled && state.stale.contains(key));
-            if !owed {
-                return None;
-            }
-        }
-        let now = Instant::now();
-        if now >= send_end {
-            return None;
-        }
-        match inbox.recv_timeout(send_end - now) {
-            Ok(Event::Frame(received)) => {
-                if lost_notification(&received.message) {
-                    note_loss(shared, LinkLoss::UnitLost);
-                    return Some(RequestCause::ConnectionLost);
-                }
-            }
-            Ok(Event::Wake) | Err(RecvTimeoutError::Timeout) => {}
-            Ok(Event::ReadFailed(cause)) => return Some(cause),
-            Err(RecvTimeoutError::Disconnected) => return Some(RequestCause::InternalError),
-        }
-    }
-}
-
-/// Clears the request on the wire when its exchange ends, however it ends.
-struct InflightGuard<'a>(Option<&'a Shared>);
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(shared) = self.0 {
-            shared.lock().inflight = None;
-        }
-    }
-}
-
-/// How long past a tolerated deadline the worker waits for the reader's
-/// verdict before deciding itself: only a reader that cannot run reaches it.
-const READER_FALLBACK: Duration = Duration::from_secs(1);
 
 /// The matching reply of one exchange.
 struct Answer {
@@ -2810,9 +2240,6 @@ struct Failed {
     evidence: Evidence,
     /// The cause that ends the connection, if this failure does.
     ends: Option<RequestCause>,
-    /// A response deadline the connection tolerates (R1-T-A): its reply is
-    /// still owed.
-    late: bool,
 }
 
 impl Failed {
@@ -2821,7 +2248,6 @@ impl Failed {
             failure: RequestFailure::Cause { code: cause, phase },
             evidence,
             ends: ends.then_some(cause),
-            late: false,
         }
     }
 
@@ -2832,21 +2258,6 @@ impl Failed {
             },
             evidence: Evidence::NotSent,
             ends: None,
-            late: false,
-        }
-    }
-
-    /// A tolerated response deadline: unconfirmed, and the connection goes
-    /// on unless the deadline was the run's `limit`-th.
-    fn tolerated(ends: bool) -> Self {
-        Failed {
-            failure: RequestFailure::Cause {
-                code: RequestCause::ResponseTimeout,
-                phase: RequestPhase::Response,
-            },
-            evidence: Evidence::Unconfirmed,
-            ends: ends.then_some(RequestCause::ResponseTimeout),
-            late: true,
         }
     }
 }
@@ -2860,8 +2271,6 @@ struct Outbound<'a> {
     send_end: Instant,
     /// A teardown budget's end, which also bounds the response wait.
     cap: Option<Instant>,
-    /// Whether a response deadline leaves the connection open (R1-T-A).
-    tolerate: bool,
     /// Whether a frame not yet started must not start.
     unstarted: &'a dyn Fn(&State) -> Option<Stop>,
 }
@@ -2878,7 +2287,6 @@ fn exchange(
         key,
         send_end,
         cap,
-        tolerate,
         unstarted,
     } = outbound;
     if Instant::now() >= send_end {
@@ -2889,25 +2297,6 @@ fn exchange(
             false,
         ));
     }
-    // Under the tolerating policy the reader judges every reply to the
-    // request on the wire in arrival order, so it is told of the request
-    // before a byte of it is written (R1-T-A).
-    let tolerance = match options.response_timeouts {
-        ResponseTimeouts::Tolerate(tolerance) => Some(tolerance),
-        ResponseTimeouts::EndConnection => None,
-    };
-    let _inflight = InflightGuard(tolerance.map(|_| {
-        let mut state = shared.lock();
-        // From now on a reply with this key is this request's.
-        state.stale.retain(|stale| stale != key);
-        state.inflight = Some(Inflight {
-            key: key.clone(),
-            deadline: None,
-            tolerance: tolerance.filter(|_| tolerate),
-            verdict: InflightVerdict::Waiting,
-        });
-        shared
-    }));
     match write_frame(sock, shared, frame, send_end, unstarted) {
         Ok(()) => {}
         Err(WriteError::Stopped(Stop::Closing)) => {
@@ -2935,11 +2324,6 @@ fn exchange(
         Some(cap) if cap < response_end => (cap, RequestCause::TeardownTimeout),
         _ => (response_end, RequestCause::ResponseTimeout),
     };
-    if let Some(inflight) = shared.lock().inflight.as_mut() {
-        inflight.deadline = Some(response_end);
-    }
-    // A tolerated deadline is the reader's to decide.
-    let tolerated = tolerate && tolerance.is_some() && timeout == RequestCause::ResponseTimeout;
     // A response-phase failure ends the connection: the cause is recorded
     // as its end when chosen, unless an earlier end was recorded, which is
     // reported instead.
@@ -2955,12 +2339,7 @@ fn exchange(
     // still awaited within its deadline and kept as evidence.
     let mut ending = None;
     loop {
-        let wait_end = if tolerated {
-            response_end + READER_FALLBACK
-        } else {
-            response_end
-        };
-        let remaining = wait_end.saturating_duration_since(Instant::now());
+        let remaining = response_end.saturating_duration_since(Instant::now());
         let event = if remaining.is_zero() {
             Err(RecvTimeoutError::Timeout)
         } else {
@@ -2974,11 +2353,6 @@ fn exchange(
                 }
                 let inbound = Inbound::new(received.message);
                 if inbound.reply(key).is_some() {
-                    // Any reply, a rejection included, is the unit answering
-                    // (the reader has ended the run when it judged it).
-                    if tolerance.is_none() {
-                        shared.lock().timeouts = 0;
-                    }
                     return Ok(Answer {
                         inbound,
                         cutoff: received.cutoff,
@@ -2986,30 +2360,11 @@ fn exchange(
                     });
                 }
             }
+            Ok(Event::Wake) => {}
             Ok(Event::ReadFailed(RequestCause::NotificationOverflow)) => {
                 ending = Some(RequestCause::NotificationOverflow);
             }
             Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
-            // A tolerated deadline (R1-T-A) is decided by the reader, which
-            // wakes the worker; a reader that cannot run leaves it to the
-            // worker's own clock. An overflow met while waiting still ends it.
-            Ok(Event::Wake) | Err(RecvTimeoutError::Timeout) if tolerated => {
-                let fell_back = matches!(event, Err(RecvTimeoutError::Timeout));
-                let verdict = {
-                    let mut state = shared.lock();
-                    if fell_back {
-                        state.advance(Instant::now());
-                    }
-                    state.inflight.as_ref().map(|inflight| inflight.verdict)
-                };
-                if let Some(InflightVerdict::Expired { ends }) = verdict {
-                    if let Some(cause) = ending {
-                        return unconfirmed(cause);
-                    }
-                    return Err(Failed::tolerated(ends));
-                }
-            }
-            Ok(Event::Wake) => {}
             Err(RecvTimeoutError::Timeout) => return unconfirmed(ending.unwrap_or(timeout)),
             Err(RecvTimeoutError::Disconnected) => return unconfirmed(RequestCause::InternalError),
         }
