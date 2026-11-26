@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FX_RETURN_RULES } from "../src/catalog/fx-return.js";
+import { HI_Z_JACKS, INPUT_JACKS } from "../src/catalog/inputs.js";
 import type { Model } from "../src/catalog/models.js";
 import { settingDefinitions, type SettingDefinitionBase, type SettingId } from "../src/catalog/settings.js";
 import type { UrxfChunk, UrxfFile } from "../src/catalog/urxf.js";
@@ -94,17 +95,17 @@ describe("CURRENT composition (K36, F18)", () => {
       expect(plan.omissions.some((o) => o.setting === "bus.fader" && (o.target as { bus: string }).bus === "mix-1")).toBe(true);
       expect(plan.steps.some((s) => s.setting === "bus.fader" && (s.target as { bus: string }).bus === "stereo")).toBe(true);
       expect(new Set(omitted("device.brightness"))).toEqual(new Set(["excluded_by_scope"]));
-      // GEQ writes need the live EQ Type (and Limit for gain): phase-5 steps planned at execution.
+      // F18-G-A: every bus's file EQ Type here is PEQ, so no GEQ setting is a step. STEREO's non-20 Hz gains are
+      // not_writable (that reason comes first, F18-R-A); every other GEQ row is inactive_bank.
       for (const setting of ["bus.geq.on", "bus.geq.link", "bus.geq.limit", "bus.geq.gain"] as const) {
-        const live = plan.steps.filter((s) => s.setting === setting);
-        expect(live.length, `${model} ${setting}`).toBeGreaterThan(0);
-        expect(new Set(live.map((s) => `${s.phase} ${String(s.planned)}`)), `${model} ${setting}`).toEqual(new Set(["5 null"]));
+        expect(plan.steps.filter((s) => s.setting === setting), `${model} ${setting}`).toEqual([]);
       }
-      // STEREO GEQ gain writes the 20 Hz band only: its other bands are not_writable omissions, not steps.
-      const stereoGain = (entries: readonly { setting: string; target: unknown }[]) =>
-        entries.filter((e) => e.setting === "bus.geq.gain" && (e.target as { bus: string }).bus === "stereo").map((e) => (e.target as { band: string }).band);
-      expect(new Set(stereoGain(plan.steps)), model).toEqual(new Set(["20"]));
-      expect(stereoGain(plan.omissions).length, model).toBe(2 * 30);
+      const geqReasons = (setting: SettingId) =>
+        new Set(plan.omissions.filter((o) => o.setting === setting).map((o) => `${(o.target as { bus: string }).bus} ${o.reason}`));
+      expect(geqReasons("bus.geq.on"), model).toEqual(new Set(["stereo inactive_bank", "mix-1 inactive_bank", "mix-2 inactive_bank"]));
+      expect(geqReasons("bus.geq.gain"), model).toEqual(new Set(["stereo not_writable", "stereo inactive_bank", "mix-1 inactive_bank", "mix-2 inactive_bank"]));
+      const stereoGain = plan.omissions.filter((o) => o.setting === "bus.geq.gain" && (o.target as { bus: string }).bus === "stereo");
+      expect(stereoGain.filter((o) => o.reason === "inactive_bank").map((o) => (o.target as { band: string }).band), model).toEqual(["20", "20"]);
       // Bus names and colors in phase 10 (OV-BUS): STEREO and FX 1/2 are steps; MIX 1/2 are not_writable omissions.
       for (const setting of ["bus.name", "bus.color"] as const) {
         const stepped = plan.steps.filter((s) => s.setting === setting).map((s) => [s.phase, (s.target as { bus: string }).bus]);
@@ -154,6 +155,66 @@ describe("CURRENT composition (K36, F18)", () => {
       expect(size, model).toBeLessThanOrEqual(PLAN_ITEM_LIMIT);
       expect(() => planCurrent(file, model, size), model).not.toThrow();
       expect(() => planCurrent(file, model, size - 1), model).toThrow(/invalid_input/);
+    }
+  });
+
+  it("apply the GEQ bank only where the file's EQ Type is Flex12GEQ, as live phase-5 steps (F18-G-A)", () => {
+    for (const model of models) {
+      // STEREO and MIX 1 store Flex12GEQ (raw 2); MIX 2 stays PEQ.
+      const plan = planCurrent(synthesize(model, { "497:0": 2, "590:0": 2 }), model);
+      for (const setting of ["bus.geq.on", "bus.geq.link", "bus.geq.limit", "bus.geq.gain"] as const) {
+        const live = plan.steps.filter((s) => s.setting === setting);
+        expect(new Set(live.map((s) => (s.target as { bus: string }).bus)), `${model} ${setting}`).toEqual(new Set(["stereo", "mix-1"]));
+        expect(new Set(live.map((s) => `${s.phase} ${String(s.planned)}`)), `${model} ${setting}`).toEqual(new Set(["5 null"]));
+        const mix2 = plan.omissions.filter((o) => o.setting === setting && (o.target as { bus: string }).bus === "mix-2").map((o) => o.reason);
+        expect(new Set(mix2), `${model} ${setting}`).toEqual(new Set(["inactive_bank"]));
+      }
+      const stereoGain = plan.steps.filter((s) => s.setting === "bus.geq.gain" && (s.target as { bus: string }).bus === "stereo");
+      expect(new Set(stereoGain.map((s) => (s.target as { band: string }).band)), model).toEqual(new Set(["20"]));
+    }
+  });
+
+  it("send a Delay's Sync, BPM, Note, the rest, then Delay Time; omit the time with Sync On (F18-D-A)", () => {
+    const delay = FX_RETURN_RULES["bus.fx.parameter"].effects["mono-delay"];
+    const stored: Record<string, number> = { "679:0": 1024 };
+    for (const field of Object.values(delay?.parameters ?? {})) {
+      if (field === undefined || field.value.kind === "context-stops") continue;
+      const codec = codecOf(field.value);
+      stored[`681:${field.slot}`] = CANDIDATES.find((raw) => codec.decode(`${raw}`) !== undefined) as number;
+    }
+    for (const model of models) {
+      for (const sync of [0, 1]) {
+        const plan = planCurrent(synthesize(model, { ...stored, "681:4": sync }), model);
+        const fx1 = (entries: readonly { setting: string; target: unknown }[]) =>
+          entries.filter((e) => e.setting === "bus.fx.parameter" && (e.target as { bus: string }).bus === "fx-1").map((e) => (e.target as { parameter: string }).parameter);
+        const rest = ["feedback", "hi-ratio", "hpf", "lpf"];
+        expect(fx1(plan.steps), `${model} sync ${sync}`).toEqual(["sync", "bpm", "note", ...rest, ...(sync === 0 ? ["delay-time"] : [])]);
+        expect(fx1(plan.omissions), `${model} sync ${sync}`).toEqual(sync === 1 ? ["delay-time"] : []);
+        if (sync === 1) {
+          expect(plan.omissions.find((o) => o.setting === "bus.fx.parameter")?.reason).toBe("device_controlled");
+        }
+      }
+    }
+  });
+
+  it("send phantom and HI-Z Off requests before On requests, phantom first in each, then gain and Clip Safe (F18-IN-B)", () => {
+    for (const model of models) {
+      const jacks = INPUT_JACKS[model];
+      const hiZ = HI_Z_JACKS[model];
+      // Alternate: odd jacks phantom On / HI-Z Off, even jacks phantom Off / HI-Z On.
+      const stored: Record<string, number> = {};
+      for (const jack of jacks) {
+        stored[`0:${jack - 1}`] = jack % 2;
+        if (hiZ.includes(jack)) stored[`6:${jack - 1}`] = 1 - (jack % 2);
+      }
+      const plan = planCurrent(synthesize(model, stored), model);
+      const phase3 = plan.steps.filter((s) => s.phase === 3).map((s) => `${s.setting} ${(s.target as { input?: number }).input ?? ""} ${String(s.requested)}`);
+      const off = [...jacks.filter((j) => j % 2 === 0).map((j) => `input.phantom ${j} false`), ...hiZ.filter((j) => j % 2 === 1).map((j) => `input.hi-z ${j} false`)];
+      const on = [...jacks.filter((j) => j % 2 === 1).map((j) => `input.phantom ${j} true`), ...hiZ.filter((j) => j % 2 === 0).map((j) => `input.hi-z ${j} true`)];
+      expect(phase3.slice(0, off.length + on.length), model).toEqual([...off, ...on]);
+      const kinds = phase3.map((entry) => entry.split(" ")[0]);
+      expect(kinds.indexOf("input.gain"), model).toBe(off.length + on.length);
+      expect(kinds.lastIndexOf("input.gain"), model).toBeLessThan(kinds.indexOf("input.clip-safe"));
     }
   });
 

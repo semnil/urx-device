@@ -52,7 +52,9 @@ function writeValueOf(decoded: unknown): unknown {
   return decoded;
 }
 
-/** Settings whose plan needs a live prerequisite read: planned at execution. */
+/** The Flex12GEQ bank settings, applied only where the file's EQ Type is Flex12GEQ (F18-G-A). */
+const GEQ_BANK: ReadonlySet<SettingId> = new Set<SettingId>(["bus.geq.on", "bus.geq.link", "bus.geq.limit", "bus.geq.gain"]);
+
 /** Settings whose plan needs a live prerequisite read (F07-G, F06-F): planned at execution, checked statically here. */
 const LIVE: ReadonlySet<SettingId> = new Set<SettingId>(["bus.geq.on", "bus.geq.link", "bus.geq.limit", "bus.geq.gain", "bus.fx.parameter"]);
 
@@ -89,11 +91,6 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
       }
       for (const target of targetsOf(rule, model)) {
         const requested = value(setting, target);
-        const native = control(setting, target);
-        if (native !== undefined) {
-          omit(setting, target, native);
-          continue;
-        }
         const args = [setting, target, requested] as unknown as WriteArgs;
         let planned: unknown = null;
         try {
@@ -111,11 +108,23 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
           }
           throw error;
         }
+        // One reason per omission, in F18-R-A's precedence: not writable, then the bank rule, then device control.
+        // F18-G-A: with the file's EQ Type PEQ, the bus's GEQ bank is not applied.
+        if (GEQ_BANK.has(setting) && value("bus.eq.type", { bus: (target as { bus: string }).bus }) === "peq") {
+          omit(setting, target, "inactive_bank");
+          continue;
+        }
+        const native = control(setting, target);
+        if (native !== undefined) {
+          omit(setting, target, native);
+          continue;
+        }
         room();
         steps.push({ phase, setting, target, component: null, requested, planned });
       }
     }
   }
+  orderInputSwitches(steps);
   // Scope exclusions present in the catalog for this model, in catalog order.
   for (const [setting, reason] of Object.entries(EXCLUDED) as [SettingId, OmissionReason][]) {
     const rule = (settingDefinitions as Record<string, SettingDefinitionBase>)[setting]?.rule;
@@ -170,7 +179,6 @@ function planFxParameters(
   omit: (setting: SettingId, target: object, reason: OmissionReason) => void,
   room: () => void,
 ): void {
-  void omit;
   const rule: FxParameterRule = FX_RETURN_RULES["bus.fx.parameter"];
   for (const bus of ["fx-1", "fx-2"] as const) {
     const effect = decodeFileSetting(chunk, model, ...(["bus.fx.type", { bus }] as unknown as ReadArgs)) as string;
@@ -184,7 +192,12 @@ function planFxParameters(
       return typeof stored === "number" ? `${stored}` : invalid();
     };
     const names = Object.keys(effectRule.parameters);
-    const ordered = names.includes("room-size") ? ["room-size", ...names.filter((name) => name !== "room-size")] : names;
+    // REV-X: Room Size before Reverb Time. Delay (F18-D-A): Sync, BPM, Note, the rest, then Delay Time.
+    const ordered = names.includes("room-size")
+      ? ["room-size", ...names.filter((name) => name !== "room-size")]
+      : names.includes("sync")
+        ? [...DELAY_FIRST, ...names.filter((name) => !DELAY_FIRST.includes(name) && name !== "delay-time"), "delay-time"]
+        : names;
     for (const parameter of ordered) {
       const field = effectRule.parameters[parameter];
       if (field === undefined) {
@@ -201,8 +214,41 @@ function planFxParameters(
       if (requested === undefined) {
         invalid();
       }
+      const target = { bus, effect, parameter };
+      // Every stored value is checked before any write, an omitted Delay Time included (F18-D-A, F18-V).
+      validateSetting(model, ...(["bus.fx.parameter", target, requested] as unknown as WriteArgs));
+      if (parameter === "delay-time" && codecOf({ kind: "switch" }).decode(raw(effectRule.parameters["sync"]?.slot ?? -1)) === true) {
+        omit("bus.fx.parameter", target, "device_controlled");
+        continue;
+      }
       room();
-      steps.push({ phase, setting: "bus.fx.parameter", target: { bus, effect, parameter }, component: null, requested, planned: null });
+      steps.push({ phase, setting: "bus.fx.parameter", target, component: null, requested, planned: null });
     }
   }
+}
+
+/** The Delay parameters sent first, in this order (F18-D-A). */
+const DELAY_FIRST = ["sync", "bpm", "note"];
+
+/**
+ * F18-IN-B: the file's phantom and HI-Z switches, Off requests before On
+ * requests, phantom before HI-Z within each, jacks ascending. The block is
+ * contiguous in phase 3, ahead of analog gain and Clip Safe.
+ */
+function orderInputSwitches(steps: PlannedStep[]): void {
+  const first = steps.findIndex((step) => step.setting === "input.phantom" || step.setting === "input.hi-z");
+  if (first === -1) {
+    return;
+  }
+  let end = first;
+  while (end < steps.length && (steps[end]?.setting === "input.phantom" || steps[end]?.setting === "input.hi-z")) {
+    end += 1;
+  }
+  const block = steps.slice(first, end);
+  const group = (on: boolean, setting: SettingId) => block.filter((step) => step.setting === setting && step.requested === on);
+  const ordered = [...group(false, "input.phantom"), ...group(false, "input.hi-z"), ...group(true, "input.phantom"), ...group(true, "input.hi-z")];
+  if (ordered.length !== block.length) {
+    return invalid();
+  }
+  steps.splice(first, block.length, ...ordered);
 }
