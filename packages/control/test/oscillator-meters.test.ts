@@ -107,6 +107,19 @@ describe("oscillator (F09-O)", () => {
         expect(none.calls, label).toEqual([]);
       }
     }
+    // A setting whose every destination takes a side still requires one for a bus without it (F07-G, F07-R).
+    for (const id of ["bus.geq.on", "bus.geq.limit", "bus.source"]) {
+      for (const [target, code] of [
+        [{ bus: "fx-1" }, "invalid_input"],
+        [{ bus: "fx-1", side: undefined }, "invalid_input"],
+        [{ bus: "fx-1", side: "left" }, "unsupported_operation"],
+        [{ bus: "fx-1", side: "middle" }, "invalid_input"],
+      ] as const) {
+        const none = new FakeTransport();
+        expect((await failureOf(readAny(new OperationContext(none, "URX44"), id, target)))?.code, `${id} ${JSON.stringify(target)}`).toBe(code);
+        expect(none.calls).toEqual([]);
+      }
+    }
   });
 });
 

@@ -524,6 +524,8 @@ function busSide(model: string, target: unknown, known: readonly string[], extra
 export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
   // A port choice depends on the model; any other codec is built once.
   const fixed = rule.value.kind === "port-choice" ? undefined : codecOf(rule.value);
+  // Only a setting with a sideless destination (oscillator.assign's FX) lets a target omit the side.
+  const sideOptional = Object.values(rule.address).some((entry) => entry?.sideless === true);
   return handler<V>((model, target, write) => {
     modelOf(model);
     const own = targetOf<{ bus?: unknown; side?: unknown }>(target, ["bus", "side"]);
@@ -532,9 +534,11 @@ export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
     }
     const bus = own.bus;
     const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
-    // A known bus without the setting is unsupported with or without a side; a malformed side is still invalid.
+    // A known bus without the setting is unsupported given a valid side, or no side where the setting takes
+    // sideless targets; a missing side elsewhere, or a malformed one, is invalid.
     if (at === undefined) {
-      return refuse(own.side === undefined || SIDES.includes(own.side as "left") ? "unsupported_operation" : "invalid_input");
+      const sideOk = SIDES.includes(own.side as "left") || (sideOptional && own.side === undefined);
+      return refuse(sideOk ? "unsupported_operation" : "invalid_input");
     }
     // A mono bus takes no side; every other bus requires one.
     if (at?.sideless === true ? own.side !== undefined : !SIDES.includes(own.side as "left")) {
