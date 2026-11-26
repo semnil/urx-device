@@ -66,7 +66,7 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
         { address: at(ids.link, ids.rep), value: "1" },
       ]);
     }
-    // EQ Type and EQ On writes await F03-G evidence: known read-only settings.
+    // STEREO EQ Type and EQ On writes await F03-G evidence on every model (the MIX EQ On: partner-writes.test.ts).
     for (const id of ["bus.eq.type", "bus.eq.on"]) {
       expect((await failureOf(writeAny(new OperationContext(new FakeTransport(), "URX44"), id, { bus: "stereo" }, id.endsWith("type") ? "peq" : true)))?.code).toBe(
         "unsupported_operation",

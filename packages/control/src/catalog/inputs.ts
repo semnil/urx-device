@@ -1,9 +1,12 @@
 // Physical inputs (F02-B) and source-owned digital gain (F03-G): model
 // coverage, addresses and ranges. Source and router references are in the
-// design record; nothing here was measured on hardware.
+// design record. The one measured fact is the source gain write sequence of
+// the sources bound on the models in PARTNER_FOLLOWS; the rest was not
+// measured on hardware.
 
 import { frozen } from "./frozen.js";
-import type { Model } from "./models.js";
+import { PARTNER_FOLLOWS, type Model } from "./models.js";
+import type { WriteGate } from "./rules.js";
 
 /** Physical MIC/LINE jacks per model, numbered from 1. */
 export const INPUT_JACKS: Readonly<Record<Model, readonly number[]>> = frozen({
@@ -58,10 +61,12 @@ export interface SourceGainAddress {
   /** Known instance `y` values; the first is the one read (F03-G). */
   readonly instances: readonly number[];
   /**
-   * The instances a write sends, in order, when its write sequence is
-   * established; null while the evidence is missing (F03-G, V-HW).
+   * The instances a write sends, in order, on the models `bound` names; null
+   * while no model's write sequence is evidenced (F03-G, V-HW).
    */
   readonly writes: readonly number[] | null;
+  /** The models on which `writes` is evidenced (F03-G). */
+  readonly bound: WriteGate;
 }
 
 const ALL: readonly Model[] = ["URX22", "URX44", "URX44V"];
@@ -69,19 +74,22 @@ const LARGER: readonly Model[] = ["URX44", "URX44V"];
 
 /** Source gain addresses; x is 0 throughout. */
 export const SOURCE_GAIN: Readonly<Record<SourceToken, SourceGainAddress>> = frozen({
-  aux: { models: ALL, paramId: 9, instances: [0, 1], writes: null },
-  "sd-playback": { models: LARGER, paramId: 11, instances: [0, 1], writes: null },
-  "usb-daw-1-2": { models: ALL, paramId: 12, instances: [0], writes: [0] },
-  "usb-daw-3-4": { models: ALL, paramId: 12, instances: [2], writes: [2] },
-  "usb-daw-5-6": { models: ALL, paramId: 12, instances: [4], writes: [4] },
-  "usb-daw-7-8": { models: ALL, paramId: 12, instances: [6], writes: [6] },
-  "usb-daw-9-10": { models: ALL, paramId: 12, instances: [8], writes: [8] },
-  "usb-daw-11-12": { models: LARGER, paramId: 12, instances: [10], writes: [10] },
-  "usb-main-a": { models: ALL, paramId: 13, instances: [0, 1], writes: null },
-  "usb-main-b": { models: ALL, paramId: 14, instances: [0, 1], writes: null },
-  "usb-main-c": { models: ALL, paramId: 15, instances: [0, 1], writes: null },
-  "usb-sub": { models: ALL, paramId: 16, instances: [0, 1], writes: null },
-  hdmi: { models: ["URX44V"], paramId: 17, instances: [0, 1], writes: null },
+  // AUX and USB MAIN B/C: on URX22 the partner's value follows one write, but the audio of both lanes is not
+  // on record for them, so their writes stay unbound until it is (F03-G).
+  aux: { models: ALL, paramId: 9, instances: [0, 1], writes: null, bound: false },
+  "sd-playback": { models: LARGER, paramId: 11, instances: [0, 1], writes: null, bound: false },
+  "usb-daw-1-2": { models: ALL, paramId: 12, instances: [0], writes: [0], bound: true },
+  "usb-daw-3-4": { models: ALL, paramId: 12, instances: [2], writes: [2], bound: true },
+  "usb-daw-5-6": { models: ALL, paramId: 12, instances: [4], writes: [4], bound: true },
+  "usb-daw-7-8": { models: ALL, paramId: 12, instances: [6], writes: [6], bound: true },
+  "usb-daw-9-10": { models: ALL, paramId: 12, instances: [8], writes: [8], bound: true },
+  "usb-daw-11-12": { models: LARGER, paramId: 12, instances: [10], writes: [10], bound: true },
+  // USB MAIN A and USB SUB: one representative write changed both lanes' audio on URX22 (F03-G).
+  "usb-main-a": { models: ALL, paramId: 13, instances: [0, 1], writes: [0], bound: PARTNER_FOLLOWS },
+  "usb-main-b": { models: ALL, paramId: 14, instances: [0, 1], writes: null, bound: false },
+  "usb-main-c": { models: ALL, paramId: 15, instances: [0, 1], writes: null, bound: false },
+  "usb-sub": { models: ALL, paramId: 16, instances: [0, 1], writes: [0], bound: PARTNER_FOLLOWS },
+  hdmi: { models: ["URX44V"], paramId: 17, instances: [0, 1], writes: null, bound: false },
 });
 
 export function isSourceToken(value: unknown): value is SourceToken {

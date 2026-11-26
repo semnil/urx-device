@@ -1,14 +1,16 @@
 // Insert-FX selector and on rules (F06-I): mono input channels (135 / 134,
 // y N − 1), STEREO (578 / 577, y 0) and MIX 1/2 (671 / 670, y 0 or 2). The
-// MIX selector and on have a partner instance: their writes await F03-G
-// evidence and stay unbound. Each selector carries F06-I's definition limits
-// (rate ceiling, mono only, shared slot) for help; no operation reads the
-// state they depend on. Effect parameters (F06-P) await hardware evidence of
+// MIX selector and on have a partner instance: the on switch writes the
+// representative once on the models in PARTNER_FOLLOWS (F03-G); the selector,
+// and the on switch elsewhere, stay unbound. Each selector carries F06-I's
+// definition limits (rate ceiling, mono only, shared slot) for help; no
+// operation reads the state they depend on. Effect parameters (F06-P) await hardware evidence of
 // the shared-engine layout and have no rule.
 
 import { byToken, frozen } from "./frozen.js";
 import { BUS_TOKENS } from "./buses.js";
-import type { BusSettingRule, ChannelSettingRule, SelectorLimits, SelectorRule } from "./rules.js";
+import { PARTNER_FOLLOWS } from "./models.js";
+import type { BusSettingRule, ChannelSettingRule, SelectorLimits, SelectorRule, WriteGate } from "./rules.js";
 
 const NONE = { value: "none", raw: "4294967295" } as const;
 
@@ -72,15 +74,15 @@ const OUTPUT: SelectorRule = {
   }),
 };
 
-const outputs = (stereo: number, mix: number): BusSettingRule["address"] => ({
+const outputs = (stereo: number, mix: number, mixWrite: WriteGate): BusSettingRule["address"] => ({
   stereo: { paramId: stereo, y: 0, write: true },
-  "mix-1": { paramId: mix, y: 0, write: false },
-  "mix-2": { paramId: mix, y: 2, write: false },
+  "mix-1": { paramId: mix, y: 0, write: mixWrite },
+  "mix-2": { paramId: mix, y: 2, write: mixWrite },
 });
 
 export const INSERT_FX_RULES = frozen({
   "channel.insert-fx.type": { target: "channel", address: { mono: 135 }, value: INPUT },
   "channel.insert-fx.on": { target: "channel", address: { mono: 134 }, value: { kind: "switch" } },
-  "bus.insert-fx.type": { target: "bus", known: BUS_TOKENS, address: outputs(578, 671), value: OUTPUT },
-  "bus.insert-fx.on": { target: "bus", known: BUS_TOKENS, address: outputs(577, 670), value: { kind: "switch" } },
+  "bus.insert-fx.type": { target: "bus", known: BUS_TOKENS, address: outputs(578, 671, false), value: OUTPUT },
+  "bus.insert-fx.on": { target: "bus", known: BUS_TOKENS, address: outputs(577, 670, PARTNER_FOLLOWS), value: { kind: "switch" } },
 } as const satisfies Record<string, ChannelSettingRule | BusSettingRule>);

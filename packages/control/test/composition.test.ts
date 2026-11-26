@@ -92,7 +92,11 @@ describe("CURRENT composition (K36, F18)", () => {
       // Writes awaiting evidence and read-only settings are known omissions, not steps.
       expect(new Set(omitted("channel.stereo-link")), model).toEqual(new Set(["not_writable"]));
       expect(new Set(omitted("bus.type")), model).toEqual(new Set(["not_writable"]));
-      expect(plan.omissions.some((o) => o.setting === "bus.fader" && (o.target as { bus: string }).bus === "mix-1")).toBe(true);
+      // The MIX fader's one write is evidenced on URX22 only (F03-G): a step there, an omission elsewhere.
+      const mixFader = (entries: readonly { setting: string; target: unknown }[]) =>
+        entries.some((e) => e.setting === "bus.fader" && (e.target as { bus: string }).bus === "mix-1");
+      expect(mixFader(plan.steps), model).toBe(model === "URX22");
+      expect(mixFader(plan.omissions), model).toBe(model !== "URX22");
       expect(plan.steps.some((s) => s.setting === "bus.fader" && (s.target as { bus: string }).bus === "stereo")).toBe(true);
       expect(new Set(omitted("device.brightness"))).toEqual(new Set(["excluded_by_scope"]));
       // F18-G-A: every bus's file EQ Type here is PEQ, so no GEQ setting is a step. STEREO's non-20 Hz gains are
@@ -117,6 +121,9 @@ describe("CURRENT composition (K36, F18)", () => {
         expect(new Set(omitted(setting)), `${model} ${setting}`).toEqual(new Set(["not_writable"]));
         const skipped = plan.omissions.filter((o) => o.setting === setting).map((o) => (o.target as { bus: string }).bus);
         expect(skipped.slice(0, 2), `${model} ${setting}`).toEqual(["mix-1", "mix-2"]);
+        // STREAMING's one write is evidenced on URX22 only (F03-G): a step there, an omission elsewhere.
+        expect(stepped.some(([, bus]) => bus === "stream"), `${model} ${setting}`).toBe(model === "URX22");
+        expect(skipped.includes("stream"), `${model} ${setting}`).toBe(model !== "URX22");
       }
       // Every catalog setting is in a phase or excluded.
       const covered = new Set<string>([...PHASES.flatMap((p) => p.settings), ...Object.keys(EXCLUDED)]);
@@ -196,6 +203,44 @@ describe("CURRENT composition (K36, F18)", () => {
       expect(() => planCurrent(synthesize(model, { "497:0": 2, "766:0": 88200 }), model), model).toThrow(/invalid_input/);
       expect(planCurrent(synthesize(model, { "766:0": 96000 }), model).fileRate, model).toBe(96000);
       expect(planCurrent(synthesize(model, { "497:0": 2, "590:0": 2, "766:0": 44100 }), model).fileRate, model).toBe(44100);
+    }
+  });
+
+  it("plan on URX22 only the MIX sends whose one write was measured, whatever the file's Pan Link (F03-G)", () => {
+    const measured = [
+      "send.level channel-1 mix-1",
+      "send.level channel-1 mix-2",
+      "send.level channel-2 mix-1",
+      "send.pan channel-1 mix-1",
+      "send.pan channel-1 mix-2",
+      "send.on channel-1 mix-1",
+      "send.on channel-1 mix-2",
+      "send.level channel-3 mix-1",
+      "send.level channel-3 mix-2",
+      "send.on channel-3 mix-1",
+      "send.level fx-1 mix-1",
+      "send.level fx-1 mix-2",
+      "send.level fx-2 mix-1",
+      "send.pan fx-1 mix-1",
+      "send.on fx-1 mix-1",
+    ].sort();
+    const toMix = (row: { setting: string; target: object }) =>
+      ["send.level", "send.pan", "send.on"].includes(row.setting) && `${(row.target as { destination?: string }).destination}`.startsWith("mix-");
+    const name = (row: { setting: string; target: object }) => {
+      const { source, destination } = row.target as { source: string; destination: string };
+      return `${row.setting} ${source} ${destination}`;
+    };
+    for (const link of [0, 1]) {
+      const plan = planCurrent(synthesize("URX22", { "589:0": link, "589:2": link }), "URX22");
+      expect(plan.steps.filter(toMix).map(name).sort(), `Pan Link ${link}`).toEqual(measured);
+      const omitted = plan.omissions.filter(toMix);
+      expect(new Set(omitted.map((o) => o.reason)), `Pan Link ${link}`).toEqual(new Set(["not_writable"]));
+      // URX22's 6 channels' and 2 FX returns' level, pan and on to 2 MIX buses, less the measured ones.
+      expect(omitted.length + measured.length, `Pan Link ${link}`).toBe(8 * 3 * 2);
+    }
+    // Elsewhere no partner-linked MIX send is a step.
+    for (const model of ["URX44", "URX44V"] as const) {
+      expect(planCurrent(synthesize(model), model).steps.filter(toMix), model).toEqual([]);
     }
   });
 

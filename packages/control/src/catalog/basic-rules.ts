@@ -95,8 +95,8 @@ export const BASIC_RULES = frozen({
           models: entry.models,
           paramId: entry.paramId,
           read: entry.instances[0] as number,
-          // A single evidenced write instance; none while the sequence awaits evidence (F03-G).
-          write: entry.writes?.length === 1 ? (entry.writes[0] as number) : null,
+          // A single write instance and the models it is evidenced on; none while the sequence awaits evidence (F03-G).
+          write: entry.writes?.length === 1 ? { y: entry.writes[0] as number, on: entry.bound } : null,
         },
       ]),
     ),

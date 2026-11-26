@@ -27,6 +27,8 @@ import type {
   PortChoiceRule,
   SendSettingRule,
   StopsRule,
+  SendInstanceGate,
+  WriteGate,
   TextIndexRule,
   ValueRule,
 } from "../catalog/rules.js";
@@ -294,6 +296,11 @@ export function readOnly<H extends { plan?: unknown; write?: unknown; validate?:
 }
 
 /** A handler for the address and codec `resolve` gives a target, for a read or a write. */
+/** Whether `gate` binds the write on `model`. */
+function writesOn(gate: WriteGate, model: string): boolean {
+  return gate === true || (Array.isArray(gate) && gate.includes(model));
+}
+
 function handler<V, I = V>(resolve: (model: string, target: unknown, write: boolean) => { at: ParameterAddress; codec: Codec }) {
   const planned = (model: string, target: unknown, requested: I) => {
     const { at, codec } = resolve(model, target, true);
@@ -460,10 +467,16 @@ export function sendRuleSetting<V>(rule: SendSettingRule) {
     }
     const to = destination[1] as "mix" | "fx";
     const route = rule.routes.find((each) => each.from === from && each.to === to) ?? refuse("unsupported_operation");
-    if (write && !route.write) {
+    const number = Number(destination[2]);
+    const gate = route.write;
+    const bound =
+      typeof gate === "boolean" || Array.isArray(gate)
+        ? writesOn(gate as WriteGate, model)
+        : Object.hasOwn(gate, model) && ((gate as SendInstanceGate)[model] ?? []).some(([each, at]) => each === y && at === number);
+    if (write && !bound) {
       return refuse("unsupported_operation");
     }
-    return { at: address(route.base + route.stride * (Number(destination[2]) - 1), y), codec };
+    return { at: address(route.base + route.stride * (number - 1), y), codec };
   });
 }
 
@@ -481,7 +494,7 @@ export function busRuleSetting<V, I = V>(rule: BusSettingRule) {
       return refuse("invalid_input");
     }
     const at = Object.hasOwn(rule.address, own.bus) ? rule.address[own.bus] : undefined;
-    if (at === undefined || (write && !at.write)) {
+    if (at === undefined || (write && !writesOn(at.write, model))) {
       return refuse("unsupported_operation");
     }
     const value = at.value ?? rule.value;
@@ -680,7 +693,7 @@ export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
       return refuse("invalid_input");
     }
     const side = at?.sideless === true ? "left" : (own.side as (typeof SIDES)[number]);
-    if (at === undefined || (write && !at.write)) {
+    if (at === undefined || (write && !writesOn(at.write, model))) {
       return refuse("unsupported_operation");
     }
     const codec = at.value === undefined ? (fixed ?? codecOf(rule.value, model)) : codecOf(at.value, model);
@@ -881,7 +894,7 @@ export function busBandRuleSetting<V>(rule: BusBandSettingRule) {
     const bands = Object.hasOwn(rule.address, own.bus) ? rule.address[own.bus] : undefined;
     const at = bands !== undefined && Object.hasOwn(bands, own.band) ? bands[own.band] : undefined;
     const codec = codecs.get(own.band);
-    if (at === undefined || codec === undefined || (write && !at.write)) {
+    if (at === undefined || codec === undefined || (write && !writesOn(at.write, model))) {
       return refuse("unsupported_operation");
     }
     return { at: address(at.paramId, at.y), codec };
@@ -1045,9 +1058,9 @@ export function sourceRuleSetting<V>(rule: SourceSettingRule) {
     }
     // Static value checks first; a write sequence still needing evidence has no bound write (F03-G).
     // (The read instance stands in as the address of the unbound write, which is never sent.)
-    return entry.write === null
+    return entry.write === null || !writesOn(entry.write.on, known)
       ? { at: address(entry.paramId, entry.read), codec: unboundWrite(codec) }
-      : { at: address(entry.paramId, entry.write), codec };
+      : { at: address(entry.paramId, entry.write.y), codec };
   });
 }
 

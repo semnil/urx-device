@@ -53,7 +53,7 @@ describe("Insert-FX selector and on (F06-I)", () => {
     }
   });
 
-  it("read the output selectors at STEREO and the MIX representative; write STEREO only, each at its own address", async () => {
+  it("read the output selectors at STEREO and the MIX representative; write STEREO, and the MIX on switch on URX22, each at its own address", async () => {
     const at = { stereo: [578, 577, "0", true], "mix-1": [671, 670, "0", false], "mix-2": [671, 670, "2", false] } as const;
     const sent = (transport: FakeTransport) => transport.calls.map(({ address, value }) => ({ address, value }));
     for (const model of models) {
@@ -76,12 +76,14 @@ describe("Insert-FX selector and on (F06-I)", () => {
             expect(sent(transport)).toEqual([{ address: typeAt, value: undefined }]);
           }
         }
+        // The MIX on switch's one write is evidenced on URX22 only (F03-G); the MIX selector stays unbound.
+        const onWritable = writable || model === "URX22";
         for (const [value, raw] of [[true, "1"], [false, "0"]] as const) {
           const transport = new FakeTransport().script("getNumeric", read(raw)).script("setNumeric", accepted);
           const c = new OperationContext(transport, model);
           expect((await readAny(c, "bus.insert-fx.on", { bus })).value, `${model} ${bus} on ${raw}`).toBe(value);
           const write = writeAny(c, "bus.insert-fx.on", { bus }, value);
-          if (writable) {
+          if (onWritable) {
             await write;
             expect(sent(transport), `${model} ${bus} on ${raw}`).toEqual([
               { address: onAt, value: undefined },
