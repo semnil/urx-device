@@ -838,20 +838,22 @@ fn a_reply_between_tolerated_deadlines_starts_the_count_again() {
     let peer = answering_gets(vec![None, Some((Duration::ZERO, 5)), None, None]);
     let connection = open(peer.port, ID, &tolerating(2), &Control::new()).unwrap();
     let operation = connection.create_operation().unwrap();
-    for (param, expected) in [
-        (1, timed_out()),
+    for (param, expected, run) in [
+        (1, timed_out(), 1),
         (
             2,
             Outcome::Success {
                 value: Some(ReadValue::Numeric(5)),
                 evidence: Evidence::Read,
             },
+            0,
         ),
-        (3, timed_out()),
+        (3, timed_out(), 1),
     ] {
         let rx = submit(&connection, &operation, Request::GetNumeric(address(param)));
         assert_eq!(outcome(&rx), expected, "address {param}");
         assert_eq!(connection.terminal(), None, "address {param}");
+        assert_eq!(connection.timeouts_in_a_row(), run, "address {param}");
     }
     let fourth = submit(&connection, &operation, Request::GetNumeric(address(4)));
     assert_eq!(outcome(&fourth), timed_out());
@@ -933,7 +935,7 @@ fn the_read_for_a_late_reply_ends_at_its_frame_budget() {
     let operation = connection.create_operation().unwrap();
     let started = Instant::now();
     let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
-    let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    let second = submit(&connection, &operation, Request::GetNumeric(address(1)));
     assert_eq!(outcome(&first), timed_out());
     assert_eq!(
         outcome(&second),
@@ -949,6 +951,225 @@ fn the_read_for_a_late_reply_ends_at_its_frame_budget() {
     );
 }
 
+/// Options with a 100 ms response deadline that tolerate deadlines as `tolerance` says.
+fn tolerating_with(
+    limit: u32,
+    late_reply_quiet: Duration,
+    late_reply_frames: usize,
+) -> ConnectionOptions {
+    ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        response_timeouts: ResponseTimeouts::Tolerate(Tolerance {
+            limit,
+            late_reply_quiet,
+            late_reply_frames,
+        }),
+        ..options()
+    }
+}
+
+fn read(value: i64) -> Outcome {
+    Outcome::Success {
+        value: Some(ReadValue::Numeric(value)),
+        evidence: Evidence::Read,
+    }
+}
+
+/// A parameter notification for an address nobody subscribed to.
+fn notification() -> Vec<u8> {
+    line(
+        json!({ "vdp": { "method": "notify", "uri": "/vd/parameters/9:0:0",
+        "data": { "current_value": 0 } } }),
+    )
+}
+
+#[test]
+fn a_notification_counts_toward_the_late_reply_frame_budget() {
+    // After the first read's deadline only a notification comes, and never the late answer.
+    // With a budget of one frame, the second read of the address goes out on it, not after
+    // the quiet.
+    let peer = late_then_prompt(|_| {
+        thread::sleep(Duration::from_millis(400));
+        vec![notification()]
+    });
+    let options = tolerating_with(3, Duration::from_secs(5), 1);
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let second = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(outcome(&second), read(222));
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "the second read waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_notification_starts_the_late_reply_quiet_again() {
+    // The quiet ends 500 ms after the last frame. A notification 350 ms after the first
+    // read's deadline keeps the wait open past the late answer 700 ms after it, so the
+    // second read of the address gets its own value.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut requests = BufReader::new(stream);
+        let mut request = String::new();
+        let mut next = |request: &mut String| {
+            request.clear();
+            requests.read_line(request).unwrap();
+        };
+        next(&mut request);
+        writer
+            .write_all(&get_reply("/vd/synchronize", online(ID)))
+            .unwrap();
+        next(&mut request);
+        writer
+            .write_all(&get_reply("/vd/device", firmware()))
+            .unwrap();
+        let reply = |value: i64| {
+            get_reply(
+                "/vd/parameters/1:0:0",
+                json!({ "current_value": value, "response_code": 200 }),
+            )
+        };
+        next(&mut request);
+        thread::sleep(Duration::from_millis(450));
+        writer.write_all(&notification()).unwrap();
+        thread::sleep(Duration::from_millis(350));
+        writer.write_all(&reply(111)).unwrap();
+        next(&mut request);
+        writer.write_all(&reply(222)).unwrap();
+        // Held open until the connection closes.
+        let _ = requests.read_line(&mut request);
+    });
+    let options = tolerating_with(3, Duration::from_millis(500), 64);
+    let connection = open(port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let second = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(outcome(&second), read(222));
+}
+
+#[test]
+fn a_late_reply_frame_budget_of_zero_waits_for_nothing() {
+    let peer = late_then_prompt(|_| vec![]);
+    let options = tolerating_with(3, Duration::from_secs(5), 0);
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let second = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(outcome(&second), read(222));
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "the second read waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_late_reply_between_tolerated_deadlines_starts_the_count_again() {
+    // The first read is answered after its deadline; the reads of other addresses after it
+    // are never answered. With a limit of two, the late answer starts the count again, so
+    // the second unanswered read leaves the connection open and the third ends it.
+    let peer = answering_gets(vec![Some((Duration::from_millis(200), 111)), None, None]);
+    let connection = open(peer.port, ID, &tolerating(2), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(outcome(&second), timed_out());
+    assert_eq!(connection.terminal(), None);
+    let third = submit(&connection, &operation, Request::GetNumeric(address(3)));
+    assert_eq!(outcome(&third), timed_out());
+    wait_until(|| connection.terminal().is_some());
+    assert_eq!(connection.terminal(), Some(RequestCause::ResponseTimeout));
+}
+
+#[test]
+fn a_registration_reply_between_tolerated_deadlines_starts_the_count_again() {
+    let peer = unit(|request| {
+        let uri = uri_of(request);
+        if uri.contains("operation=") {
+            vec![post_reply(uri, json!({ "response_code": 200 }))]
+        } else {
+            vec![]
+        }
+    });
+    let connection = open(peer.port, ID, &tolerating(2), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    let subscription = connection
+        .prepare_subscription(&[crate::subscription::SubscriptionAddress::Parameter(
+            address(9),
+        )])
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    subscription.activate(&connection.create_operation().unwrap(), move |activated| {
+        let _ = tx.send(activated);
+    });
+    assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap().is_ok());
+    let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(outcome(&second), timed_out());
+    assert_eq!(connection.terminal(), None);
+}
+
+#[test]
+fn a_tolerated_deadline_is_reported_at_the_deadline_and_holds_up_no_close() {
+    // The late answer is waited for up to five seconds, which neither the read's outcome
+    // nor a close waits out: the close unregisters at once and ends within its budget.
+    let peer = unit(|request| {
+        let uri = uri_of(request);
+        if uri.contains("operation=") {
+            vec![post_reply(uri, json!({ "response_code": 200 }))]
+        } else {
+            vec![]
+        }
+    });
+    let options = tolerating_with(3, Duration::from_secs(5), 64);
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let subscription = connection
+        .prepare_subscription(&[crate::subscription::SubscriptionAddress::Parameter(
+            address(9),
+        )])
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    subscription.activate(&connection.create_operation().unwrap(), move |activated| {
+        let _ = tx.send(activated);
+    });
+    assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap().is_ok());
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "the outcome came after {:?}",
+        started.elapsed()
+    );
+    let closing = Instant::now();
+    assert_eq!(
+        connection.close(Duration::from_millis(500)),
+        CloseOutcome::Closed
+    );
+    assert!(
+        closing.elapsed() < Duration::from_millis(1500),
+        "the close took {:?}",
+        closing.elapsed()
+    );
+    assert!(peer
+        .uris()
+        .contains(&"/vd/parameters/9:0:0?operation=unregist".to_string()));
+}
+
 #[test]
 fn a_unit_lost_push_while_reading_for_a_late_reply_ends_the_connection() {
     // The read goes unanswered past its deadline; while the late reply is read for, the unit
@@ -962,7 +1183,8 @@ fn a_unit_lost_push_while_reading_for_a_late_reply_ends_the_connection() {
     let connection = open(peer.port, ID, &tolerating(3), &Control::new()).unwrap();
     let operation = connection.create_operation().unwrap();
     let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
-    let waiting = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    // The same address, so it waits for the first read's late reply.
+    let waiting = submit(&connection, &operation, Request::GetNumeric(address(1)));
     assert_eq!(outcome(&first), timed_out());
     assert_eq!(
         outcome(&waiting),
@@ -1278,6 +1500,8 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             loss: std::sync::Mutex::new(None),
+            arrivals: Default::default(),
+            awaiting_late: std::sync::atomic::AtomicBool::new(false),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
