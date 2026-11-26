@@ -44,7 +44,7 @@ describe("scene references (F14-R)", () => {
         }
       }
       for (const raw of ["63", "32767", "32772", "-1", "101"]) {
-        expect((await observe(id, raw)) as { code?: string }, `${id} ${raw}`).toMatchObject({ code: "invalid_response" });
+        expect(await observe(id, raw), `${id} ${raw}`).toEqual({ code: "invalid_response", calls: 1 });
       }
       expect((await failed(writeAny(new OperationContext(new FakeTransport(), "URX44"), id, {}, "user-1")))?.code).toBe("unsupported_operation");
     }
@@ -71,7 +71,7 @@ describe("recorder (F16-R)", () => {
       ["recorder.track-count", "0"],
       ["recorder.track-count", "9"],
     ] as const) {
-      expect((await observe(id, raw)) as { code?: string }, `${id} ${raw}`).toMatchObject({ code: "invalid_response" });
+      expect(await observe(id, raw), `${id} ${raw}`).toEqual({ code: "invalid_response", calls: 1 });
     }
     for (const id of ["recorder.state", "recorder.card-present", "recorder.track-count"]) {
       expect(await observe(id, "0", "URX22"), id).toEqual({ code: "unsupported_operation", calls: 0 });
@@ -83,8 +83,8 @@ describe("recorder (F16-R)", () => {
     for (let track = 1; track <= 16; track += 1) {
       expect(await observe("recorder.source", "289", "URX44", { track })).toEqual({ value: "mix-1-right", address: { paramId: 736, x: "0", y: `${track - 1}` } });
     }
-    expect((await observe("recorder.source", "336", "URX44", { track: 1 })) as { value?: string }).toMatchObject({ value: "monitor-1-left" });
-    expect((await observe("recorder.source", `${258 + 0x80000000}`, "URX44", { track: 1 })) as { value?: string }).toMatchObject({ value: "stream-left" });
+    expect(await observe("recorder.source", "336", "URX44", { track: 1 })).toEqual({ value: "monitor-1-left", address: { paramId: 736, x: "0", y: "0" } });
+    expect(await observe("recorder.source", `${258 + 0x80000000}`, "URX44", { track: 1 })).toEqual({ value: "stream-left", address: { paramId: 736, x: "0", y: "0" } });
     const writable = [
       ["none", "4294967295"],
       ["channel-1", "0"],
@@ -114,7 +114,7 @@ describe("recorder (F16-R)", () => {
     }
     expect(() => plan("none", { track: 1 }, "URX22")).toThrow(/unsupported_operation/);
     for (const raw of ["12", "340", "-1"]) {
-      expect((await observe("recorder.source", raw, "URX44", { track: 1 })) as { code?: string }, raw).toMatchObject({ code: "invalid_response" });
+      expect(await observe("recorder.source", raw, "URX44", { track: 1 }), raw).toEqual({ code: "invalid_response", calls: 1 });
     }
   });
 });
@@ -148,6 +148,43 @@ describe("recorder sources on every track (F16-R)", () => {
     ["mix-2-right", "291"],
   ];
   const READ_ONLY = ["monitor-1-left", "monitor-1-right", "monitor-2-left", "monitor-2-right", "stream-left", "stream-right"];
+
+  it("read every lane, plain or tagged, at every track on both models with one GET", async () => {
+    const READ_ONLY_RAW: [string, string][] = [
+      ["monitor-1-left", "336"],
+      ["monitor-1-right", "337"],
+      ["monitor-2-left", "338"],
+      ["monitor-2-right", "339"],
+      ["stream-left", "258"],
+      ["stream-right", "259"],
+    ];
+    const lanes = [...WRITABLE, ...READ_ONLY_RAW];
+    expect(lanes.length).toBe(25);
+    for (const model of ["URX44", "URX44V"] as const) {
+      for (let track = 1; track <= 16; track += 1) {
+        const at = { paramId: 736, x: "0", y: `${track - 1}` };
+        for (const [token, raw] of lanes) {
+          const raws = token === "none" ? [raw] : [raw, `${BigInt(raw) + 0x80000000n}`];
+          for (const each of raws) {
+            expect(await observe("recorder.source", each, model, { track }), `${model} ${track} ${token} ${each}`).toEqual({ value: token, address: at });
+          }
+        }
+        expect(await observe("recorder.source", "340", model, { track }), `${model} ${track}`).toEqual({ code: "invalid_response", calls: 1 });
+      }
+    }
+    // Every scene and recorder read with an invalid answer is one request, reported as invalid.
+    for (const [id, raw] of [
+      ["scene.current", "64"],
+      ["scene.cursor", "32772"],
+      ["recorder.state", "6"],
+      ["recorder.card-present", "2"],
+      ["recorder.track-count", "9"],
+    ] as const) {
+      for (const model of id.startsWith("scene") ? (["URX22", "URX44", "URX44V"] as const) : (["URX44", "URX44V"] as const)) {
+        expect(await observe(id, raw, model), `${model} ${id}`).toEqual({ code: "invalid_response", calls: 1 });
+      }
+    }
+  });
 
   it("write each of the 19 writable lanes once at the named track, on both models", async () => {
     expect(WRITABLE.length).toBe(19);
