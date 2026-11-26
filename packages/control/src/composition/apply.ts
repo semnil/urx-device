@@ -9,13 +9,12 @@
 // steps are kept, and nothing is rolled back, retried or read back. A
 // dry-run performs the same prerequisite reads and sends no setting write.
 
-import type { UrxfFile } from "../catalog/urxf.js";
 import type { ConsoleLockGuard } from "../operations/console-lock.js";
 import type { OperationContext, WriteGuard } from "../operations/context.js";
 import type { OperationCause } from "../operations/failure.js";
 import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "../operations/transport.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
-import { decodeFileSetting, dryRunSettingAfter, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
+import { dryRunSettingAfter, readSetting, writeSetting, type WriteArgs } from "../operations/registry.js";
 import type { UnverifiedCondition, WriteOutcome } from "../operations/results.js";
 import type { CurrentPlan, PlannedStep } from "./plan.js";
 
@@ -86,8 +85,7 @@ const sameAddress = (a: ParameterAddress, b: ParameterAddress) => a.paramId === 
  * invalid input, both before any write. The clock is never written from the
  * file. The returned function releases the observation.
  */
-async function watchRate(context: OperationContext, file: UrxfFile): Promise<() => Promise<void>> {
-  const fileRate = decodeFileSetting(file.current, context.model, ...(["device.sample-rate", {}] as unknown as ReadArgs)) as number;
+async function watchRate(context: OperationContext, fileRate: number): Promise<() => Promise<void>> {
   const watch = new RateWatch(context, fileRate);
   let operation: TransportOperation;
   try {
@@ -122,14 +120,16 @@ async function watchRate(context: OperationContext, file: UrxfFile): Promise<() 
 }
 
 /**
- * Applies (or, with `dryRun`, plans with the prerequisite reads) `plan` from
- * `file` as one write operation under `options.guard`, which the caller has
- * opened and releases: its lock read precedes the rate check, a lock stops
- * the unsent steps, and a dry run makes the same reads.
+ * Applies (or, with `dryRun`, plans with the prerequisite reads) `plan` as
+ * one write operation under `options.guard`, which the caller has opened and
+ * releases: its lock read precedes the rate check, a lock stops the unsent
+ * steps, and a dry run makes the same reads. The plan carries its own model
+ * and file rate, so the values sent, the omissions and the rate checked come
+ * from one file; a plan built for another model is refused before any
+ * request.
  */
 export async function applyCurrent(
   context: OperationContext,
-  file: UrxfFile,
   plan: CurrentPlan,
   options: { readonly guard: ConsoleLockGuard; readonly dryRun?: boolean },
 ): Promise<ApplyResult> {
@@ -137,9 +137,15 @@ export async function applyCurrent(
   const failWith = (index: number, error: unknown, outcome: WriteOutcome): ApplyResult => {
     const failure = operationFailureOf(error);
     const step = results[index] as StepResult;
-    results[index] = { ...step, outcome, error: failure?.code ?? "internal_error" };
+    // The operation's own planned value, where it settled one before failing (a live-prerequisite step included).
+    const progress = failure?.progress as { planned?: unknown } | null | undefined;
+    const planned = progress !== null && progress !== undefined && "planned" in progress ? progress.planned : step.planned;
+    results[index] = { ...step, planned, outcome, error: failure?.code ?? "internal_error" };
     return { steps: results, error: failure?.code ?? "internal_error" };
   };
+  if (context.model !== plan.model) {
+    return { steps: results, error: "invalid_input" };
+  }
   let detach: () => void;
   try {
     detach = await options.guard.begin(context);
@@ -147,7 +153,7 @@ export async function applyCurrent(
     return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error" };
   }
   try {
-    return await run(context, file, plan, results, failWith, options.dryRun === true);
+    return await run(context, plan, results, failWith, options.dryRun === true);
   } finally {
     detach();
   }
@@ -155,7 +161,6 @@ export async function applyCurrent(
 
 async function run(
   context: OperationContext,
-  file: UrxfFile,
   plan: CurrentPlan,
   results: StepResult[],
   failWith: (index: number, error: unknown, outcome: WriteOutcome) => ApplyResult,
@@ -163,7 +168,7 @@ async function run(
 ): Promise<ApplyResult> {
   let releaseRate: () => Promise<void>;
   try {
-    releaseRate = await watchRate(context, file);
+    releaseRate = await watchRate(context, plan.fileRate);
   } catch (error) {
     return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error" };
   }

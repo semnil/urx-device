@@ -197,7 +197,7 @@ describe("CURRENT composition (K36, F18)", () => {
     }
   });
 
-  it("send phantom and HI-Z Off requests before On requests, phantom first in each, then gain and Clip Safe (F18-IN-B)", () => {
+  it("send each jack's Off switches before its On switches, phantom first in each, then its gain and Clip Safe (K36, F18-IN-B)", () => {
     for (const model of models) {
       const jacks = INPUT_JACKS[model];
       const hiZ = HI_Z_JACKS[model];
@@ -208,13 +208,17 @@ describe("CURRENT composition (K36, F18)", () => {
         if (hiZ.includes(jack)) stored[`6:${jack - 1}`] = 1 - (jack % 2);
       }
       const plan = planCurrent(synthesize(model, stored), model);
-      const phase3 = plan.steps.filter((s) => s.phase === 3).map((s) => `${s.setting} ${(s.target as { input?: number }).input ?? ""} ${String(s.requested)}`);
-      const off = [...jacks.filter((j) => j % 2 === 0).map((j) => `input.phantom ${j} false`), ...hiZ.filter((j) => j % 2 === 1).map((j) => `input.hi-z ${j} false`)];
-      const on = [...jacks.filter((j) => j % 2 === 1).map((j) => `input.phantom ${j} true`), ...hiZ.filter((j) => j % 2 === 0).map((j) => `input.hi-z ${j} true`)];
-      expect(phase3.slice(0, off.length + on.length), model).toEqual([...off, ...on]);
-      const kinds = phase3.map((entry) => entry.split(" ")[0]);
-      expect(kinds.indexOf("input.gain"), model).toBe(off.length + on.length);
-      expect(kinds.lastIndexOf("input.gain"), model).toBeLessThan(kinds.indexOf("input.clip-safe"));
+      const phase3 = plan.steps.filter((s) => s.phase === 3 && s.setting.startsWith("input.")).map((s) => `${s.setting} ${(s.target as { input?: number }).input ?? ""} ${String(s.requested)}`);
+      // K36: jack by jack, ascending; within a jack, Off switches before On (phantom before HI-Z), then gain, then Clip Safe.
+      const expected = jacks.flatMap((jack) => {
+        const switches = [
+          { setting: "input.phantom", on: jack % 2 === 1 },
+          ...(hiZ.includes(jack) ? [{ setting: "input.hi-z", on: jack % 2 === 0 }] : []),
+        ];
+        const ordered = [...switches.filter((each) => !each.on), ...switches.filter((each) => each.on)];
+        return [...ordered.map((each) => `${each.setting} ${jack} ${each.on}`), `input.gain ${jack}`, `input.clip-safe ${jack}`];
+      });
+      expect(phase3.map((entry) => entry.split(" ").slice(0, entry.startsWith("input.gain") || entry.startsWith("input.clip-safe") ? 2 : 3).join(" ")), model).toEqual(expected);
     }
   });
 
@@ -233,7 +237,7 @@ describe("CURRENT composition (K36, F18)", () => {
       const unit = new Unit();
       const context = new OperationContext(unit, model);
       const guard = await ConsoleLockGuard.open(context);
-      const result = await applyCurrent(context, file, plan, { guard, dryRun: true });
+      const result = await applyCurrent(context, plan, { guard, dryRun: true });
       await guard.release();
       expect(result.error, model).toBeNull();
       const fx = (bus: string) => result.steps.filter((s) => s.setting === "bus.fx.parameter" && (s.target as { bus: string }).bus === bus);
@@ -248,6 +252,58 @@ describe("CURRENT composition (K36, F18)", () => {
       // Steps that no earlier step affects stay verified.
       expect(result.steps.filter((s) => s.setting === "channel.fader").every((s) => s.unverified.length === 0), model).toBe(true);
     }
+  });
+
+  it("order each phase by target, every target's settings together (K36)", () => {
+    for (const model of models) {
+      const plan = planCurrent(synthesize(model, { "497:0": 2, "590:0": 2 }), model);
+      const position = (predicate: (step: (typeof plan.steps)[number]) => boolean) => plan.steps.map((step, index) => (predicate(step) ? index : -1)).filter((index) => index >= 0);
+      // Phase 4: every step of the first channel before any step of the second.
+      const [first, second] = [...new Set(plan.steps.filter((s) => s.phase === 4).map((s) => (s.target as { channel: number }).channel))];
+      expect(Math.max(...position((s) => s.phase === 4 && (s.target as { channel?: number }).channel === first)), model).toBeLessThan(
+        Math.min(...position((s) => s.phase === 4 && (s.target as { channel?: number }).channel === second)),
+      );
+      // Phase 5, MIX 1: the bus's sideless settings, then its left GEQ, then its right GEQ; STEREO entirely before MIX 1.
+      const mix1 = plan.steps.filter((s) => s.phase === 5 && (s.target as { bus?: string }).bus === "mix-1");
+      const sides = mix1.map((s) => (s.target as { side?: string }).side ?? "none");
+      expect(sides, model).toEqual([...sides].sort((a, b) => ["none", "left", "right"].indexOf(a) - ["none", "left", "right"].indexOf(b)));
+      expect(mix1.findIndex((s) => s.setting === "bus.geq.link"), model).toBeLessThan(mix1.findIndex((s) => (s.target as { side?: string }).side === "left"));
+      expect(Math.max(...position((s) => s.phase === 5 && (s.target as { bus?: string }).bus === "stereo")), model).toBeLessThan(
+        Math.min(...position((s) => s.phase === 5 && (s.target as { bus?: string }).bus === "mix-1")),
+      );
+      // Phase 9: every step of one send route before the next route's.
+      const routes = plan.steps.filter((s) => s.phase === 9 && "destination" in (s.target as object)).map((s) => JSON.stringify(s.target));
+      const seen: string[] = [];
+      for (const route of routes) if (seen.at(-1) !== route) seen.push(route);
+      expect(new Set(seen).size, model).toBe(seen.length);
+    }
+  });
+
+  it("apply a plan only to its own model, with the rate it was built from; keep a failed live step's planned value", async () => {
+    const file = synthesize("URX44", { "497:0": 2 });
+    const plan = planCurrent(file, "URX44");
+    expect([plan.model, plan.fileRate]).toEqual(["URX44", 48000]);
+    const other = new FakeTransport().script("getNumeric", { kind: "success", value: "0", evidence: { state: "read" } });
+    const otherContext = new OperationContext(other, "URX44V");
+    const guard = await ConsoleLockGuard.open(otherContext);
+    const refused = await applyCurrent(otherContext, plan, { guard });
+    await guard.release();
+    expect(refused.error).toBe("invalid_input");
+    expect(other.calls).toEqual([]);
+    // A file without a valid rate is refused when the plan is built.
+    expect(() => planCurrent(synthesize("URX44", { "766:0": 32000 }), "URX44")).toThrow(/invalid_input/);
+    // A GEQ gain step plans at execution; its write is rejected, and the step keeps the value it planned.
+    const gain = plan.steps.find((s) => s.setting === "bus.geq.gain" && (s.target as { bus: string }).bus === "stereo");
+    expect(gain?.planned).toBeNull();
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
+    const t = new FakeTransport().script("getNumeric", read("0"), read("48000"), read("2"), read("0")).script("setNumeric", rejected);
+    const context = new OperationContext(t, "URX44");
+    const own = await ConsoleLockGuard.open(context);
+    const result = await applyCurrent(context, { ...plan, steps: [gain as (typeof plan.steps)[number]] }, { guard: own });
+    await own.release();
+    expect(result.error).toBe("device_rejected");
+    expect([result.steps[0]?.outcome, result.steps[0]?.planned]).toEqual(["rejected", gain?.requested]);
   });
 
   it("omit the automatically controlled values the file enables (F18-C), and fail whole on a missing value", () => {
@@ -270,7 +326,7 @@ describe("CURRENT composition (K36, F18)", () => {
   it("check the sample rate first, write the steps in order, and stop at the first failure", async () => {
     const file = synthesize("URX22");
     const plan = planCurrent(file, "URX22");
-    const head = { steps: plan.steps.filter((s) => s.planned !== null).slice(0, 5), omissions: [] };
+    const head = { ...plan, steps: plan.steps.filter((s) => s.planned !== null).slice(0, 5), omissions: [] };
     const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
     const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
     const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
@@ -279,7 +335,7 @@ describe("CURRENT composition (K36, F18)", () => {
       const context = new OperationContext(transport, "URX22");
       const guard = await ConsoleLockGuard.open(context);
       try {
-        return await applyCurrent(context, file, head, { guard, dryRun });
+        return await applyCurrent(context, head, { guard, dryRun });
       } finally {
         await guard.release();
       }

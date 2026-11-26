@@ -36,6 +36,10 @@ export interface Omission {
 }
 
 export interface CurrentPlan {
+  /** The model the plan was built for; applying it to another is refused before any request. */
+  readonly model: Model;
+  /** The file's sample rate, checked when the plan was built (L3); the device must report it before any write. */
+  readonly fileRate: number;
   readonly steps: readonly PlannedStep[];
   readonly omissions: readonly Omission[];
 }
@@ -78,6 +82,8 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
   };
   const value = (setting: SettingId, target: object) => writeValueOf(decodeFileSetting(chunk, model, ...([setting, target] as unknown as ReadArgs)));
   const control = deviceControlled(chunk, model);
+  // The file's rate is part of the plan: a missing or invalid one refuses the file here (L3).
+  const fileRate = value("device.sample-rate", {}) as number;
 
   for (const { phase, settings } of PHASES) {
     for (const setting of settings) {
@@ -124,7 +130,7 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
       }
     }
   }
-  orderInputSwitches(steps);
+  orderByTarget(steps);
   // Scope exclusions present in the catalog for this model, in catalog order.
   for (const [setting, reason] of Object.entries(EXCLUDED) as [SettingId, OmissionReason][]) {
     const rule = (settingDefinitions as Record<string, SettingDefinitionBase>)[setting]?.rule;
@@ -132,7 +138,7 @@ export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_I
       omit(setting, target, reason);
     }
   }
-  return { steps, omissions };
+  return { model, fileRate, steps, omissions };
 }
 
 /**
@@ -230,25 +236,52 @@ function planFxParameters(
 /** The Delay parameters sent first, in this order (F18-D-A). */
 const DELAY_FIRST = ["sync", "bpm", "note"];
 
+/** The entity a step's target names (K36 target order): a jack, a channel, a send route, a bus, an output, a track. */
+function entityOf(step: PlannedStep): string {
+  const target = step.target as { input?: number; channel?: number; source?: string; destination?: string; bus?: string; output?: string; track?: number };
+  if (target.destination !== undefined) return `send ${target.source} ${target.destination}`;
+  if (target.input !== undefined) return `input ${target.input}`;
+  if (target.channel !== undefined) return `channel ${target.channel}`;
+  if (target.source !== undefined) return `source ${target.source}`;
+  if (target.bus !== undefined) return `bus ${target.bus}`;
+  if (target.output !== undefined) return `output ${target.output}`;
+  if (target.track !== undefined) return `track ${target.track}`;
+  return "device";
+}
+
 /**
- * F18-IN-B: the file's phantom and HI-Z switches, Off requests before On
- * requests, phantom before HI-Z within each, jacks ascending. The block is
- * contiguous in phase 3, ahead of analog gain and Clip Safe.
+ * K36: a phase iterates its targets, each target's settings in the phase's
+ * order, targets in their canonical order (first appearance). Phase 6 is the
+ * exception: every Insert-FX type, then the engines' values, then every On.
+ * Within a bus in phase 5, the sided GEQ settings go left, then right, after
+ * the bus's other settings (F18-G). Within a jack in phase 3, the file's
+ * phantom and HI-Z switches go Off requests before On, phantom before HI-Z
+ * within each (F18-IN-B).
  */
-function orderInputSwitches(steps: PlannedStep[]): void {
-  const first = steps.findIndex((step) => step.setting === "input.phantom" || step.setting === "input.hi-z");
-  if (first === -1) {
-    return;
+function orderByTarget(steps: PlannedStep[]): void {
+  let start = 0;
+  while (start < steps.length) {
+    const phase = (steps[start] as PlannedStep).phase;
+    let end = start;
+    while (end < steps.length && (steps[end] as PlannedStep).phase === phase) end += 1;
+    if (phase !== 6) {
+      const block = steps.slice(start, end);
+      const order = new Map<string, number>();
+      for (const step of block) if (!order.has(entityOf(step))) order.set(entityOf(step), order.size);
+      const rank = (step: PlannedStep) => {
+        if (phase === 5) {
+          const side = (step.target as { side?: string }).side;
+          return side === "left" ? 1 : side === "right" ? 2 : 0;
+        }
+        if (phase === 3 && (step.setting === "input.phantom" || step.setting === "input.hi-z")) {
+          return (step.requested === true ? 2 : 0) + (step.setting === "input.hi-z" ? 1 : 0);
+        }
+        return phase === 3 ? 4 : 0;
+      };
+      const keyed = block.map((step, index) => ({ step, index, entity: order.get(entityOf(step)) as number, rank: rank(step) }));
+      keyed.sort((a, b) => a.entity - b.entity || a.rank - b.rank || a.index - b.index);
+      steps.splice(start, block.length, ...keyed.map((each) => each.step));
+    }
+    start = end;
   }
-  let end = first;
-  while (end < steps.length && (steps[end]?.setting === "input.phantom" || steps[end]?.setting === "input.hi-z")) {
-    end += 1;
-  }
-  const block = steps.slice(first, end);
-  const group = (on: boolean, setting: SettingId) => block.filter((step) => step.setting === setting && step.requested === on);
-  const ordered = [...group(false, "input.phantom"), ...group(false, "input.hi-z"), ...group(true, "input.phantom"), ...group(true, "input.hi-z")];
-  if (ordered.length !== block.length) {
-    return invalid();
-  }
-  steps.splice(first, block.length, ...ordered);
 }
