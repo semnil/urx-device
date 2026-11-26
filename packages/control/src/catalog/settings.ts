@@ -4,6 +4,7 @@
 
 import { frozen } from "./frozen.js";
 import type { CHANNEL_COLORS, REC_POINTS } from "./channels.js";
+import { BASIC_RULES } from "./basic-rules.js";
 import { DUCKER_RULES } from "./ducker.js";
 import { SEND_RULES } from "./sends.js";
 import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE, type BUS_TOKENS } from "./buses.js";
@@ -30,8 +31,8 @@ export interface SettingDefinitionBase {
   readonly readable: true;
   /** Whether the setting can be written. */
   readonly writable: boolean;
-  /** The target, address and value rule, for the settings that carry one (K35 metadata). */
-  readonly rule?: SettingRule;
+  /** The target, address and value rule (K35 metadata): the operations are built from it. */
+  readonly rule: SettingRule;
 }
 
 /**
@@ -39,32 +40,32 @@ export interface SettingDefinitionBase {
  * extended at runtime (K2: no dynamic registration).
  */
 export const settingDefinitions = frozen({
-  "input.gain": { readable: true, writable: true },
-  "input.phantom": { readable: true, writable: true },
-  "input.hi-z": { readable: true, writable: true },
-  "input.clip-safe": { readable: true, writable: true },
-  "input.clip-safe-active": { readable: true, writable: false },
-  "source.gain": { readable: true, writable: true },
-  "channel.on": { readable: true, writable: true },
-  "channel.fader": { readable: true, writable: true },
-  "channel.pan": { readable: true, writable: true },
-  "channel.polarity": { readable: true, writable: true },
-  "channel.source": { readable: true, writable: true },
+  "input.gain": { readable: true, writable: true, rule: BASIC_RULES["input.gain"] },
+  "input.phantom": { readable: true, writable: true, rule: BASIC_RULES["input.phantom"] },
+  "input.hi-z": { readable: true, writable: true, rule: BASIC_RULES["input.hi-z"] },
+  "input.clip-safe": { readable: true, writable: true, rule: BASIC_RULES["input.clip-safe"] },
+  "input.clip-safe-active": { readable: true, writable: false, rule: BASIC_RULES["input.clip-safe-active"] },
+  "source.gain": { readable: true, writable: true, rule: BASIC_RULES["source.gain"] },
+  "channel.on": { readable: true, writable: true, rule: BASIC_RULES["channel.on"] },
+  "channel.fader": { readable: true, writable: true, rule: BASIC_RULES["channel.fader"] },
+  "channel.pan": { readable: true, writable: true, rule: BASIC_RULES["channel.pan"] },
+  "channel.polarity": { readable: true, writable: true, rule: BASIC_RULES["channel.polarity"] },
+  "channel.source": { readable: true, writable: true, rule: BASIC_RULES["channel.source"] },
   // Its write sequence needs evidence first (F03-J); readable until then.
-  "channel.stereo-link": { readable: true, writable: false },
-  "channel.pan-mode": { readable: true, writable: true },
-  "channel.name": { readable: true, writable: true },
-  "channel.color": { readable: true, writable: true },
-  "channel.rec-point": { readable: true, writable: true },
-  "channel.processing-mode": { readable: true, writable: true },
-  "channel.hpf.on": { readable: true, writable: true },
-  "channel.hpf.frequency": { readable: true, writable: true },
-  "channel.gate.on": { readable: true, writable: true },
-  "channel.comp.on": { readable: true, writable: true },
-  "channel.eq.on": { readable: true, writable: true },
-  "channel.ssmcs.on": { readable: true, writable: true },
-  "channel.ssmcs.comp.on": { readable: true, writable: true },
-  "channel.ssmcs.eq.on": { readable: true, writable: true },
+  "channel.stereo-link": { readable: true, writable: false, rule: BASIC_RULES["channel.stereo-link"] },
+  "channel.pan-mode": { readable: true, writable: true, rule: BASIC_RULES["channel.pan-mode"] },
+  "channel.name": { readable: true, writable: true, rule: BASIC_RULES["channel.name"] },
+  "channel.color": { readable: true, writable: true, rule: BASIC_RULES["channel.color"] },
+  "channel.rec-point": { readable: true, writable: true, rule: BASIC_RULES["channel.rec-point"] },
+  "channel.processing-mode": { readable: true, writable: true, rule: BASIC_RULES["channel.processing-mode"] },
+  "channel.hpf.on": { readable: true, writable: true, rule: BASIC_RULES["channel.hpf.on"] },
+  "channel.hpf.frequency": { readable: true, writable: true, rule: BASIC_RULES["channel.hpf.frequency"] },
+  "channel.gate.on": { readable: true, writable: true, rule: BASIC_RULES["channel.gate.on"] },
+  "channel.comp.on": { readable: true, writable: true, rule: BASIC_RULES["channel.comp.on"] },
+  "channel.eq.on": { readable: true, writable: true, rule: BASIC_RULES["channel.eq.on"] },
+  "channel.ssmcs.on": { readable: true, writable: true, rule: BASIC_RULES["channel.ssmcs.on"] },
+  "channel.ssmcs.comp.on": { readable: true, writable: true, rule: BASIC_RULES["channel.ssmcs.comp.on"] },
+  "channel.ssmcs.eq.on": { readable: true, writable: true, rule: BASIC_RULES["channel.ssmcs.eq.on"] },
   "channel.gate.threshold": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.threshold"] },
   "channel.gate.range": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.range"] },
   "channel.gate.attack": { readable: true, writable: true, rule: DYNAMICS_RULES["channel.gate.attack"] },

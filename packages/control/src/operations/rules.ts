@@ -3,7 +3,8 @@
 // handler reads or writes its one resolved address once.
 
 import { channelIndex } from "../catalog/channels.js";
-import { decodeInteger, decodeSwitch, nearestStopIndex, planOnGrid } from "../catalog/codecs.js";
+import { NAME_MAX_CODE_POINTS } from "../catalog/channels.js";
+import { decodeInteger, decodeSwitch, encodeSwitch, nearestStopIndex, planOnGrid } from "../catalog/codecs.js";
 import type { I64Text } from "../catalog/i64.js";
 import type {
   BusSettingRule,
@@ -15,6 +16,10 @@ import type {
   OutputSettingRule,
   OutputSideSettingRule,
   TrackSettingRule,
+  InputSettingRule,
+  SourceSettingRule,
+  ChannelSideSettingRule,
+  PairSettingRule,
   ContextStopsRule,
   FxParameterRule,
   GeqGainRule,
@@ -25,7 +30,6 @@ import type {
   TextIndexRule,
   ValueRule,
 } from "../catalog/rules.js";
-import { planSwitch, writableName } from "./channels.js";
 import type { OperationContext } from "./context.js";
 import { OperationFailureError } from "./failure.js";
 import type { DryRunPlan, Reading, UnverifiedCondition, VerifiedPlan, WritePlan, WriteResult } from "./results.js";
@@ -54,6 +58,28 @@ interface Codec {
   readonly name?: true;
   decode(raw: string): unknown;
   plan(value: unknown): { planned: unknown; raw: string } | "unsupported" | undefined;
+}
+
+/** A switch's plan: a boolean, sent as raw 1 / 0. */
+export function planSwitch(value: unknown): { planned: boolean; raw: I64Text } | undefined {
+  return typeof value === "boolean" ? { planned: value, raw: encodeSwitch(value) } : undefined;
+}
+
+/** Whether `name` is writable (F03-K): at most `maxCodePoints` Unicode scalar values, no C0/C1 controls. */
+export function writableName(name: unknown, maxCodePoints: number = NAME_MAX_CODE_POINTS): name is string {
+  if (typeof name !== "string") {
+    return false;
+  }
+  const points = Array.from(name);
+  if (points.length > maxCodePoints) {
+    return false;
+  }
+  return points.every((point) => {
+    const code = point.codePointAt(0) as number;
+    const surrogate = code >= 0xd800 && code <= 0xdfff;
+    const control = code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    return !surrogate && !control;
+  });
 }
 
 function gridCodec(rule: GridRule): Codec {
@@ -90,7 +116,9 @@ function stopsCodec(rule: StopsRule): Codec {
       return value === undefined ? undefined : value / rule.scale;
     },
     plan: (value) => {
-      if (typeof value !== "number" || !Number.isFinite(value) || value < first / rule.scale || value > last / rule.scale) {
+      const min = rule.write?.min ?? first / rule.scale;
+      const max = rule.write?.max ?? last / rule.scale;
+      if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
         return undefined;
       }
       const index = nearestStopIndex(rule.stops, rule.scale, value);
@@ -170,21 +198,26 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
         // Exact membership: no rounding to the nearest member.
         plan: (value) => (typeof value === "number" && rule.values.includes(value) ? { planned: value, raw: `${value}` } : undefined),
       };
-    case "selector":
+    case "selector": {
+      // A choice listing models exists on those models only: elsewhere it reads as invalid and writes as unsupported.
+      const choices = rule.choices.filter((choice) => choice.models === undefined || choice.models.includes(model));
+      // The published known list decides unsupported against invalid, as a catalog reader decides it.
+      const known = rule.known;
       return {
         text: false,
-        decode: (raw) => (raw === rule.none?.raw ? rule.none.value : rule.choices.find((choice) => choice.raw === raw)?.token),
+        decode: (raw) => (raw === rule.none?.raw ? rule.none.value : choices.find((choice) => choice.raw === raw)?.token),
         plan: (value) => {
           if (rule.none !== undefined && value === rule.none.value) {
             return { planned: value, raw: rule.none.raw };
           }
-          const choice = rule.choices.find((each) => each.token === value);
+          const choice = choices.find((each) => each.token === value);
           if (choice !== undefined) {
             return { planned: value, raw: choice.raw };
           }
-          return rule.known.includes(value as string) ? "unsupported" : undefined;
+          return known.includes(value as string) ? "unsupported" : undefined;
         },
       };
+    }
     case "name":
       return {
         text: true,
@@ -195,8 +228,17 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
       };
     case "port-choice":
       return portChoiceCodec(rule, model);
-    case "switch":
-      return { text: false, decode: decodeSwitch, plan: planSwitch };
+    case "switch": {
+      if (rule.on !== "0") {
+        return { text: false, decode: decodeSwitch, plan: planSwitch };
+      }
+      // Inverted polarity: raw 0 means on.
+      return {
+        text: false,
+        decode: (raw) => (raw === "0" ? true : raw === "1" ? false : undefined),
+        plan: (value) => (typeof value === "boolean" ? { planned: value, raw: value ? "0" : "1" } : undefined),
+      };
+    }
     case "choice":
       return {
         text: false,
@@ -306,12 +348,17 @@ function channelAddress(
 }
 
 /** A whole-channel setting whose handler is built from `rule`; `V` is its catalog value type. */
-export function ruleSetting<V>(rule: ChannelSettingRule) {
-  const fixed = rule.value.kind === "port-choice" ? undefined : codecOf(rule.value);
-  return handler<V>((model, target) => {
+export function ruleSetting<V, I = V>(rule: ChannelSettingRule) {
+  const value = rule.value;
+  return handler<V, I>((model, target) => {
     const own = targetOf<{ channel?: unknown; side?: unknown }>(target, ["channel", "side"]);
     const at = channelAddress(model, own, rule.address);
-    return { at, codec: fixed ?? codecOf(rule.value, model) };
+    if (value.kind !== "by-kind") {
+      return { at, codec: codecOf(value, model) };
+    }
+    const kind = channelIndex(modelOf(model), own.channel)?.kind;
+    const each = kind === undefined ? undefined : value.rules[kind];
+    return each === undefined ? refuse("unsupported_operation") : { at, codec: codecOf(each, model) };
   });
 }
 
@@ -940,6 +987,90 @@ export function trackRuleSetting<V>(rule: TrackSettingRule) {
       return refuse("unsupported_operation");
     }
     return { at: address(rule.paramId, own.track - 1), codec: codecOf(rule.value, known) };
+  });
+}
+
+/** A physical input jack setting whose handler is built from `rule`: the target names a jack only. */
+export function inputRuleSetting<V>(rule: InputSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target) => {
+    const known = modelOf(model);
+    const own = targetOf<{ input?: unknown; band?: unknown }>(target, ["input"]);
+    const jacks = rule.jacks[known] ?? [];
+    if (typeof own.input !== "number" || !jacks.includes(own.input)) {
+      return refuse("invalid_input");
+    }
+    const only = rule.only?.[known];
+    if (only !== undefined && !only.includes(own.input)) {
+      return refuse("unsupported_operation");
+    }
+    return { at: address(rule.paramId, own.input - 1), codec };
+  });
+}
+
+/** A source gain whose handler is built from `rule`: the read instance, and the evidenced write instance. */
+export function sourceRuleSetting<V>(rule: SourceSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target, write) => {
+    const known = modelOf(model);
+    const own = targetOf<{ source?: unknown }>(target, ["source"]);
+    const entry = typeof own.source === "string" && Object.hasOwn(rule.sources, own.source) ? rule.sources[own.source] : undefined;
+    if (entry === undefined) {
+      return refuse("invalid_input");
+    }
+    if (!entry.models.includes(known)) {
+      return refuse("unsupported_operation");
+    }
+    if (!write) {
+      return { at: address(entry.paramId, entry.read), codec };
+    }
+    // Static value checks first; a write sequence still needing evidence has no bound write (F03-G).
+    // (The read instance stands in as the address of the unbound write, which is never sent.)
+    return entry.write === null
+      ? { at: address(entry.paramId, entry.read), codec: unboundWrite(codec) }
+      : { at: address(entry.paramId, entry.write), codec };
+  });
+}
+
+/** A codec whose valid plans report the write as unsupported, after the value check. */
+function unboundWrite(codec: Codec): Codec {
+  return {
+    ...codec,
+    plan: (value) => (codec.plan(value) === undefined ? undefined : "unsupported"),
+  };
+}
+
+/** A side-specific channel setting: mono takes no side, a fixed stereo channel requires one. */
+export function channelSideRuleSetting<V>(rule: ChannelSideSettingRule) {
+  return handler<V>((model, target) => {
+    const known = modelOf(model);
+    const own = targetOf<{ channel?: unknown; side?: unknown }>(target, ["channel", "side"]);
+    const channel = channelIndex(known, own.channel) ?? refuse("invalid_input");
+    const codec = codecOf(rule.value, known);
+    if (channel.kind === "mono") {
+      return own.side === undefined ? { at: address(rule.address.mono, channel.index), codec } : refuse("invalid_input");
+    }
+    if (own.side === "left" || own.side === "right") {
+      return { at: address(rule.address[own.side], channel.index), codec };
+    }
+    return refuse("invalid_input");
+  });
+}
+
+/** A mono pair setting: the primary's address; a secondary is not an alias, fixed stereo has none. */
+export function pairRuleSetting<V>(rule: PairSettingRule) {
+  const codec = codecOf(rule.value);
+  return handler<V>((model, target) => {
+    const known = modelOf(model);
+    const own = targetOf<{ channel?: unknown; side?: unknown }>(target, ["channel", "side"]);
+    const channel = channelIndex(known, own.channel) ?? refuse("invalid_input");
+    if (own.side !== undefined) {
+      return refuse("invalid_input");
+    }
+    if (channel.kind === "stereo") {
+      return refuse("unsupported_operation");
+    }
+    return (rule.primaries[known] ?? []).includes(channel.index + 1) ? { at: address(rule.paramId, channel.index), codec } : refuse("invalid_input");
   });
 }
 

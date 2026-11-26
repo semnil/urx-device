@@ -1,5 +1,11 @@
+import { settingHandlers } from "../src/operations/registry.js";
+import { type SelectorRule } from "../src/catalog/rules.js";
+import { validateSetting } from "../src/operations/registry.js";
+import { dryRunSetting } from "../src/operations/registry.js";
+import { dryRunSettingAfter } from "../src/operations/registry.js";
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
+import { BASIC_RULES } from "../src/catalog/basic-rules.js";
 import { DUCKER_RULES } from "../src/catalog/ducker.js";
 import { BUS_RULES, CHANNEL_STEREO_ASSIGN_RULE } from "../src/catalog/buses.js";
 import { INSERT_FX_RULES } from "../src/catalog/insert-fx.js";
@@ -30,16 +36,20 @@ const ruled = Object.entries(settingDefinitions as Record<string, SettingDefinit
   definition.rule === undefined ? [] : [[id, definition.rule] as [string, SettingRule]],
 );
 
-const allRules: Record<string, SettingRule> = { ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES, ...BUS_RULES, "channel.stereo-assign": CHANNEL_STEREO_ASSIGN_RULE, ...INSERT_FX_RULES, ...FX_RETURN_RULES, ...OUTPUT_EQ_RULES, ...OUTPUT_PEQ_RULES, ...STREAM_DELAY_RULES, ...OUTPUT_SOURCE_RULES, ...MONITOR_RULES, ...CUE_RULES, ...OSCILLATOR_RULES, ...DEVICE_RULES, ...KNOB_RULES, ...INTEGRATION_RULES, ...SCENE_RECORDER_RULES };
+const allRules: Record<string, SettingRule> = {
+  ...BASIC_RULES,
+  ...DYNAMICS_RULES, ...EQ_RULES, ...SSMCS_RULES, ...DUCKER_RULES, ...SEND_RULES, ...BUS_RULES, "channel.stereo-assign": CHANNEL_STEREO_ASSIGN_RULE, ...INSERT_FX_RULES, ...FX_RETURN_RULES, ...OUTPUT_EQ_RULES, ...OUTPUT_PEQ_RULES, ...STREAM_DELAY_RULES, ...OUTPUT_SOURCE_RULES, ...MONITOR_RULES, ...CUE_RULES, ...OSCILLATOR_RULES, ...DEVICE_RULES, ...KNOB_RULES, ...INTEGRATION_RULES, ...SCENE_RECORDER_RULES };
 
 /** The channel and band rules; send and bus rules, addressed per route or bus, have their own tests. */
-const addressed = ruled.flatMap(([id, rule]) => (rule.target === "send" || rule.target === "bus" || rule.target === "fx-parameter" || rule.target === "bus-side" || rule.target === "bus-side-band" || rule.target === "bus-band" || rule.target === "output-side" || rule.target === "output" || rule.target === "device" || rule.target === "knob" || rule.target === "track" ? [] : [[id, rule] as const]));
+const addressed = ruled.flatMap(([id, rule]) =>
+  (rule.target === "channel" && rule.value.kind !== "by-kind") || rule.target === "channel-band" ? [[id, rule] as const] : [],
+);
 
 /** Each (id, target, value rule) a rule defines: one per band for a band rule. */
 const valueCases = addressed.flatMap(([id, rule]): [string, object, ValueRule][] => {
   if (rule.target === "channel") {
-    // URX44 channel 1 is mono, channel 5 the first fixed stereo pair.
-    return [[id, { channel: rule.address.mono === undefined ? 5 : 1 }, rule.value]];
+    // URX44 channel 1 is mono, channel 5 the first fixed stereo pair (per-kind values are excluded above).
+    return rule.value.kind === "by-kind" ? [] : [[id, { channel: rule.address.mono === undefined ? 5 : 1 }, rule.value]];
   }
   const value = rule.value;
   return rule.bands.flatMap((band): [string, object, ValueRule][] => {
@@ -70,7 +80,8 @@ async function observed(label: string, target: object, raw: string, text = false
 }
 
 describe("setting rules (K35 definition metadata)", () => {
-  it("carry the rule objects the operations are built from", () => {
+  it("carry a rule on every definition, the object the operations are built from", () => {
+    expect(ruled.length).toBe(Object.keys(settingDefinitions).length);
     expect(ruled.map(([id]) => id).sort()).toEqual(Object.keys(allRules).sort());
     for (const [id, rule] of ruled) {
       expect(rule, id).toBe(allRules[id]);
@@ -115,10 +126,13 @@ describe("setting rules (K35 definition metadata)", () => {
   it("predict each operation's write domain, wire values and read domain from the rule alone", async () => {
     for (const [id, target, rule] of valueCases) {
       switch (rule.kind) {
-        case "switch":
-          expect([await wire(id, target, true), await wire(id, target, false)], id).toEqual(["1", "0"]);
-          expect([await observed(id, target, "1"), await observed(id, target, "2")], id).toEqual([{ value: true }, { code: "invalid_response" }]);
+        case "switch": {
+          // On is raw 1, or raw 0 for an inverted switch.
+          const [on, off] = rule.on === "0" ? ["0", "1"] : ["1", "0"];
+          expect([await wire(id, target, true), await wire(id, target, false)], id).toEqual([on, off]);
+          expect([await observed(id, target, on), await observed(id, target, "2")], id).toEqual([{ value: true }, { code: "invalid_response" }]);
           break;
+        }
         case "choice":
           for (const [index, choice] of rule.choices.entries()) {
             expect(await wire(id, target, choice), `${id} ${choice}`).toBe(`${index}`);
@@ -173,9 +187,17 @@ describe("setting rules (K35 definition metadata)", () => {
           const lastIndex = rule.stops.length - 1;
           const first = (rule.stops[0] as number) / rule.scale;
           const last = (rule.stops[lastIndex] as number) / rule.scale;
-          expect([plan(id, target, first), plan(id, target, last)], id).toEqual([first, last]);
-          expect(() => plan(id, target, first - 1 / rule.scale), id).toThrow();
-          expect(() => plan(id, target, last + 1 / rule.scale), id).toThrow();
+          // The write range: the stops, or a wider `write` window whose ends round to the end stops.
+          const writeMin = rule.write?.min ?? first;
+          const writeMax = rule.write?.max ?? last;
+          expect([plan(id, target, first), plan(id, target, last), plan(id, target, writeMin), plan(id, target, writeMax)], id).toEqual([
+            first,
+            last,
+            first,
+            last,
+          ]);
+          expect(() => plan(id, target, writeMin - 1 / rule.scale), id).toThrow();
+          expect(() => plan(id, target, writeMax + 1 / rule.scale), id).toThrow();
           // The raw read range: the indices with an ordinal, else the stop values or `read`.
           const low = rule.ordinal ?? rule.read?.min ?? (rule.stops[0] as number);
           const high = rule.ordinal === undefined ? (rule.read?.max ?? (rule.stops[lastIndex] as number)) : rule.ordinal + lastIndex;
@@ -210,6 +232,150 @@ describe("setting rules (K35 definition metadata)", () => {
         expect(await wire(id, target, rule.sentinel.value), id).toBe(rule.sentinel.raw);
         expect(await observed(id, target, rule.sentinel.raw), id).toEqual({ value: rule.sentinel.value });
       }
+    }
+  });
+});
+
+describe("every read-only setting exposes no write path", () => {
+  it("has no plan, write, validation or dry run where the setting has no write on any target", () => {
+    for (const id of [
+      "input.clip-safe-active",
+      "channel.stereo-link",
+      "device.console-lock",
+      "knob.bank",
+      "integration.active",
+      "scene.current",
+      "scene.cursor",
+      "recorder.state",
+      "recorder.card-present",
+      "recorder.track-count",
+    ]) {
+      expect((settingDefinitions as Record<string, { writable: boolean }>)[id]?.writable, id).toBe(false);
+      const handler = (settingHandlers as unknown as Record<string, Record<string, unknown>>)[id] ?? {};
+      expect(["plan", "write", "validate", "dryRun"].filter((key) => key in handler), id).toEqual([]);
+    }
+  });
+
+  it("sends nothing from a direct write where every target's write is unbound", async () => {
+    for (const [id, target, value] of [
+      ["send.pan", { source: "channel-1", destination: "mix-1" }, 0],
+      ["bus.type", { bus: "mix-1" }, "fixed"],
+      ["bus.eq.type", { bus: "stereo" }, "peq"],
+      ["bus.eq.on", { bus: "mix-1" }, true],
+    ] as const) {
+      for (const model of ["URX22", "URX44", "URX44V"] as const) {
+        const none = new FakeTransport();
+        const handler = (settingHandlers as unknown as Record<string, { write: (c: OperationContext, t: unknown, v: unknown) => Promise<unknown> }>)[id];
+        const code = await Promise.resolve()
+          .then(() => handler?.write(new OperationContext(none, model), target, value))
+          .then(
+          () => "accepted",
+          (error: unknown) => operationFailureOf(error)?.code,
+        );
+        expect(code, `${model} ${id}`).toBe("unsupported_operation");
+        expect(none.calls, `${model} ${id}`).toEqual([]);
+      }
+    }
+  });
+});
+
+describe("selector judgments from the published catalog match the operations", () => {
+  /** A catalog reader's verdict: the model's choices plan, another known token is unsupported, anything else invalid. */
+  const judge = (rule: SelectorRule, model: string, token: string) => {
+    const choice = rule.choices.find((each) => each.token === token && (each.models === undefined || each.models.includes(model)));
+    if (choice !== undefined) return `planned ${choice.raw}`;
+    return rule.known.includes(token) ? "unsupported_operation" : "invalid_input";
+  };
+  const operation = (model: string, id: string, target: object, token: string) => {
+    try {
+      previewSetting(model, ...([id, target, token] as unknown as WriteArgs));
+    } catch (error) {
+      return operationFailureOf(error)?.code;
+    }
+    return "planned";
+  };
+  /** Every write entry's verdict for one value: each must equal the catalog's, with the sent value and request count. */
+  const everyPath = async (model: string, id: string, target: object, token: string) => {
+    const args = [id, target, token] as unknown as WriteArgs;
+    const code = (run: () => unknown) => {
+      try {
+        run();
+        return "planned";
+      } catch (error) {
+        return operationFailureOf(error)?.code;
+      }
+    };
+    const settle = (promise: () => Promise<unknown>) =>
+      Promise.resolve()
+        .then(promise)
+        .then(
+          () => "planned",
+          (error: unknown) => operationFailureOf(error)?.code,
+        );
+    const dry = new FakeTransport();
+    const after = new FakeTransport();
+    const write = new FakeTransport().script("setNumeric", { kind: "success", value: null, evidence: { state: "accepted" } });
+    const verdicts = {
+      validate: code(() => validateSetting(model, ...args)),
+      preview: code(() => previewSetting(model, ...args)),
+      dryRun: await settle(() => dryRunSetting(new OperationContext(dry, model), ...args)),
+      dryRunAfter: await settle(() => dryRunSettingAfter(new OperationContext(after, model), new Set(["geq_type_selected"]), ...args)),
+      write: await settle(() => writeSetting(new OperationContext(write, model), ...args)),
+    };
+    return { verdicts, previews: dry.calls.length + after.calls.length, sent: write.calls.map((call) => call.value) };
+  };
+
+  it("for the channel input source and Rec Point on every model and channel kind", async () => {
+    const source = settingDefinitions["channel.source"].rule.value as SelectorRule;
+    const recPoint = settingDefinitions["channel.rec-point"].rule.value as { rules: { mono: SelectorRule; stereo: SelectorRule } };
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      const mono = MONO_CHANNELS[model][0] as number;
+      const stereo = STEREO_CHANNELS[model][0] as number;
+      for (const token of [...source.known, "usb-daw-13", "Input-1"]) {
+        for (const target of [{ channel: mono }, { channel: stereo, side: "left" }, { channel: stereo, side: "right" }]) {
+          const verdict = judge(source, model, token);
+          expect(operation(model, "channel.source", target, token), `${model} ${JSON.stringify(target)} ${token}`).toBe(verdict.startsWith("planned") ? "planned" : verdict);
+        }
+      }
+      for (const [kind, channel] of [["mono", mono], ["stereo", stereo]] as const) {
+        const rule = recPoint.rules[kind];
+        for (const token of [...recPoint.rules.mono.known, "pre-anything"]) {
+          const verdict = judge(rule, model, token);
+          expect(operation(model, "channel.rec-point", { channel }, token), `${model} ${kind} ${token}`).toBe(verdict.startsWith("planned") ? "planned" : verdict);
+        }
+      }
+    }
+    // Every write entry, with the sent value and the request count, agrees with the catalog.
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      const mono = MONO_CHANNELS[model][0] as number;
+      const stereo = STEREO_CHANNELS[model][0] as number;
+      const cases: [string, object, SelectorRule, string][] = [
+        ...[...source.known, "Input-1"].flatMap((token): [string, object, SelectorRule, string][] => [
+          ["channel.source", { channel: mono }, source, token],
+          ["channel.source", { channel: stereo, side: "right" }, source, token],
+        ]),
+        ...[...recPoint.rules.mono.known, "pre-anything"].flatMap((token): [string, object, SelectorRule, string][] => [
+          ["channel.rec-point", { channel: mono }, recPoint.rules.mono, token],
+          ["channel.rec-point", { channel: stereo }, recPoint.rules.stereo, token],
+        ]),
+      ];
+      for (const [id, target, rule, token] of cases) {
+        const verdict = judge(rule, model, token);
+        const expected = verdict.startsWith("planned") ? "planned" : verdict;
+        const label = `${model} ${id} ${JSON.stringify(target)} ${token}`;
+        const { verdicts, previews, sent } = await everyPath(model, id, target, token);
+        expect(verdicts, label).toEqual({ validate: expected, preview: expected, dryRun: expected, dryRunAfter: expected, write: expected });
+        expect(previews, label).toBe(0);
+        expect(sent, label).toEqual(verdict.startsWith("planned") ? [verdict.slice("planned ".length)] : []);
+      }
+    }
+    // A port another model takes is unsupported here, from the catalog alone.
+    expect(judge(source, "URX44", "hdmi-left")).toBe("unsupported_operation");
+    // A mono-only Rec Point stage is an invalid value for a fixed stereo channel, not a known one it lacks.
+    const monoOnly = recPoint.rules.mono.known.filter((stage) => !recPoint.rules.stereo.known.includes(stage));
+    expect(monoOnly.length).toBeGreaterThan(0);
+    for (const stage of monoOnly) {
+      expect(operation("URX44", "channel.rec-point", { channel: STEREO_CHANNELS.URX44[0] as number }, stage), stage).toBe("invalid_input");
     }
   });
 });

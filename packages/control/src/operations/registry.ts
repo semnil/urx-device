@@ -7,8 +7,6 @@ import {
   type SettingTypes,
   type WritableSettingId,
 } from "../catalog/settings.js";
-import type { OperationContext } from "./context.js";
-import { OperationFailureError } from "./failure.js";
 import {
   channelColor,
   channelFader,
@@ -20,7 +18,24 @@ import {
   channelRecPoint,
   channelSource,
   channelStereoLink,
-} from "./channels.js";
+  compOn,
+  eqOn,
+  gateOn,
+  hpfFrequency,
+  hpfOn,
+  inputClipSafe,
+  inputClipSafeActive,
+  inputGain,
+  inputHiZ,
+  inputPhantom,
+  processingMode,
+  sourceGain,
+  ssmcsCompOn,
+  ssmcsEqOn,
+  ssmcsOn,
+} from "./basic.js";
+import type { OperationContext } from "./context.js";
+import { OperationFailureError } from "./failure.js";
 import {
   compAttack,
   compAutoMakeup,
@@ -138,25 +153,6 @@ import {
 import { integrationActive, integrationPostFaderSource, knobBank, panelSendsTarget } from "./integration-panel.js";
 import { knobAssignment } from "./knob.js";
 import { recorderCardPresent, recorderSource, recorderState, recorderTrackCount, sceneCurrent, sceneCursor } from "./scene-recorder.js";
-import {
-  compOn,
-  eqOn,
-  gateOn,
-  hpfFrequency,
-  hpfOn,
-  processingMode,
-  ssmcsCompOn,
-  ssmcsEqOn,
-  ssmcsOn,
-} from "./processing.js";
-import {
-  inputClipSafe,
-  inputClipSafeActive,
-  inputGain,
-  inputHiZ,
-  inputPhantom,
-  sourceGain,
-} from "./inputs.js";
 import type { DryRunPlan, Reading, UnverifiedCondition, VerifiedPlan, WritePlan, WriteResult } from "./results.js";
 
 type Target<K extends SettingId> = SettingTypes[K]["target"];

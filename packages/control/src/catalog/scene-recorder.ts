@@ -7,9 +7,11 @@ import { sourceLaneRule } from "./output-routing.js";
 import type { DeviceSettingRule, SelectorRule, TrackSettingRule } from "./rules.js";
 
 /** User scenes 0…62, Initial Data 32768, presets 32769…32771: the 67 references. */
+const SCENE_TOKENS = ["initial", ...Array.from({ length: 63 }, (_, index) => `user-${index + 1}`), "preset-1", "preset-2", "preset-3"];
+
 const SCENE: SelectorRule = {
   kind: "selector",
-  known: [],
+  known: SCENE_TOKENS,
   choices: [
     { token: "initial", raw: "32768" },
     ...Array.from({ length: 63 }, (_, index) => ({ token: `user-${index + 1}`, raw: `${index}` })),

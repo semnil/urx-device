@@ -24,6 +24,7 @@ export {
 export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
+export { BASIC_RULES } from "./basic-rules.js";
 export { DUCKER_RULES } from "./ducker.js";
 export { SEND_RULES } from "./sends.js";
 export { BUS_RULES, BUS_TOKENS, CHANNEL_STEREO_ASSIGN_RULE } from "./buses.js";
@@ -59,6 +60,11 @@ export {
 export { DYNAMICS_RULES } from "./dynamics.js";
 export type {
   ByBandRule,
+  ByKindRule,
+  ChannelSideSettingRule,
+  InputSettingRule,
+  PairSettingRule,
+  SourceSettingRule,
   ChannelBandSettingRule,
   ChannelSettingRule,
   ChoiceRule,
