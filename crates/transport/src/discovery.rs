@@ -7,6 +7,7 @@
 //! could not be checked fails the whole discovery, so no result is ever
 //! selected from an incomplete list.
 
+use crate::connection::LinkLoss;
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use crate::link::{Budget, Link};
 use crate::wire::{Inbound, Request};
@@ -39,8 +40,14 @@ pub struct DiscoveryOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemFirmware {
     Version(String),
-    /// A valid response that reports no System version.
+    /// A `firm_list` read in full that has no System entry.
     Absent,
+    /// A `firm_list` the version cannot be read from (R1-F-A): no `firm_list`
+    /// array, an entry without a nonempty string `firm_name`, a System entry
+    /// without a nonempty string `firm_version`, or System entries that
+    /// disagree. Discovery fails such metadata as `invalid_response`; an
+    /// operational connection reports it, and its application decides.
+    Unreadable,
 }
 
 /// One online unit.
@@ -147,10 +154,10 @@ fn check(
         budget,
         PHASE,
     )?;
+    // An empty status is a status other than `online` (R1-S-A).
     let status = synchronize
         .get("sync_status")
         .and_then(Value::as_str)
-        .filter(|status| !status.is_empty())
         .ok_or_else(malformed)?;
     if status != "online" {
         return Ok(None);
@@ -170,7 +177,10 @@ fn check(
             budget,
             PHASE,
         )?;
-        Some(system_firmware(&device).ok_or_else(malformed)?)
+        match system_firmware(&device) {
+            SystemFirmware::Unreadable => return Err(malformed()),
+            firmware => Some(firmware),
+        }
     } else {
         None
     };
@@ -210,8 +220,10 @@ pub(crate) fn get(
 ) -> Result<Value, Failure> {
     link.send(&request.message(), request_deadline, budget)?;
     let key = request.reply_key();
-    link.await_frame(request_deadline, budget, |message| {
+    let mut unit_lost = false;
+    let result = link.await_frame(request_deadline, budget, |message| {
         if watch_lost && lost_notification(message) {
+            unit_lost = true;
             return Some(Err(Failure::cause(Cause::ConnectionLost, phase)));
         }
         let inbound = Inbound::new(message.clone());
@@ -222,15 +234,26 @@ pub(crate) fn get(
                 .cloned()
                 .ok_or(Failure::cause(Cause::InvalidResponse, phase)),
         )
-    })
+    });
+    if unit_lost {
+        link.note_loss(LinkLoss::UnitLost);
+    }
+    result
 }
 
 /// The System version in `/vd/device`'s `firm_list`, whose entries are
-/// matched by name without case. `None` when the response is malformed: no
-/// `firm_list` array, an entry without a nonempty string `firm_name`, a System
-/// entry without a string `firm_version`, or System entries that disagree.
-/// Entry order does not change the result.
-pub(crate) fn system_firmware(device: &Value) -> Option<SystemFirmware> {
+/// matched by name without case; [`SystemFirmware::Unreadable`] when it
+/// cannot be read. Entry order does not change the result.
+pub(crate) fn system_firmware(device: &Value) -> SystemFirmware {
+    read_system_version(device).map_or(SystemFirmware::Unreadable, |version| match version {
+        None => SystemFirmware::Absent,
+        Some(version) => SystemFirmware::Version(version.to_string()),
+    })
+}
+
+/// The System version, `Some(None)` when the list has no System entry, and
+/// `None` when the list cannot be read.
+fn read_system_version(device: &Value) -> Option<Option<&str>> {
     let list = device.get("firm_list")?.as_array()?;
     let mut version: Option<&str> = None;
     for entry in list {
@@ -241,16 +264,16 @@ pub(crate) fn system_firmware(device: &Value) -> Option<SystemFirmware> {
         if !name.eq_ignore_ascii_case("system") {
             continue;
         }
-        let this = entry.get("firm_version")?.as_str()?;
+        let this = entry
+            .get("firm_version")?
+            .as_str()
+            .filter(|version| !version.is_empty())?;
         if version.is_some_and(|seen| seen != this) {
             return None;
         }
         version = Some(this);
     }
-    match version {
-        None | Some("") => Some(SystemFirmware::Absent),
-        Some(version) => Some(SystemFirmware::Version(version.to_string())),
-    }
+    Some(version)
 }
 
 #[cfg(test)]

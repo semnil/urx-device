@@ -151,10 +151,6 @@ fn metadata_reads_the_system_firmware_version() {
             SystemFirmware::Absent,
         ),
         (json!([]), SystemFirmware::Absent),
-        (
-            json!([{ "firm_name": "system", "firm_version": "" }]),
-            SystemFirmware::Absent,
-        ),
     ];
     for (entries, expected) in cases {
         let a = unit(online("<device-id-a>"), firm_list(entries.clone()));
@@ -176,6 +172,8 @@ fn malformed_firmware_metadata_fails_the_discovery() {
         firm_list(json!({})),
         firm_list(json!([{ "firm_name": "System" }])),
         firm_list(json!([{ "firm_name": "System", "firm_version": 1 }])),
+        // An empty version is a System entry whose version cannot be read (R1-F-A).
+        firm_list(json!([{ "firm_name": "system", "firm_version": "" }])),
     ] {
         let a = unit(online("<device-id-a>"), device.clone());
         let center = center(&[(a.port, "URX44V")]);
@@ -666,12 +664,22 @@ fn an_online_push_or_a_push_before_the_status_reply_does_not_fail_the_check() {
 }
 
 #[test]
-fn an_empty_link_state_is_invalid_rather_than_offline() {
+fn an_empty_link_state_is_a_unit_that_is_not_online() {
+    // An empty status is a status other than `online` (R1-S-A); a status that is not a
+    // string is still a malformed answer.
     let a = unit(online("<device-id-a>"), Value::Null);
     let empty = unit(json!({ "sync_status": "" }), Value::Null);
-    let center = center(&[(a.port, "URX44V"), (empty.port, "URX22")]);
+    let center_with_empty = center(&[(a.port, "URX44V"), (empty.port, "URX22")]);
+    let ids: Vec<String> = run(&options(center_with_empty.port))
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    assert_eq!(ids, ["<device-id-a>"]);
+    let numeric = unit(json!({ "sync_status": 0 }), Value::Null);
+    let center_with_numeric = center(&[(a.port, "URX44V"), (numeric.port, "URX22")]);
     assert_eq!(
-        run(&options(center.port)),
+        run(&options(center_with_numeric.port)),
         fails_with(Cause::InvalidResponse)
     );
 }

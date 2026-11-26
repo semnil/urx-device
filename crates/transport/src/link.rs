@@ -8,6 +8,7 @@
 //! holds first is reported even when a reply, a close or an oversized frame
 //! arrives after it.
 
+use crate::connection::LinkLoss;
 use crate::frame::{self, FrameReader, ReadError};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use serde_json::Value;
@@ -124,6 +125,9 @@ pub(crate) struct Link<'a> {
     reader: FrameReader,
     phase: Phase,
     control: &'a Control,
+    /// How the link was lost, once a failure ended it as `connection_lost`
+    /// (R1-O-A). The first one recorded stands.
+    lost: Option<LinkLoss>,
 }
 
 impl<'a> Link<'a> {
@@ -171,12 +175,23 @@ impl<'a> Link<'a> {
             reader: FrameReader::new(),
             phase,
             control,
+            lost: None,
         })
     }
 
     /// The phase later failures on this link report.
     pub fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
+    }
+
+    /// How the link was lost, if a failure on it ended it as `connection_lost`.
+    pub fn lost_link(&self) -> Option<LinkLoss> {
+        self.lost
+    }
+
+    /// Records how the link was lost, unless that is already recorded.
+    pub fn note_loss(&mut self, loss: LinkLoss) {
+        self.lost.get_or_insert(loss);
     }
 
     /// The connected socket and the reader holding any bytes already received.
@@ -198,20 +213,27 @@ impl<'a> Link<'a> {
         let mut written = 0;
         while written < bytes.len() {
             let remaining = stop(self.control, &bound, self.phase)?;
-            self.sock
-                .set_write_timeout(Some(remaining.min(POLL)))
-                .map_err(|_| Failure::cause(Cause::ConnectionLost, self.phase))?;
+            if let Err(error) = self.sock.set_write_timeout(Some(remaining.min(POLL))) {
+                self.note_loss(LinkLoss::SocketError(error.kind()));
+                return Err(Failure::cause(Cause::ConnectionLost, self.phase));
+            }
             let outcome = self.sock.write(&bytes[written..]);
             stop(self.control, &bound, self.phase)?;
             match outcome {
-                Ok(0) => return Err(Failure::cause(Cause::ConnectionLost, self.phase)),
+                Ok(0) => {
+                    self.note_loss(LinkLoss::PeerClosed);
+                    return Err(Failure::cause(Cause::ConnectionLost, self.phase));
+                }
                 Ok(n) => written += n,
                 Err(e)
                     if matches!(
                         e.kind(),
                         ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                     ) => {}
-                Err(_) => return Err(Failure::cause(Cause::ConnectionLost, self.phase)),
+                Err(e) => {
+                    self.note_loss(LinkLoss::SocketError(e.kind()));
+                    return Err(Failure::cause(Cause::ConnectionLost, self.phase));
+                }
             }
         }
         Ok(())
@@ -233,6 +255,7 @@ impl<'a> Link<'a> {
             self.control,
             self.phase,
             &bound,
+            &mut self.lost,
             answer,
         )
     }
@@ -251,19 +274,26 @@ impl Source for TcpStream {
 }
 
 /// [`Link::await_frame`]'s loop: one read at a time, each bounded by
-/// [`POLL`], with the stop conditions checked before and after every read.
+/// [`POLL`], with the stop conditions checked before and after every read. A
+/// failure that ends the link as `connection_lost` records how in `lost`.
 fn read_until<S: Source, T>(
     sock: &mut S,
     reader: &mut FrameReader,
     control: &Control,
     phase: Phase,
     bound: &Bound,
+    lost: &mut Option<LinkLoss>,
     mut answer: impl FnMut(&Value) -> Option<Result<T, Failure>>,
 ) -> Result<T, Failure> {
+    let mut lose = |loss: LinkLoss| {
+        lost.get_or_insert(loss);
+        Failure::cause(Cause::ConnectionLost, phase)
+    };
     loop {
         let remaining = stop(control, bound, phase)?;
-        sock.set_poll(remaining.min(POLL))
-            .map_err(|_| Failure::cause(Cause::ConnectionLost, phase))?;
+        if let Err(error) = sock.set_poll(remaining.min(POLL)) {
+            return Err(lose(LinkLoss::SocketError(error.kind())));
+        }
         let outcome = reader.read_once(sock);
         stop(control, bound, phase)?;
         match outcome {
@@ -276,9 +306,8 @@ fn read_until<S: Source, T>(
             Err(ReadError::Oversized { .. }) => {
                 return Err(Failure::cause(Cause::InvalidResponse, phase))
             }
-            Err(ReadError::Closed | ReadError::Io(_)) => {
-                return Err(Failure::cause(Cause::ConnectionLost, phase))
-            }
+            Err(ReadError::Closed) => return Err(lose(LinkLoss::PeerClosed)),
+            Err(ReadError::Io(kind)) => return Err(lose(LinkLoss::SocketError(kind))),
         }
     }
 }
@@ -342,6 +371,7 @@ mod tests {
             control,
             Phase::Discovery,
             &bound,
+            &mut None,
             |frame| Some(Ok(frame.clone())),
         );
         (result, source.reads)
