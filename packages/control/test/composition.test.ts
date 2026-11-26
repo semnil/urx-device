@@ -9,7 +9,7 @@ import { PLAN_ITEM_LIMIT, planCurrent } from "../src/composition/plan.js";
 import { targetsOf } from "../src/composition/targets.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { previewSetting, settingHandlers, type WriteArgs } from "../src/operations/registry.js";
+import { settingHandlers, validateSetting, type WriteArgs } from "../src/operations/registry.js";
 import { codecOf } from "../src/operations/rules.js";
 import { FakeTransport } from "./fake-transport.js";
 
@@ -39,7 +39,7 @@ function synthesize(model: Model, overrides: Record<string, number | string> = {
           if (read === undefined) return false;
           const decoded = typeof read === "object" && read !== null && read.kind === "text" ? read.text : read;
           try {
-            previewSetting(model, ...([setting, target, decoded] as unknown as WriteArgs));
+            validateSetting(model, ...([setting, target, decoded] as unknown as WriteArgs));
             return true;
           } catch (error) {
             return operationFailureOf(error)?.code === "unsupported_operation";
@@ -93,6 +93,17 @@ describe("CURRENT composition (K36, F18)", () => {
       expect(plan.omissions.some((o) => o.setting === "bus.fader" && (o.target as { bus: string }).bus === "mix-1")).toBe(true);
       expect(plan.steps.some((s) => s.setting === "bus.fader" && (s.target as { bus: string }).bus === "stereo")).toBe(true);
       expect(new Set(omitted("device.brightness"))).toEqual(new Set(["excluded_by_scope"]));
+      // GEQ writes need the live EQ Type (and Limit for gain): phase-5 steps planned at execution.
+      for (const setting of ["bus.geq.on", "bus.geq.link", "bus.geq.limit", "bus.geq.gain"] as const) {
+        const live = plan.steps.filter((s) => s.setting === setting);
+        expect(live.length, `${model} ${setting}`).toBeGreaterThan(0);
+        expect(new Set(live.map((s) => `${s.phase} ${String(s.planned)}`)), `${model} ${setting}`).toEqual(new Set(["5 null"]));
+      }
+      // STEREO GEQ gain writes the 20 Hz band only: its other bands are not_writable omissions, not steps.
+      const stereoGain = (entries: readonly { setting: string; target: unknown }[]) =>
+        entries.filter((e) => e.setting === "bus.geq.gain" && (e.target as { bus: string }).bus === "stereo").map((e) => (e.target as { band: string }).band);
+      expect(new Set(stereoGain(plan.steps)), model).toEqual(new Set(["20"]));
+      expect(stereoGain(plan.omissions).length, model).toBe(2 * 30);
       // Bus names and colors in phase 10 (OV-BUS): STEREO and FX 1/2 are steps; MIX 1/2 are not_writable omissions.
       for (const setting of ["bus.name", "bus.color"] as const) {
         const stepped = plan.steps.filter((s) => s.setting === setting).map((s) => [s.phase, (s.target as { bus: string }).bus]);

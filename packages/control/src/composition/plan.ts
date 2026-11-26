@@ -10,7 +10,7 @@ import { urxfValue, type UrxfChunk, type UrxfFile } from "../catalog/urxf.js";
 import { FX_RETURN_RULES } from "../catalog/fx-return.js";
 import type { FxParameterRule, GeqGainRule } from "../catalog/rules.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
-import { decodeFileSetting, previewSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
+import { decodeFileSetting, previewSetting, validateSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
 import { codecOf } from "../operations/rules.js";
 import { EXCLUDED, PHASES, type OmissionReason } from "./coverage.js";
 import { targetsOf } from "./targets.js";
@@ -53,7 +53,8 @@ function writeValueOf(decoded: unknown): unknown {
 }
 
 /** Settings whose plan needs a live prerequisite read: planned at execution. */
-const LIVE: ReadonlySet<SettingId> = new Set<SettingId>(["bus.geq.gain", "bus.fx.parameter"]);
+/** Settings whose plan needs a live prerequisite read (F07-G, F06-F): planned at execution, checked statically here. */
+const LIVE: ReadonlySet<SettingId> = new Set<SettingId>(["bus.geq.on", "bus.geq.link", "bus.geq.limit", "bus.geq.gain", "bus.fx.parameter"]);
 
 function invalid(): never {
   throw new OperationFailureError({ code: "invalid_input", phase: "preparation", progress: null });
@@ -93,14 +94,15 @@ export function planCurrent(file: UrxfFile, model: Model): CurrentPlan {
           omit(setting, target, native);
           continue;
         }
-        if (LIVE.has(setting)) {
-          room();
-          steps.push({ phase, setting, target, component: null, requested, planned: null });
-          continue;
-        }
-        let planned: unknown;
+        const args = [setting, target, requested] as unknown as WriteArgs;
+        let planned: unknown = null;
         try {
-          planned = previewSetting(model, ...([setting, target, requested] as unknown as WriteArgs)).planned;
+          if (LIVE.has(setting)) {
+            // The static checks now; the plan itself needs the live prerequisite reads at execution.
+            validateSetting(model, ...args);
+          } else {
+            planned = previewSetting(model, ...args).planned;
+          }
         } catch (error) {
           // A known write this target lacks (an unbound or read-only one) is an omission; a refused value refuses the file.
           if (operationFailureOf(error)?.code === "unsupported_operation") {
