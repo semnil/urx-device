@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
 import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { settingHandlers } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -163,6 +164,16 @@ describe("integration and SEND display target (F12-I, F13-S)", () => {
     for (const raw of ["1", "18", "33", "48"]) {
       const transport = new FakeTransport().script("getNumeric", read(raw));
       expect((await failed(readAny(new OperationContext(transport, "URX44"), "panel.sends-target", {})))?.code, raw).toBe("invalid_response");
+    }
+  });
+});
+
+describe("read-only settings expose no write path", () => {
+  it("have no plan, write, validation or dry run in the public handler table", () => {
+    for (const id of ["knob.bank", "integration.active"] as const) {
+      const handler = settingHandlers[id] as unknown as Record<string, unknown>;
+      expect(["plan", "write", "validate", "dryRun"].filter((key) => key in handler), id).toEqual([]);
+      expect(typeof handler["read"], id).toBe("function");
     }
   });
 });

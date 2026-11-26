@@ -244,6 +244,12 @@ function dryRunOf<V>(run: (context: OperationContext, target: unknown, requested
     run(context, target, requested, new Set(affected ?? []))) as DryRun<V>;
 }
 
+/** A read-only setting's handler (a known setting without a write): no plan, write, validation or dry run. */
+export function readOnly<H extends { plan?: unknown; write?: unknown; validate?: unknown; dryRun?: unknown }>(handler: H) {
+  const { plan: _plan, write: _write, validate: _validate, dryRun: _dryRun, ...rest } = handler;
+  return rest;
+}
+
 /** A handler for the address and codec `resolve` gives a target, for a read or a write. */
 function handler<V, I = V>(resolve: (model: string, target: unknown, write: boolean) => { at: ParameterAddress; codec: Codec }) {
   const planned = (model: string, target: unknown, requested: I) => {
