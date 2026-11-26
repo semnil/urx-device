@@ -47,6 +47,12 @@ function atDelivery<T>(record: T): T {
 }
 
 /** The owner of one logical operation over one connection. */
+/** A write guard an operation's setting writes check at the send boundary (F20-L-A). */
+export interface WriteGuard {
+  /** The latched stop, once there is one; it never clears. */
+  readonly stop: OperationCause | undefined;
+}
+
 export class OperationContext {
   readonly transport: Transport;
   /** The connected unit's model, as the app verified it. */
@@ -54,6 +60,7 @@ export class OperationContext {
   readonly #operation: TransportOperation;
   readonly #clock: () => Date;
   #stopping: OperationCause | undefined;
+  readonly #writeGuards = new Set<WriteGuard>();
 
   /** `clock` gives observation times (O5); the system clock by default. */
   constructor(transport: Transport, model: string, clock: () => Date = () => new Date()) {
@@ -86,6 +93,15 @@ export class OperationContext {
     this.#operation.cancel();
   }
 
+  /**
+   * Puts this operation's writes under `guard` (F20-L-A): no setting write
+   * is handed to the transport once the guard has latched a stop. The guard
+   * also cancels the operation when it latches, so unsent work stops.
+   */
+  guardWrites(guard: WriteGuard): void {
+    this.#writeGuards.add(guard);
+  }
+
   /** The owner's stopping cause, once cancelled. */
   get stopping(): OperationCause | undefined {
     return this.#stopping;
@@ -109,10 +125,12 @@ export class OperationContext {
   }
 
   async setNumeric(address: ParameterAddress, value: I64Text): Promise<NativePostResult> {
+    this.#checkWriteGuard();
     return (await this.#issue((request) => this.transport.setNumeric(address, value, request), validatePost)).record;
   }
 
   async setText(address: ParameterAddress, value: string): Promise<NativePostResult> {
+    this.#checkWriteGuard();
     return (await this.#issue((request) => this.transport.setText(address, value, request), validatePost)).record;
   }
 
@@ -124,6 +142,20 @@ export class OperationContext {
     const { failure } = record;
     const code = failure.kind === "cause" ? failure.code : (this.#stopping ?? "internal_error");
     return new OperationFailureError({ code, phase: failure.phase, progress });
+  }
+
+  /**
+   * The send boundary of every setting write: a latched guard stop refuses
+   * it before it is handed over (admission), so it is reported not sent,
+   * with the operation's first stopping cause where guards latched in turn.
+   */
+  #checkWriteGuard(): void {
+    for (const guard of this.#writeGuards) {
+      const stop = guard.stop;
+      if (stop !== undefined) {
+        throw new OperationFailureError({ code: this.#stopping ?? stop, phase: "admission", progress: null });
+      }
+    }
   }
 
   async #issue<T>(

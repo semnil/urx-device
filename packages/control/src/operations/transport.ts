@@ -37,6 +37,28 @@ export interface TransportRequest {
 }
 
 /**
+ * One notification delivered to a subscription's route (K12), as the native
+ * side received it: a numeric or text parameter change, a meter reading, or
+ * a namespace-wide change with no address. Callers validate it before use.
+ */
+export type TransportNotification =
+  | { readonly kind: "numeric"; readonly address: ParameterAddress; readonly value: I64Text }
+  | { readonly kind: "text"; readonly address: ParameterAddress; readonly value: string }
+  | { readonly kind: "meter"; readonly meterId: number; readonly x: I64Text; readonly value: I64Text }
+  | { readonly kind: "bulk-change" };
+
+/** One admitted subscription (K8, K11), registered by `activate` (K9). */
+export interface TransportSubscription {
+  /**
+   * Registers every address in order; settles once all are accepted. A
+   * rejection or failure rejects after the owned cleanup (K10).
+   */
+  activate(): Promise<void>;
+  /** Releases the subscription (K10); repeated calls join one completion. */
+  release(): Promise<void>;
+}
+
+/**
  * One verified connection. Each method resolves with the raw K34 record the
  * native side returned; callers validate it before adopting anything.
  */
@@ -49,6 +71,18 @@ export interface Transport {
   getName(address: ParameterAddress, request: TransportRequest): Promise<unknown>;
   setNumeric(address: ParameterAddress, value: I64Text, request: TransportRequest): Promise<unknown>;
   setText(address: ParameterAddress, value: string, request: TransportRequest): Promise<unknown>;
+  /**
+   * Admits a subscription to `addresses` for `operation` (K11), with no
+   * traffic yet. From activation until release the adapter calls `deliver`
+   * with each notification it routes to this subscription's token, in
+   * receive order, before acknowledging the batch that carried it. A refused
+   * admission throws.
+   */
+  prepareSubscription(
+    addresses: readonly ParameterAddress[],
+    operation: TransportOperation,
+    deliver: (notification: TransportNotification) => void,
+  ): TransportSubscription;
   /**
    * Acknowledges the validated result of `requestTicket`, releasing its
    * completion slot; no device I/O. At most once per ticket. It settles
