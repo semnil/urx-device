@@ -716,7 +716,7 @@ impl Connection {
     /// Repeated and concurrent calls share the first call's close and its
     /// outcome; none starts a second shutdown or sends anything more.
     pub fn close(&self, teardown: Duration) -> CloseOutcome {
-        let waiting = {
+        {
             let mut close = lock(&self.close.state);
             loop {
                 match *close {
@@ -744,16 +744,21 @@ impl Connection {
             lock(&self.close.exempt).push(thread::current().id());
             // An end already recorded is how the waiting requests end.
             let cause = gate.unwrap_or(RequestCause::NotConnected);
-            (take_pending(&mut state), cause)
+            // What waits completes on the threads held for it at admission,
+            // which the close waits for within the budget; a close called from
+            // one of their callbacks returns `Started` instead of waiting for
+            // itself. Handed over in the step that takes it, so an end that
+            // stops the threads meanwhile finds it queued, and they run it
+            // first.
+            self.shared
+                .expiry
+                .hand(take_pending(&mut state).completions(cause));
         };
-        let (waiting, cause) = waiting;
-        // What waits completes on the threads held for it at admission, which
-        // the close waits for within the budget; a close called from one of
-        // their callbacks returns `Started` instead of waiting for itself.
-        // Handed over before the threads are told to stop, so they run it
-        // first; after the close is marked, no hold queues another expired
-        // request.
-        self.shared.expiry.hand(waiting.completions(cause));
+        #[cfg(test)]
+        if let Some(taken) = CLOSE_TAKEN.with(|hook| hook.borrow_mut().take()) {
+            taken();
+        }
+        // After the close is marked, no hold queues another expired request.
         self.shared.expiry.stop();
         // A held result stops waiting for the application.
         self.shared.advance.notify_all();
@@ -941,7 +946,12 @@ fn wait_for<const N: usize>(
         // Taken once the close is marked: no admission, and so no completing
         // thread, follows it. Their identities stay recorded, so a close from
         // one never waits for itself.
-        let expiries = std::mem::take(&mut lock(&joining.pool).threads);
+        let expiries = {
+            let mut pool = lock(&joining.pool);
+            let mut threads = std::mem::take(&mut pool.threads);
+            threads.append(&mut pool.retired);
+            threads
+        };
         for thread in expiries {
             let _ = thread.join();
         }
@@ -1224,6 +1234,10 @@ thread_local! {
     /// Refuses the threads started from this thread once this many more have
     /// started, for a case that stands in for the system.
     pub(crate) static REFUSE_SPAWN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Runs once a close on this thread has taken what waits, for a case that
+    /// ends the connection at that point.
+    pub(crate) static CLOSE_TAKEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     /// Counts the threads started from this thread that have not yet
     /// finished, for a case that checks none is left running.
     pub(crate) static RUNNING: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
@@ -1311,7 +1325,11 @@ struct ExpiryPool {
     /// Threads started that have not ended.
     alive: usize,
     threads: Vec<JoinHandle<()>>,
-    /// Identities of every thread started, kept for the connection's life.
+    /// Threads that ended after lingering, until a later one or the close
+    /// joins them.
+    retired: Vec<JoinHandle<()>>,
+    /// Identities of the threads that have not ended after lingering, so a
+    /// close from one never waits for itself.
     ids: Vec<ThreadId>,
     stopping: bool,
 }
@@ -1419,6 +1437,21 @@ impl Expiry {
                 && pool.alive > self.reserved.load(Ordering::SeqCst)
             {
                 pool.alive -= 1;
+                // Retires itself, for a later thread or the close to join, and
+                // joins the threads retired before it, off every admission and
+                // close: the connection keeps no more than the threads that
+                // may still be ending.
+                let me = thread::current().id();
+                let earlier = std::mem::take(&mut pool.retired);
+                if let Some(at) = pool.threads.iter().position(|t| t.thread().id() == me) {
+                    let own = pool.threads.swap_remove(at);
+                    pool.retired.push(own);
+                }
+                pool.ids.retain(|id| *id != me);
+                drop(pool);
+                for thread in earlier {
+                    let _ = thread.join();
+                }
                 return;
             }
         }

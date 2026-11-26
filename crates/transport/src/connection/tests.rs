@@ -1683,6 +1683,35 @@ fn a_close_with_no_thread_to_start_completes_waiting_requests_and_returns() {
 }
 
 #[test]
+fn repeated_bursts_keep_no_more_threads_than_they_need() {
+    // Each burst holds up to eight threads, which end after lingering; the connection keeps
+    // no more of their handles or identities than the threads that may still be ending.
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    for round in 0..3 {
+        let answered: Vec<_> = (0..8)
+            .map(|n| submit(&connection, &operation, Request::GetNumeric(address(n))))
+            .collect();
+        for rx in &answered {
+            assert!(
+                matches!(outcome(rx), Outcome::Success { .. }),
+                "round {round}"
+            );
+        }
+        wait_until(|| super::lock(&connection.shared.expiry.pool).alive == 0);
+        let pool = super::lock(&connection.shared.expiry.pool);
+        assert!(pool.threads.is_empty(), "round {round}");
+        assert!(pool.ids.is_empty(), "round {round}");
+        assert!(
+            pool.retired.len() <= 8,
+            "round {round}: {} retired",
+            pool.retired.len()
+        );
+    }
+}
+
+#[test]
 fn a_completing_thread_no_callback_holds_ends_after_its_linger() {
     let peer = unit(plain);
     let connection = connect(&peer);
@@ -1692,6 +1721,79 @@ fn a_completing_thread_no_callback_holds_ends_after_its_linger() {
     let alive = || super::lock(&connection.shared.expiry.pool).alive;
     assert_eq!(alive(), 1, "held for the request at its admission");
     wait_until(|| alive() == 0);
+}
+
+#[test]
+fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_after() {
+    // A read is on the wire; a read, a write, an activation and two releases wait behind it.
+    // Right after the close takes them, the end of the connection stops the completing
+    // threads. Each callback still gets its result once, before the close returns.
+    let (port, _closed) = silent_unit();
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        ..options()
+    };
+    let connection = open(port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    thread::sleep(Duration::from_millis(20));
+    let read = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    let write = submit(&connection, &operation, Request::SetNumeric(address(3), 5));
+    let parameter = |param_id| {
+        crate::subscription::SubscriptionAddress::Parameter(ParameterAddress {
+            param_id,
+            x: 0,
+            y: 0,
+        })
+    };
+    let token = connection.prepare_subscription(&[parameter(4)]).unwrap();
+    let (tx, lifecycle) = mpsc::channel();
+    let (activated, released, again) = (tx.clone(), tx.clone(), tx);
+    token.activate(&operation, move |outcome| {
+        let _ = activated.send(outcome);
+    });
+    token.release(move |outcome| {
+        let _ = released.send(outcome);
+    });
+    token.release(move |outcome| {
+        let _ = again.send(outcome);
+    });
+    let expiry = Arc::clone(&connection.shared.expiry);
+    super::CLOSE_TAKEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            expiry.stop();
+            // Long enough for threads with nothing queued to end.
+            thread::sleep(Duration::from_millis(50));
+        }))
+    });
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    let unsent = failed(
+        RequestCause::NotConnected,
+        RequestPhase::Admission,
+        Evidence::NotSent,
+    );
+    assert_eq!(
+        read.try_recv(),
+        Ok(unsent.clone()),
+        "the read, before the close returned"
+    );
+    assert_eq!(
+        write.try_recv(),
+        Ok(unsent),
+        "the write, before the close returned"
+    );
+    for call in ["activate", "release", "release again"] {
+        let outcome = lifecycle.try_recv().expect(call);
+        assert_eq!(
+            outcome.map_err(|failed| failed.failure),
+            Err(Failure::Cause {
+                code: Cause::NotConnected,
+                phase: Phase::Subscription
+            }),
+            "{call}"
+        );
+    }
+    assert!(lifecycle.try_recv().is_err(), "each once");
 }
 
 #[test]
