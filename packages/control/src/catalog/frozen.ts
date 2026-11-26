@@ -12,3 +12,11 @@ export function frozen<T>(value: T): T {
   }
   return value;
 }
+
+/**
+ * A table by token with no inherited keys: looking up a token it does not
+ * hold, `toString` or `constructor` included, gives undefined.
+ */
+export function byToken<T>(entries: { readonly [token: string]: T }): { readonly [token: string]: T | undefined } {
+  return Object.assign(Object.create(null) as { [token: string]: T }, entries);
+}

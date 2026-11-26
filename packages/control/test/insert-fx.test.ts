@@ -130,11 +130,18 @@ describe("Insert-FX selector and on (F06-I)", () => {
     });
     const dynamics = { maxRateHz: 96000, monoOnly: false, slot: "output-dynamics" };
     expect(output.limits).toEqual({ none, "compander-h": dynamics, "compander-s": dynamics, "multi-band-comp": dynamics });
-    // The same rules through the public catalog, and a limit for exactly the tokens each target takes.
+    // The same rules through the public catalog, and a limit for exactly the tokens each target takes:
+    // an unknown name, an inherited object key or the other target's effect gives undefined.
+    const inherited = Object.getOwnPropertyNames(Object.prototype);
+    expect(inherited).toContain("toString");
     for (const id of ["channel.insert-fx.type", "bus.insert-fx.type"] as const) {
       const rule = settingDefinitions[id].rule;
       expect(rule).toBe(INSERT_FX_RULES[id]);
       expect(Object.keys(rule.value.limits ?? {}).sort()).toEqual(["none", ...rule.value.choices.map((choice) => choice.token)].sort());
+      const absent = [...inherited, "bypass", id.startsWith("channel") ? "multi-band-comp" : "clean"];
+      for (const token of absent) {
+        expect(rule.value.limits?.[token], `${id} ${token}`).toBeUndefined();
+      }
     }
   });
 
