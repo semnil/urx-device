@@ -93,9 +93,19 @@ describe("oscillator (F09-O)", () => {
       [{ bus: "stereo" }, "invalid_input"],
       [{ bus: "stream", side: "left" }, "unsupported_operation"],
       [{ bus: "monitor-1", side: "left" }, "unsupported_operation"],
+      // A known bus without an oscillator destination is unsupported with or without a side.
+      [{ bus: "stream" }, "unsupported_operation"],
+      [{ bus: "monitor-2" }, "unsupported_operation"],
+      [{ bus: "stream", side: "middle" }, "invalid_input"],
       [{ bus: "osc" }, "invalid_input"],
     ] as const) {
-      expect((await failureOf(readAny(new OperationContext(new FakeTransport(), "URX44"), "oscillator.assign", target)))?.code, JSON.stringify(target)).toBe(code);
+      for (const model of ["URX22", "URX44", "URX44V"] as const) {
+        const none = new FakeTransport();
+        const label = `${model} ${JSON.stringify(target)}`;
+        expect((await failureOf(readAny(new OperationContext(none, model), "oscillator.assign", target)))?.code, label).toBe(code);
+        expect((await failureOf(writeAny(new OperationContext(none, model), "oscillator.assign", target, true)))?.code, label).toBe(code);
+        expect(none.calls, label).toEqual([]);
+      }
     }
   });
 });
@@ -176,6 +186,13 @@ describe("meter points (F10-M)", () => {
     for (const bad of ["-1281", "1", "32766", "32768", "-0", "1.5", "", "-01"]) {
       expect(decodeMeterLevel(bad), bad).toBeUndefined();
       expect(decodeMeterReduction(bad), bad).toBeUndefined();
+    }
+    // A value of the wrong type decodes to nothing, and nothing is coerced or thrown.
+    for (const [index, bad] of [0, -15, 32767, ["-15"], { toString: null }, null, undefined, true, -15n].entries()) {
+      const label = `wrong type #${index}`;
+      expect(() => decodeMeterLevel(bad as never), label).not.toThrow();
+      expect(decodeMeterLevel(bad as never), label).toBeUndefined();
+      expect(decodeMeterReduction(bad as never), label).toBeUndefined();
     }
   });
 });

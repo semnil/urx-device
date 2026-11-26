@@ -532,6 +532,10 @@ export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
     }
     const bus = own.bus;
     const at = Object.hasOwn(rule.address, bus) ? rule.address[bus] : undefined;
+    // A known bus without the setting is unsupported with or without a side; a malformed side is still invalid.
+    if (at === undefined) {
+      return refuse(own.side === undefined || SIDES.includes(own.side as "left") ? "unsupported_operation" : "invalid_input");
+    }
     // A mono bus takes no side; every other bus requires one.
     if (at?.sideless === true ? own.side !== undefined : !SIDES.includes(own.side as "left")) {
       return refuse("invalid_input");

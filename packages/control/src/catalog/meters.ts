@@ -130,7 +130,8 @@ export type MeterLevel = { readonly state: "finite"; readonly value: number } | 
 const OVER = "32767";
 
 function tenths(raw: I64Text): number | undefined {
-  if (!/^(0|-[1-9][0-9]*)$/.test(raw)) {
+  // The type is checked first: only the defined integer text decodes, and nothing else is coerced.
+  if (typeof raw !== "string" || !/^(0|-[1-9][0-9]*)$/.test(raw)) {
     return undefined;
   }
   const value = Number(raw);
