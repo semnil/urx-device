@@ -327,6 +327,24 @@ pub struct Operation {
     shared: Weak<Shared>,
 }
 
+/// Why an opening or a discovery failed: its failure and, when it ended as
+/// `connection_lost`, how the link was lost if that is known (R1-O-A,
+/// R1-D-A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkFailure {
+    pub failure: Failure,
+    pub lost_link: Option<LinkLoss>,
+}
+
+impl From<Failure> for LinkFailure {
+    fn from(failure: Failure) -> Self {
+        LinkFailure {
+            failure,
+            lost_link: None,
+        }
+    }
+}
+
 /// Opens the unit at `port`, which must report `online` with identity
 /// `expected_id`, and reads its System firmware. Notifications are not
 /// delivered; see [`open_with`].
@@ -335,7 +353,7 @@ pub fn open(
     expected_id: &str,
     options: &ConnectionOptions,
     control: &Control,
-) -> Result<Connection, Failure> {
+) -> Result<Connection, LinkFailure> {
     open_with(port, expected_id, options, control, None)
 }
 
@@ -347,25 +365,39 @@ pub fn open_with(
     options: &ConnectionOptions,
     control: &Control,
     notifications: Option<NotificationHandler>,
-) -> Result<Connection, Failure> {
+) -> Result<Connection, LinkFailure> {
     let budget = Budget::starting_now(options.connect_deadline, Cause::ConnectTimeout);
-    let deadline = options.handshake_request_deadline;
     let mut link = Link::connect(port, &budget, Phase::Connect, control)?;
     link.set_phase(Phase::Identity);
+    let firmware = identify(&mut link, expected_id, options, &budget)
+        .map_err(|failure| link.failed(failure))?;
+    let (sock, reader) = link.into_parts();
+    Connection::start(sock, reader, firmware, options, notifications)
+        .map_err(|_| Failure::cause(Cause::InternalError, Phase::Connect).into())
+}
+
+/// The opening's reads: the unit must report `online` with identity
+/// `expected_id`; then its System firmware, as read.
+fn identify(
+    link: &mut Link<'_>,
+    expected_id: &str,
+    options: &ConnectionOptions,
+    budget: &Budget,
+) -> Result<SystemFirmware, Failure> {
+    let deadline = options.handshake_request_deadline;
     let synchronize = get(
-        &mut link,
+        link,
         wire::Request::GetSynchronize,
         false,
         deadline,
-        &budget,
+        budget,
         Phase::Identity,
     )?;
-    let invalid = Failure::cause(Cause::InvalidResponse, Phase::Identity);
+    // An empty status is a status other than `online` (R1-S-A).
     let status = synchronize
         .get("sync_status")
         .and_then(Value::as_str)
-        .filter(|status| !status.is_empty())
-        .ok_or(invalid)?;
+        .ok_or(Failure::cause(Cause::InvalidResponse, Phase::Identity))?;
     if status != "online" {
         return Err(Failure::cause(Cause::DeviceNotFound, Phase::Identity));
     }
@@ -378,17 +410,14 @@ pub fn open_with(
         return Err(Failure::cause(Cause::DeviceNotFound, Phase::Identity));
     }
     let device = get(
-        &mut link,
+        link,
         wire::Request::GetDevice,
         true,
         deadline,
-        &budget,
+        budget,
         Phase::Identity,
     )?;
-    let firmware = system_firmware(&device).ok_or(invalid)?;
-    let (sock, reader) = link.into_parts();
-    Connection::start(sock, reader, firmware, options, notifications)
-        .map_err(|_| Failure::cause(Cause::InternalError, Phase::Connect))
+    Ok(system_firmware(&device))
 }
 
 impl Connection {

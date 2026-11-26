@@ -8,6 +8,7 @@
 //! holds first is reported even when a reply, a close or an oversized frame
 //! arrives after it.
 
+use crate::connection::{LinkFailure, LinkLoss};
 use crate::frame::{self, FrameReader, ReadError};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use serde_json::Value;
@@ -124,6 +125,9 @@ pub(crate) struct Link<'a> {
     reader: FrameReader,
     phase: Phase,
     control: &'a Control,
+    /// How the link was lost, once a failure ended it as `connection_lost`
+    /// (R1-O-A). The first one recorded stands.
+    lost: Option<LinkLoss>,
 }
 
 impl<'a> Link<'a> {
@@ -171,12 +175,31 @@ impl<'a> Link<'a> {
             reader: FrameReader::new(),
             phase,
             control,
+            lost: None,
         })
     }
 
     /// The phase later failures on this link report.
     pub fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
+    }
+
+    /// `failure`, with how the link was lost when the failure ended it as
+    /// `connection_lost` and that is known.
+    pub fn failed(&self, failure: Failure) -> LinkFailure {
+        let lost_link = match failure {
+            Failure::Cause {
+                code: Cause::ConnectionLost,
+                ..
+            } => self.lost,
+            _ => None,
+        };
+        LinkFailure { failure, lost_link }
+    }
+
+    /// Records how the link was lost, unless that is already recorded.
+    pub fn note_loss(&mut self, loss: LinkLoss) {
+        self.lost.get_or_insert(loss);
     }
 
     /// The connected socket and the reader holding any bytes already received.
@@ -195,26 +218,14 @@ impl<'a> Link<'a> {
         stop(self.control, &bound, self.phase)?;
         let bytes =
             frame::encode(message).map_err(|_| Failure::cause(Cause::InternalError, self.phase))?;
-        let mut written = 0;
-        while written < bytes.len() {
-            let remaining = stop(self.control, &bound, self.phase)?;
-            self.sock
-                .set_write_timeout(Some(remaining.min(POLL)))
-                .map_err(|_| Failure::cause(Cause::ConnectionLost, self.phase))?;
-            let outcome = self.sock.write(&bytes[written..]);
-            stop(self.control, &bound, self.phase)?;
-            match outcome {
-                Ok(0) => return Err(Failure::cause(Cause::ConnectionLost, self.phase)),
-                Ok(n) => written += n,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                    ) => {}
-                Err(_) => return Err(Failure::cause(Cause::ConnectionLost, self.phase)),
-            }
-        }
-        Ok(())
+        write_within(
+            &mut self.sock,
+            &bytes,
+            self.control,
+            self.phase,
+            &bound,
+            &mut self.lost,
+        )
     }
 
     /// Reads frames until `answer` decides one, within `deadline` from now and
@@ -233,6 +244,7 @@ impl<'a> Link<'a> {
             self.control,
             self.phase,
             &bound,
+            &mut self.lost,
             answer,
         )
     }
@@ -250,20 +262,76 @@ impl Source for TcpStream {
     }
 }
 
+/// What [`write_within`] writes to: the connection's socket, or a test's
+/// scripted sink.
+trait Sink: Write {
+    fn set_write_poll(&mut self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl Sink for TcpStream {
+    fn set_write_poll(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.set_write_timeout(Some(timeout))
+    }
+}
+
+/// [`Link::send`]'s loop: one write at a time, each bounded by [`POLL`], with
+/// the stop conditions checked before and after every write. A failure that
+/// ends the link as `connection_lost` records how in `lost`.
+fn write_within<S: Sink>(
+    sock: &mut S,
+    bytes: &[u8],
+    control: &Control,
+    phase: Phase,
+    bound: &Bound,
+    lost: &mut Option<LinkLoss>,
+) -> Result<(), Failure> {
+    let mut lose = |loss: LinkLoss| {
+        lost.get_or_insert(loss);
+        Failure::cause(Cause::ConnectionLost, phase)
+    };
+    let mut written = 0;
+    while written < bytes.len() {
+        let remaining = stop(control, bound, phase)?;
+        if let Err(error) = sock.set_write_poll(remaining.min(POLL)) {
+            return Err(lose(LinkLoss::SocketError(error.kind())));
+        }
+        let outcome = sock.write(&bytes[written..]);
+        stop(control, bound, phase)?;
+        match outcome {
+            Ok(0) => return Err(lose(LinkLoss::PeerClosed)),
+            Ok(n) => written += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(lose(LinkLoss::SocketError(e.kind()))),
+        }
+    }
+    Ok(())
+}
+
 /// [`Link::await_frame`]'s loop: one read at a time, each bounded by
-/// [`POLL`], with the stop conditions checked before and after every read.
+/// [`POLL`], with the stop conditions checked before and after every read. A
+/// failure that ends the link as `connection_lost` records how in `lost`.
 fn read_until<S: Source, T>(
     sock: &mut S,
     reader: &mut FrameReader,
     control: &Control,
     phase: Phase,
     bound: &Bound,
+    lost: &mut Option<LinkLoss>,
     mut answer: impl FnMut(&Value) -> Option<Result<T, Failure>>,
 ) -> Result<T, Failure> {
+    let mut lose = |loss: LinkLoss| {
+        lost.get_or_insert(loss);
+        Failure::cause(Cause::ConnectionLost, phase)
+    };
     loop {
         let remaining = stop(control, bound, phase)?;
-        sock.set_poll(remaining.min(POLL))
-            .map_err(|_| Failure::cause(Cause::ConnectionLost, phase))?;
+        if let Err(error) = sock.set_poll(remaining.min(POLL)) {
+            return Err(lose(LinkLoss::SocketError(error.kind())));
+        }
         let outcome = reader.read_once(sock);
         stop(control, bound, phase)?;
         match outcome {
@@ -276,21 +344,21 @@ fn read_until<S: Source, T>(
             Err(ReadError::Oversized { .. }) => {
                 return Err(Failure::cause(Cause::InvalidResponse, phase))
             }
-            Err(ReadError::Closed | ReadError::Io(_)) => {
-                return Err(Failure::cause(Cause::ConnectionLost, phase))
-            }
+            Err(ReadError::Closed) => return Err(lose(LinkLoss::PeerClosed)),
+            Err(ReadError::Io(kind)) => return Err(lose(LinkLoss::SocketError(kind))),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt, decide, read_until, stop, Bound, Source};
+    use super::{attempt, decide, read_until, stop, write_within, Bound, Sink, Source};
+    use crate::connection::LinkLoss;
     use crate::frame::FrameReader;
     use crate::lifecycle::{Cause, Control, Failure, Phase};
     use serde_json::Value;
     use std::collections::VecDeque;
-    use std::io::{ErrorKind, Read};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -342,6 +410,7 @@ mod tests {
             control,
             Phase::Discovery,
             &bound,
+            &mut None,
             |frame| Some(Ok(frame.clone())),
         );
         (result, source.reads)
@@ -395,6 +464,114 @@ mod tests {
             end,
             expired: Cause::ResponseTimeout,
         }
+    }
+
+    /// A socket whose timeout setting fails with `poll`, and whose reads and
+    /// writes fail with `io`, or report the stream closed without one.
+    struct Failing {
+        poll: Option<ErrorKind>,
+        io: Option<ErrorKind>,
+    }
+
+    impl Failing {
+        fn outcome(&self) -> std::io::Result<usize> {
+            self.io.map_or(Ok(0), |kind| Err(kind.into()))
+        }
+
+        fn set(&self) -> std::io::Result<()> {
+            self.poll.map_or(Ok(()), |kind| Err(kind.into()))
+        }
+    }
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.outcome()
+        }
+    }
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.outcome()
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Source for Failing {
+        fn set_poll(&mut self, _: Duration) -> std::io::Result<()> {
+            self.set()
+        }
+    }
+
+    impl Sink for Failing {
+        fn set_write_poll(&mut self, _: Duration) -> std::io::Result<()> {
+            self.set()
+        }
+    }
+
+    #[test]
+    fn a_read_or_write_that_ends_the_link_records_how_with_the_error_it_failed_with() {
+        let lost = Failure::cause(Cause::ConnectionLost, Phase::Identity);
+        for (poll, io, expected) in [
+            (
+                Some(ErrorKind::InvalidInput),
+                None,
+                LinkLoss::SocketError(ErrorKind::InvalidInput),
+            ),
+            (
+                None,
+                Some(ErrorKind::ConnectionReset),
+                LinkLoss::SocketError(ErrorKind::ConnectionReset),
+            ),
+            (
+                None,
+                Some(ErrorKind::BrokenPipe),
+                LinkLoss::SocketError(ErrorKind::BrokenPipe),
+            ),
+            (None, None, LinkLoss::PeerClosed),
+        ] {
+            let bound = bound(Instant::now() + Duration::from_secs(5));
+            let mut recorded = None;
+            let read = read_until(
+                &mut Failing { poll, io },
+                &mut FrameReader::new(),
+                &Control::new(),
+                Phase::Identity,
+                &bound,
+                &mut recorded,
+                |frame| Some(Ok(frame.clone())),
+            );
+            assert_eq!(read, Err(lost), "read: {expected:?}");
+            assert_eq!(recorded, Some(expected), "read");
+            let mut recorded = None;
+            let written = write_within(
+                &mut Failing { poll, io },
+                b"{}\n",
+                &Control::new(),
+                Phase::Identity,
+                &bound,
+                &mut recorded,
+            );
+            assert_eq!(written, Err(lost), "write: {expected:?}");
+            assert_eq!(recorded, Some(expected), "write");
+        }
+        // The first loss recorded stands.
+        let bound = bound(Instant::now() + Duration::from_secs(5));
+        let mut recorded = Some(LinkLoss::UnitLost);
+        let _ = write_within(
+            &mut Failing {
+                poll: None,
+                io: Some(ErrorKind::BrokenPipe),
+            },
+            b"{}\n",
+            &Control::new(),
+            Phase::Identity,
+            &bound,
+            &mut recorded,
+        );
+        assert_eq!(recorded, Some(LinkLoss::UnitLost));
     }
 
     #[test]

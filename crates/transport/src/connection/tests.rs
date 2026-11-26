@@ -1,7 +1,7 @@
 //! The operational connection against a fake unit endpoint.
 
 use super::{
-    open, CloseOutcome, Connection, ConnectionOptions, LinkLoss, MAX_WAITING_BYTES,
+    open, CloseOutcome, Connection, ConnectionOptions, LinkFailure, LinkLoss, MAX_WAITING_BYTES,
     MAX_WAITING_REQUESTS,
 };
 use crate::discovery::SystemFirmware;
@@ -10,7 +10,7 @@ use crate::lifecycle::{Cause, Control, Failure, Phase};
 use crate::request::{
     Evidence, Outcome, ReadValue, Request, RequestCause, RequestFailure, RequestPhase,
 };
-use crate::test_peer::{get_reply, line, uri_of, Peer};
+use crate::test_peer::{get_reply, is_reset, line, resetting, uri_of, Peer};
 use crate::wire::{NameValue, ParameterAddress};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -174,8 +174,13 @@ fn open_refuses_a_unit_that_is_absent_or_not_the_one_requested() {
             json!({ "sync_status": "online" }),
             identity(Cause::IdentityError),
         ),
+        // An empty status is a status other than `online` (R1-S-A).
         (
             json!({ "sync_status": "" }),
+            identity(Cause::DeviceNotFound),
+        ),
+        (
+            json!({ "sync_status": 1 }),
             identity(Cause::InvalidResponse),
         ),
     ];
@@ -184,7 +189,9 @@ fn open_refuses_a_unit_that_is_absent_or_not_the_one_requested() {
             "/vd/synchronize" => vec![get_reply("/vd/synchronize", sync.clone())],
             _ => vec![get_reply("/vd/device", firmware())],
         });
-        let result = open(peer.port, ID, &options(), &Control::new()).map(|_| ());
+        let result = open(peer.port, ID, &options(), &Control::new())
+            .map(|_| ())
+            .map_err(|failed| failed.failure);
         assert_eq!(result, expected);
         assert_eq!(
             peer.uris(),
@@ -194,8 +201,21 @@ fn open_refuses_a_unit_that_is_absent_or_not_the_one_requested() {
     }
 }
 
+/// The opening's `connection_lost` failure, and how the link was lost.
+fn lost_while_opening(lost_link: Option<LinkLoss>) -> Result<(), LinkFailure> {
+    Err(LinkFailure {
+        failure: Failure::Cause {
+            code: Cause::ConnectionLost,
+            phase: Phase::Identity,
+        },
+        lost_link,
+    })
+}
+
 #[test]
-fn open_fails_on_a_lost_push_malformed_firmware_or_an_unreachable_unit() {
+fn an_opening_that_loses_its_link_says_how() {
+    // The unit reported lost while its firmware is read: Device Center goes on answering
+    // that read from its cache.
     let lost = Peer::serve(|request| match uri_of(request) {
         "/vd/synchronize" => vec![
             get_reply("/vd/synchronize", online(ID)),
@@ -205,25 +225,72 @@ fn open_fails_on_a_lost_push_malformed_firmware_or_an_unreachable_unit() {
         ],
         _ => vec![get_reply("/vd/device", firmware())],
     });
-    let malformed = Peer::serve(|request| match uri_of(request) {
-        "/vd/synchronize" => vec![get_reply("/vd/synchronize", online(ID))],
-        _ => vec![get_reply("/vd/device", json!({ "firm_list": {} }))],
-    });
     let result = |peer: &Peer| open(peer.port, ID, &options(), &Control::new()).map(|_| ());
+    assert_eq!(result(&lost), lost_while_opening(Some(LinkLoss::UnitLost)));
+    // The peer closing the stream instead of answering the firmware read.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut requests = BufReader::new(stream);
+        let mut request = String::new();
+        requests.read_line(&mut request).unwrap();
+        writer
+            .write_all(&get_reply("/vd/synchronize", online(ID)))
+            .unwrap();
+        request.clear();
+        requests.read_line(&mut request).unwrap();
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+    });
     assert_eq!(
-        result(&lost),
-        Err(Failure::Cause {
-            code: Cause::ConnectionLost,
-            phase: Phase::Identity
-        })
+        open(port, ID, &options(), &Control::new()).map(|_| ()),
+        lost_while_opening(Some(LinkLoss::PeerClosed))
     );
-    assert_eq!(
-        result(&malformed),
-        Err(Failure::Cause {
-            code: Cause::InvalidResponse,
-            phase: Phase::Identity
-        })
-    );
+    // The peer resetting the connection at each of the opening's reads.
+    for answered in [vec![], vec![get_reply("/vd/synchronize", online(ID))]] {
+        let read = answered.len();
+        let failed = open(resetting(answered), ID, &options(), &Control::new())
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            failed.failure,
+            Failure::Cause {
+                code: Cause::ConnectionLost,
+                phase: Phase::Identity,
+            },
+            "read {read}"
+        );
+        assert!(is_reset(failed.lost_link), "read {read}: {failed:?}");
+    }
+}
+
+#[test]
+fn unreadable_firmware_rows_open_the_unit_and_are_reported_as_such() {
+    let system = |version: &str| json!({ "firm_name": "System", "firm_version": version });
+    for rows in [
+        json!({}),
+        json!([{ "firm_name": "", "firm_version": "1.0" }]),
+        json!([system("")]),
+        json!([system("9.9.9"), system("9.9.8")]),
+    ] {
+        let device = json!({ "firm_list": rows.clone() });
+        let peer = Peer::serve(move |request| match uri_of(request) {
+            "/vd/synchronize" => vec![get_reply("/vd/synchronize", online(ID))],
+            _ => vec![get_reply("/vd/device", device.clone())],
+        });
+        let connection = open(peer.port, ID, &options(), &Control::new()).unwrap();
+        assert_eq!(connection.firmware(), &SystemFirmware::Unreadable, "{rows}");
+    }
+}
+
+#[test]
+fn open_fails_on_an_unreachable_or_silent_unit() {
+    let result = |port| {
+        open(port, ID, &options(), &Control::new())
+            .map(|_| ())
+            .map_err(|failed| failed.failure)
+    };
 
     let closed = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -231,7 +298,7 @@ fn open_fails_on_a_lost_push_malformed_firmware_or_an_unreachable_unit() {
         .unwrap()
         .port();
     assert_eq!(
-        open(closed, ID, &options(), &Control::new()).map(|_| ()),
+        result(closed),
         Err(Failure::Cause {
             code: Cause::ConnectionFailed,
             phase: Phase::Connect
@@ -245,7 +312,9 @@ fn open_fails_on_a_lost_push_malformed_firmware_or_an_unreachable_unit() {
         ..options()
     };
     assert_eq!(
-        open(silent.port, ID, &short, &Control::new()).map(|_| ()),
+        open(silent.port, ID, &short, &Control::new())
+            .map(|_| ())
+            .map_err(|failed| failed.failure),
         Err(Failure::Cause {
             code: Cause::ConnectTimeout,
             phase: Phase::Identity

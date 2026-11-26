@@ -7,6 +7,7 @@
 //! could not be checked fails the whole discovery, so no result is ever
 //! selected from an incomplete list.
 
+use crate::connection::{LinkFailure, LinkLoss};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use crate::link::{Budget, Link};
 use crate::wire::{Inbound, Request};
@@ -39,8 +40,14 @@ pub struct DiscoveryOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemFirmware {
     Version(String),
-    /// A valid response that reports no System version.
+    /// A `firm_list` read in full that has no System entry.
     Absent,
+    /// A `firm_list` the version cannot be read from (R1-F-A): no `firm_list`
+    /// array, an entry without a nonempty string `firm_name`, a System entry
+    /// without a nonempty string `firm_version`, or System entries that
+    /// disagree. Discovery fails such metadata as `invalid_response`; an
+    /// operational connection reports it, and its application decides.
+    Unreadable,
 }
 
 /// One online unit.
@@ -57,11 +64,12 @@ pub struct DeviceEntry {
 }
 
 /// Lists the online units, in Device Center's list order. An empty list is a
-/// completed discovery with no unit online.
+/// completed discovery with no unit online. A failure that ended a link as
+/// `connection_lost` says how that link was lost (R1-D-A).
 pub fn discover(
     options: &DiscoveryOptions,
     control: &Control,
-) -> Result<Vec<DeviceEntry>, Failure> {
+) -> Result<Vec<DeviceEntry>, LinkFailure> {
     let budget = Budget::starting_now(options.deadline, Cause::DiscoveryTimeout);
     let listed = list(options, &budget, control)?;
     let mut entries = Vec::new();
@@ -71,7 +79,7 @@ pub fn discover(
             continue;
         };
         if !ids.insert(entry.id.clone()) {
-            return Err(Failure::cause(Cause::IdentityError, PHASE));
+            return Err(Failure::cause(Cause::IdentityError, PHASE).into());
         }
         entries.push(entry);
     }
@@ -87,11 +95,21 @@ fn list(
     options: &DiscoveryOptions,
     budget: &Budget,
     control: &Control,
-) -> Result<Vec<(u16, String)>, Failure> {
+) -> Result<Vec<(u16, String)>, LinkFailure> {
     let mut link = Link::connect(options.list_port, budget, PHASE, control)?;
+    let data = read_list(&mut link, options, budget).map_err(|failure| link.failed(failure))?;
+    Ok(parse_list(&data)?)
+}
+
+/// The device list's `data`, as Device Center answers it.
+fn read_list(
+    link: &mut Link<'_>,
+    options: &DiscoveryOptions,
+    budget: &Budget,
+) -> Result<Value, Failure> {
     let request = json!({ "vddp": { "method": "get", "uri": LIST_URI } });
     link.send(&request, options.request_deadline, budget)?;
-    let data = link.await_frame(options.request_deadline, budget, |message| {
+    link.await_frame(options.request_deadline, budget, |message| {
         let vddp = message.get("vddp")?;
         let method = vddp.get("method").and_then(Value::as_str);
         let uri = vddp.get("uri").and_then(Value::as_str).unwrap_or("");
@@ -99,8 +117,7 @@ fn list(
             return None;
         }
         Some(vddp.get("data").cloned().ok_or_else(malformed))
-    })?;
-    parse_list(&data)
+    })
 }
 
 fn parse_list(data: &Value) -> Result<Vec<(u16, String)>, Failure> {
@@ -127,30 +144,41 @@ fn parse_list(data: &Value) -> Result<Vec<(u16, String)>, Failure> {
 }
 
 /// The listed unit at `port` if it is online, or `None` when it reports any
-/// other nonempty link state. Once the unit has reported `online`, a
-/// device-lost push received before its firmware reply fails the check: the
-/// unit was unplugged while it was being checked, and Device Center keeps
-/// answering `/vd/device` from its cache.
+/// other link state, an empty one included (R1-S-A). Once the unit has
+/// reported `online`, a device-lost push received before its firmware reply
+/// fails the check: the unit was unplugged while it was being checked, and
+/// Device Center keeps answering `/vd/device` from its cache.
 fn check(
     port: u16,
     model: String,
     options: &DiscoveryOptions,
     budget: &Budget,
     control: &Control,
-) -> Result<Option<DeviceEntry>, Failure> {
+) -> Result<Option<DeviceEntry>, LinkFailure> {
     let mut link = Link::connect(port, budget, PHASE, control)?;
+    examine(&mut link, port, model, options, budget).map_err(|failure| link.failed(failure))
+}
+
+/// [`check`]'s reads over the unit's link.
+fn examine(
+    link: &mut Link<'_>,
+    port: u16,
+    model: String,
+    options: &DiscoveryOptions,
+    budget: &Budget,
+) -> Result<Option<DeviceEntry>, Failure> {
     let synchronize = get(
-        &mut link,
+        link,
         Request::GetSynchronize,
         false,
         options.request_deadline,
         budget,
         PHASE,
     )?;
+    // An empty status is a status other than `online` (R1-S-A).
     let status = synchronize
         .get("sync_status")
         .and_then(Value::as_str)
-        .filter(|status| !status.is_empty())
         .ok_or_else(malformed)?;
     if status != "online" {
         return Ok(None);
@@ -163,14 +191,17 @@ fn check(
         .to_string();
     let firmware = if options.metadata {
         let device = get(
-            &mut link,
+            link,
             Request::GetDevice,
             true,
             options.request_deadline,
             budget,
             PHASE,
         )?;
-        Some(system_firmware(&device).ok_or_else(malformed)?)
+        match system_firmware(&device) {
+            SystemFirmware::Unreadable => return Err(malformed()),
+            firmware => Some(firmware),
+        }
     } else {
         None
     };
@@ -210,8 +241,10 @@ pub(crate) fn get(
 ) -> Result<Value, Failure> {
     link.send(&request.message(), request_deadline, budget)?;
     let key = request.reply_key();
-    link.await_frame(request_deadline, budget, |message| {
+    let mut unit_lost = false;
+    let result = link.await_frame(request_deadline, budget, |message| {
         if watch_lost && lost_notification(message) {
+            unit_lost = true;
             return Some(Err(Failure::cause(Cause::ConnectionLost, phase)));
         }
         let inbound = Inbound::new(message.clone());
@@ -222,15 +255,26 @@ pub(crate) fn get(
                 .cloned()
                 .ok_or(Failure::cause(Cause::InvalidResponse, phase)),
         )
-    })
+    });
+    if unit_lost {
+        link.note_loss(LinkLoss::UnitLost);
+    }
+    result
 }
 
 /// The System version in `/vd/device`'s `firm_list`, whose entries are
-/// matched by name without case. `None` when the response is malformed: no
-/// `firm_list` array, an entry without a nonempty string `firm_name`, a System
-/// entry without a string `firm_version`, or System entries that disagree.
-/// Entry order does not change the result.
-pub(crate) fn system_firmware(device: &Value) -> Option<SystemFirmware> {
+/// matched by name without case; [`SystemFirmware::Unreadable`] when it
+/// cannot be read. Entry order does not change the result.
+pub(crate) fn system_firmware(device: &Value) -> SystemFirmware {
+    read_system_version(device).map_or(SystemFirmware::Unreadable, |version| match version {
+        None => SystemFirmware::Absent,
+        Some(version) => SystemFirmware::Version(version.to_string()),
+    })
+}
+
+/// The System version, `Some(None)` when the list has no System entry, and
+/// `None` when the list cannot be read.
+fn read_system_version(device: &Value) -> Option<Option<&str>> {
     let list = device.get("firm_list")?.as_array()?;
     let mut version: Option<&str> = None;
     for entry in list {
@@ -241,16 +285,16 @@ pub(crate) fn system_firmware(device: &Value) -> Option<SystemFirmware> {
         if !name.eq_ignore_ascii_case("system") {
             continue;
         }
-        let this = entry.get("firm_version")?.as_str()?;
+        let this = entry
+            .get("firm_version")?
+            .as_str()
+            .filter(|version| !version.is_empty())?;
         if version.is_some_and(|seen| seen != this) {
             return None;
         }
         version = Some(this);
     }
-    match version {
-        None | Some("") => Some(SystemFirmware::Absent),
-        Some(version) => Some(SystemFirmware::Version(version.to_string())),
-    }
+    Some(version)
 }
 
 #[cfg(test)]
