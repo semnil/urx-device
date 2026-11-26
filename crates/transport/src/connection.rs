@@ -30,7 +30,7 @@ use std::io::{ErrorKind, Write};
 use std::net::{Shutdown, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1608,16 +1608,74 @@ impl Timing {
     }
 }
 
+/// The frame bytes handed to the reader and not yet taken by it, at most.
+/// Past it the receiving thread stops reading, so the socket's own flow
+/// control holds the unit back, as when one thread both read and judged.
+const MAX_ARRIVAL_BYTES: usize = 4 << 20;
+
+/// Arrivals between the two threads at most, frames and empty reads alike.
+const MAX_ARRIVALS: usize = 4096;
+
+/// The frame bytes between the receiving thread and the reader.
+struct Backlog {
+    bytes: Mutex<usize>,
+    room: Condvar,
+    /// Set once the reader has stopped taking arrivals.
+    done: AtomicBool,
+}
+
+impl Backlog {
+    fn new() -> Self {
+        Backlog {
+            bytes: Mutex::new(0),
+            room: Condvar::new(),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    /// Waits until `len` more bytes fit, or the reader or the connection has
+    /// stopped; returns whether they were taken.
+    fn reserve(&self, len: usize, stop: &AtomicBool) -> bool {
+        let mut bytes = lock(&self.bytes);
+        while *bytes > 0 && *bytes + len > MAX_ARRIVAL_BYTES {
+            if stop.load(Ordering::SeqCst) || self.done.load(Ordering::SeqCst) {
+                return false;
+            }
+            bytes = self
+                .room
+                .wait_timeout(bytes, READ_POLL)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        *bytes += len;
+        true
+    }
+
+    fn release(&self, len: usize) {
+        let mut bytes = lock(&self.bytes);
+        *bytes = bytes.saturating_sub(len);
+        self.room.notify_all();
+    }
+
+    fn finish(&self) {
+        self.done.store(true, Ordering::SeqCst);
+        let _bytes = lock(&self.bytes);
+        self.room.notify_all();
+    }
+}
+
 /// Reads the socket and stamps each frame with the time it was read, and
-/// nothing else: it takes no lock, so nothing the reader waits on holds up
-/// the times (R1-T-A). A frame already buffered was read with the frames
-/// before it.
+/// nothing else: it takes no lock the reader holds, so nothing the reader
+/// waits on holds up the times (R1-T-A). A frame already buffered was read
+/// with the frames before it. It stops reading while the reader is
+/// [`MAX_ARRIVAL_BYTES`] or [`MAX_ARRIVALS`] behind.
 fn receive(
     mut sock: TcpStream,
     mut reader: FrameReader,
-    arrivals: Sender<Arrival>,
+    arrivals: SyncSender<Arrival>,
     stop: Arc<AtomicBool>,
     timing: Arc<Timing>,
+    backlog: Arc<Backlog>,
 ) {
     let mut poll = None;
     let mut last_read = Instant::now();
@@ -1635,7 +1693,12 @@ fn receive(
         let at = if buffered { last_read } else { Instant::now() };
         last_read = at;
         let arrival = match read {
-            Ok(Some(frame)) => Arrival::Frame(frame, at),
+            Ok(Some(frame)) => {
+                if !backlog.reserve(frame.len, &stop) {
+                    return;
+                }
+                Arrival::Frame(frame, at)
+            }
             Ok(None) => Arrival::Nothing(at),
             Err(error) => {
                 if !stop.load(Ordering::SeqCst) {
@@ -1659,16 +1722,19 @@ fn read_frames(
     stop: Arc<AtomicBool>,
     shared: Arc<Shared>,
 ) {
-    let (arrivals_tx, arrivals) = mpsc::channel();
+    let (arrivals_tx, arrivals) = mpsc::sync_channel(MAX_ARRIVALS);
     let timing = Arc::new(Timing::new());
+    let backlog = Arc::new(Backlog::new());
     let receiving = {
         let stop = Arc::clone(&stop);
         let timing = Arc::clone(&timing);
-        thread::spawn(move || receive(sock, reader, arrivals_tx, stop, timing))
+        let backlog = Arc::clone(&backlog);
+        thread::spawn(move || receive(sock, reader, arrivals_tx, stop, timing, backlog))
     };
-    judge_frames(&arrivals, &events, &stop, &shared, &timing);
-    // The receiving thread ends with the socket; it is waited for here so
-    // the reader's thread outlives it.
+    judge_frames(&arrivals, &events, &stop, &shared, &timing, &backlog);
+    // The receiving thread ends with the socket or once nothing takes its
+    // arrivals; it is waited for here so the reader's thread outlives it.
+    backlog.finish();
     drop(arrivals);
     let _ = receiving.join();
 }
@@ -1680,6 +1746,7 @@ fn judge_frames(
     stop: &AtomicBool,
     shared: &Shared,
     timing: &Timing,
+    backlog: &Backlog,
 ) {
     let record = |cause| {
         record_end(shared, cause);
@@ -1701,6 +1768,9 @@ fn judge_frames(
         // What the receiving thread reads for until the next arrival.
         timing.set(shared.lock().next_due(), unsettled);
         let Ok(arrival) = arrivals.recv() else { return };
+        if let Arrival::Frame(frame, _) = &arrival {
+            backlog.release(frame.len);
+        }
         let at = match &arrival {
             Arrival::Frame(_, at) | Arrival::Nothing(at) => *at,
             Arrival::Failed(_) => Instant::now(),

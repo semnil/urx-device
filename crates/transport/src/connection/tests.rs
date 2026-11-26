@@ -1516,6 +1516,56 @@ fn a_reply_counts_against_the_run_by_when_it_was_received() {
 }
 
 #[test]
+fn a_reader_held_up_stops_the_unit_sending_rather_than_buffering_all_it_sends() {
+    // The unit sends 64 MiB of replies nothing waits for while the reader is held up for a
+    // second. Received but not yet judged, at most MAX_ARRIVAL_BYTES are held between the two
+    // threads; past that the receiving thread stops reading and the socket's flow control
+    // holds the unit back, so it has written far less than everything by then.
+    let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    {
+        let written = Arc::clone(&written);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut requests = BufReader::new(stream);
+            let mut request = String::new();
+            for reply in [
+                get_reply("/vd/synchronize", online(ID)),
+                get_reply("/vd/device", firmware()),
+            ] {
+                request.clear();
+                requests.read_line(&mut request).unwrap();
+                writer.write_all(&reply).unwrap();
+            }
+            request.clear();
+            requests.read_line(&mut request).unwrap();
+            let big = get_reply(
+                "/vd/parameters/9:0:0",
+                json!({ "current_value": "x".repeat(64 << 10), "response_code": 200 }),
+            );
+            for _ in 0..1024 {
+                if writer.write_all(&big).is_err() {
+                    return;
+                }
+                written.fetch_add(big.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+    let options = tolerating_with(3, Duration::from_secs(5), 64);
+    let connection = open_holdable(port, &options);
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let _read = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    hold_reader(&connection, started, Duration::from_millis(1000));
+    let sent = written.load(std::sync::atomic::Ordering::SeqCst);
+    // About 5 MiB with the cap, about 34 MiB without it, on a loopback socket.
+    assert!(sent < 16 << 20, "the unit wrote {sent} bytes");
+    let _ = connection.close(Duration::from_millis(500));
+}
+
+#[test]
 fn a_unit_lost_push_while_reading_for_a_late_reply_ends_the_connection() {
     // The read goes unanswered past its deadline; while the late reply is read for, the unit
     // is reported lost.
