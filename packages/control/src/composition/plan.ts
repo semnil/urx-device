@@ -4,6 +4,9 @@
 // and planned with each setting's own validation and rounding (F18-V); a
 // missing or invalid included value refuses the whole plan.
 
+import { BUS_TOKENS } from "../catalog/buses.js";
+import { SOURCE_TOKENS } from "../catalog/inputs.js";
+import { OUTPUT_TOKENS } from "../catalog/output-routing.js";
 import { settingDefinitions, type SettingDefinitionBase, type SettingId } from "../catalog/settings.js";
 import type { Model } from "../catalog/models.js";
 import { urxfValue, type UrxfChunk, type UrxfFile } from "../catalog/urxf.js";
@@ -237,21 +240,29 @@ function planFxParameters(
 const DELAY_FIRST = ["sync", "bpm", "note"];
 
 /** The entity a step's target names (K36 target order): a jack, a channel, a send route, a bus, an output, a track. */
-function entityOf(step: PlannedStep): string {
+/** A step's target kind and its position in the kind's canonical order (K36). */
+function entityOf(step: PlannedStep): { kind: string; position: number } {
   const target = step.target as { input?: number; channel?: number; source?: string; destination?: string; bus?: string; output?: string; track?: number };
-  if (target.destination !== undefined) return `send ${target.source} ${target.destination}`;
-  if (target.input !== undefined) return `input ${target.input}`;
-  if (target.channel !== undefined) return `channel ${target.channel}`;
-  if (target.source !== undefined) return `source ${target.source}`;
-  if (target.bus !== undefined) return `bus ${target.bus}`;
-  if (target.output !== undefined) return `output ${target.output}`;
-  if (target.track !== undefined) return `track ${target.track}`;
-  return "device";
+  if (target.destination !== undefined) {
+    // Sources by C12 number, then FX 1/2; destinations MIX 1/2, FX 1/2 within each (targetsOf).
+    const source = target.source?.startsWith("channel-") === true ? Number(target.source.slice(8)) : 1000 + ["fx-1", "fx-2"].indexOf(target.source ?? "");
+    return { kind: "send", position: source * 10 + ["mix-1", "mix-2", "fx-1", "fx-2"].indexOf(target.destination) };
+  }
+  if (target.input !== undefined) return { kind: "input", position: target.input };
+  if (target.channel !== undefined) return { kind: "channel", position: target.channel };
+  if (target.source !== undefined) return { kind: "source", position: (SOURCE_TOKENS as readonly string[]).indexOf(target.source) };
+  if (target.bus !== undefined) return { kind: "bus", position: (BUS_TOKENS as readonly string[]).indexOf(target.bus) };
+  if (target.output !== undefined) return { kind: "output", position: (OUTPUT_TOKENS as readonly string[]).indexOf(target.output) };
+  if (target.track !== undefined) return { kind: "track", position: target.track };
+  return { kind: "device", position: 0 };
 }
 
 /**
  * K36: a phase iterates its targets, each target's settings in the phase's
- * order, targets in their canonical order (first appearance). Phase 6 is the
+ * order, targets in their canonical order: target kinds as they first appear
+ * in the phase, targets of a kind in the catalog's canonical order (channels
+ * by C12 number, buses STEREO, MIX 1/2, FX 1/2, STREAMING, MONITOR 1/2,
+ * outputs in their published order, jacks and tracks ascending). Phase 6 is the
  * exception: every Insert-FX type, then the engines' values, then every On.
  * Within a bus in phase 5, the sided GEQ settings go left, then right, after
  * the bus's other settings (F18-G). Within a jack in phase 3, the file's
@@ -266,8 +277,12 @@ function orderByTarget(steps: PlannedStep[]): void {
     while (end < steps.length && (steps[end] as PlannedStep).phase === phase) end += 1;
     if (phase !== 6) {
       const block = steps.slice(start, end);
-      const order = new Map<string, number>();
-      for (const step of block) if (!order.has(entityOf(step))) order.set(entityOf(step), order.size);
+      const kinds = new Map<string, number>();
+      for (const step of block) if (!kinds.has(entityOf(step).kind)) kinds.set(entityOf(step).kind, kinds.size);
+      const entity = (step: PlannedStep) => {
+        const { kind, position } = entityOf(step);
+        return (kinds.get(kind) as number) * 100_000 + position;
+      };
       const rank = (step: PlannedStep) => {
         if (phase === 5) {
           const side = (step.target as { side?: string }).side;
@@ -278,7 +293,7 @@ function orderByTarget(steps: PlannedStep[]): void {
         }
         return phase === 3 ? 4 : 0;
       };
-      const keyed = block.map((step, index) => ({ step, index, entity: order.get(entityOf(step)) as number, rank: rank(step) }));
+      const keyed = block.map((step, index) => ({ step, index, entity: entity(step), rank: rank(step) }));
       keyed.sort((a, b) => a.entity - b.entity || a.rank - b.rank || a.index - b.index);
       steps.splice(start, block.length, ...keyed.map((each) => each.step));
     }

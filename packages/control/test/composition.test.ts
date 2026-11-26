@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FX_RETURN_RULES } from "../src/catalog/fx-return.js";
-import { HI_Z_JACKS, INPUT_JACKS } from "../src/catalog/inputs.js";
+import { HI_Z_JACKS, INPUT_JACKS, SOURCE_TOKENS } from "../src/catalog/inputs.js";
 import type { Model } from "../src/catalog/models.js";
 import { settingDefinitions, type SettingDefinitionBase, type SettingId } from "../src/catalog/settings.js";
 import type { UrxfChunk, UrxfFile } from "../src/catalog/urxf.js";
@@ -276,6 +276,43 @@ describe("CURRENT composition (K36, F18)", () => {
       const seen: string[] = [];
       for (const route of routes) if (seen.at(-1) !== route) seen.push(route);
       expect(new Set(seen).size, model).toBe(seen.length);
+    }
+  });
+
+  it("keep every phase's targets in the canonical order, whichever setting a target first appears in (K36)", () => {
+    const buses = ["stereo", "mix-1", "mix-2", "fx-1", "fx-2", "stream", "monitor-1", "monitor-2"];
+    const outputs = ["main", "line", "usb-main-a", "usb-main-b", "usb-main-c", "usb-sub", "phones-1", "phones-2"];
+    const sendSource = (source: string) => (source.startsWith("channel-") ? Number(source.slice(8)) : 100 + Number(source.slice(3)));
+    const canonical = (target: Record<string, unknown>): [string, number] => {
+      if (typeof target.destination === "string") return ["send", sendSource(`${target.source}`) * 10 + ["mix-1", "mix-2", "fx-1", "fx-2"].indexOf(target.destination)];
+      if (typeof target.input === "number") return ["input", target.input];
+      if (typeof target.channel === "number") return ["channel", target.channel];
+      if (typeof target.bus === "string") return ["bus", buses.indexOf(target.bus)];
+      if (typeof target.output === "string") return ["output", outputs.indexOf(target.output)];
+      if (typeof target.track === "number") return ["track", target.track];
+      if (typeof target.source === "string") return ["source", SOURCE_TOKENS.indexOf(target.source as (typeof SOURCE_TOKENS)[number])];
+      return ["device", 0];
+    };
+    for (const model of models) {
+      for (const overrides of [{ "497:0": 2, "590:0": 2 }, {}] as Record<string, number>[]) {
+        const plan = planCurrent(synthesize(model, overrides), model);
+        for (const phase of new Set(plan.steps.map((s) => s.phase))) {
+          if (phase === 6) continue;
+          const runs: [string, number][] = [];
+          for (const step of plan.steps.filter((s) => s.phase === phase)) {
+            const entity = canonical(step.target as Record<string, unknown>);
+            const last = runs.at(-1);
+            if (last?.[0] !== entity[0] || last[1] !== entity[1]) runs.push(entity);
+          }
+          const label = `${model} phase ${phase}`;
+          // Each target's settings stay together, and the targets of one kind ascend.
+          expect(new Set(runs.map(([kind, position]) => `${kind} ${position}`)).size, label).toBe(runs.length);
+          for (const kind of new Set(runs.map(([each]) => each))) {
+            const positions = runs.filter(([each]) => each === kind).map(([, position]) => position);
+            expect(positions, `${label} ${kind}`).toEqual([...positions].sort((a, b) => a - b));
+          }
+        }
+      }
     }
   });
 
