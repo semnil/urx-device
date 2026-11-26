@@ -13,6 +13,7 @@ import { OUTPUT_EQ_RULES, type GEQ_BANDS } from "./output-eq.js";
 import { OUTPUT_PEQ_RULES } from "./output-peq.js";
 import { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES, type OUTPUT_TOKENS } from "./output-routing.js";
 import { OSCILLATOR_RULES } from "./oscillator.js";
+import { DEVICE_RULES } from "./device.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -157,6 +158,19 @@ export const settingDefinitions = frozen({
   "oscillator.burst-width": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.burst-width"] },
   "oscillator.burst-interval": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.burst-interval"] },
   "oscillator.assign": { readable: true, writable: true, rule: OSCILLATOR_RULES["oscillator.assign"] },
+  "device.brightness": { readable: true, writable: true, rule: DEVICE_RULES["device.brightness"] },
+  "device.auto-power-off": { readable: true, writable: true, rule: DEVICE_RULES["device.auto-power-off"] },
+  "device.auto-power-off-time": { readable: true, writable: true, rule: DEVICE_RULES["device.auto-power-off-time"] },
+  "device.language": { readable: true, writable: true, rule: DEVICE_RULES["device.language"] },
+  "device.usb-suppression": { readable: true, writable: true, rule: DEVICE_RULES["device.usb-suppression"] },
+  "device.date-format": { readable: true, writable: true, rule: DEVICE_RULES["device.date-format"] },
+  "device.time-format": { readable: true, writable: true, rule: DEVICE_RULES["device.time-format"] },
+  "device.time-zone-index": { readable: true, writable: true, rule: DEVICE_RULES["device.time-zone-index"] },
+  "device.hdmi-hdcp": { readable: true, writable: true, rule: DEVICE_RULES["device.hdmi-hdcp"] },
+  "device.hdmi-input-channels": { readable: true, writable: true, rule: DEVICE_RULES["device.hdmi-input-channels"] },
+  "device.sample-rate": { readable: true, writable: true, rule: DEVICE_RULES["device.sample-rate"] },
+  "device.follow-usb": { readable: true, writable: true, rule: DEVICE_RULES["device.follow-usb"] },
+  "device.console-lock": { readable: true, writable: false, rule: DEVICE_RULES["device.console-lock"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -230,6 +244,13 @@ export interface OutputTarget {
 
 /** A device-wide setting's target: no keys (F08-C). */
 export type DeviceTarget = Readonly<Record<PropertyKey, never>>;
+
+/** Device utility enums (F11-U, F11-H). */
+export type DeviceLanguage = "en" | "ja" | "zh-cn";
+export type UsbSuppression = "none" | "2-channels";
+export type DateFormat = "mm/dd/yyyy" | "dd/mm/yyyy" | "yyyy/mm/dd";
+export type TimeFormat = "24h" | "12h";
+export type HdmiInputChannels = "2-channels" | "multi-channels";
 
 /** An oscillator mode (F09-O). */
 export type OscillatorMode = "sine" | "pink-noise" | "burst-noise";
@@ -459,6 +480,19 @@ export interface SettingTypes {
   "oscillator.burst-width": { target: DeviceTarget; value: number };
   "oscillator.burst-interval": { target: DeviceTarget; value: number };
   "oscillator.assign": { target: OscillatorAssignTarget; value: boolean };
+  "device.brightness": { target: DeviceTarget; value: number };
+  "device.auto-power-off": { target: DeviceTarget; value: boolean };
+  "device.auto-power-off-time": { target: DeviceTarget; value: number };
+  "device.language": { target: DeviceTarget; value: DeviceLanguage };
+  "device.usb-suppression": { target: DeviceTarget; value: UsbSuppression };
+  "device.date-format": { target: DeviceTarget; value: DateFormat };
+  "device.time-format": { target: DeviceTarget; value: TimeFormat };
+  "device.time-zone-index": { target: DeviceTarget; value: number };
+  "device.hdmi-hdcp": { target: DeviceTarget; value: boolean };
+  "device.hdmi-input-channels": { target: DeviceTarget; value: HdmiInputChannels };
+  "device.sample-rate": { target: DeviceTarget; value: number };
+  "device.follow-usb": { target: DeviceTarget; value: boolean };
+  "device.console-lock": { target: DeviceTarget; value: boolean };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.

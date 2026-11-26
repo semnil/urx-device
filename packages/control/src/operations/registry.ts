@@ -121,6 +121,21 @@ import {
   oscillatorOn,
 } from "./oscillator.js";
 import {
+  deviceAutoPowerOff,
+  deviceAutoPowerOffTime,
+  deviceBrightness,
+  deviceConsoleLock,
+  deviceDateFormat,
+  deviceFollowUsb,
+  deviceHdmiHdcp,
+  deviceHdmiInputChannels,
+  deviceLanguage,
+  deviceSampleRate,
+  deviceTimeFormat,
+  deviceTimeZoneIndex,
+  deviceUsbSuppression,
+} from "./device.js";
+import {
   compOn,
   eqOn,
   gateOn,
@@ -139,7 +154,7 @@ import {
   inputPhantom,
   sourceGain,
 } from "./inputs.js";
-import type { Reading, WritePlan, WriteResult } from "./results.js";
+import type { DryRunPlan, Reading, UnverifiedCondition, VerifiedPlan, WritePlan, WriteResult } from "./results.js";
 
 type Target<K extends SettingId> = SettingTypes[K]["target"];
 type Value<K extends SettingId> = SettingTypes[K]["value"];
@@ -167,9 +182,14 @@ export interface WriteHandler<K extends SettingId> extends ReadHandler<K> {
   validate?(model: string, target: Target<K>, value: Input<K>): void;
   /**
    * The plan with the operation's required prerequisite reads, sending no
-   * write (O13); absent where the plan needs no device state.
+   * write (O13); absent where the plan needs no device state. A condition in
+   * `affected` is one an earlier unsent write can change: it is still read
+   * where its address is known, and reported unverified instead of refused.
    */
-  dryRun?(context: OperationContext, target: Target<K>, value: Input<K>): Promise<WritePlan<Input<K>>>;
+  dryRun?: {
+    (context: OperationContext, target: Target<K>, value: Input<K>): Promise<VerifiedPlan<Input<K>>>;
+    (context: OperationContext, target: Target<K>, value: Input<K>, affected: ReadonlySet<UnverifiedCondition>): Promise<DryRunPlan<Input<K>>>;
+  };
   write(context: OperationContext, target: Target<K>, value: Input<K>): Promise<WriteResult<Input<K>>>;
 }
 
@@ -299,6 +319,19 @@ export const settingHandlers: SettingHandlers = {
   "oscillator.burst-width": oscillatorBurstWidth,
   "oscillator.burst-interval": oscillatorBurstInterval,
   "oscillator.assign": oscillatorAssign,
+  "device.brightness": deviceBrightness,
+  "device.auto-power-off": deviceAutoPowerOff,
+  "device.auto-power-off-time": deviceAutoPowerOffTime,
+  "device.language": deviceLanguage,
+  "device.usb-suppression": deviceUsbSuppression,
+  "device.date-format": deviceDateFormat,
+  "device.time-format": deviceTimeFormat,
+  "device.time-zone-index": deviceTimeZoneIndex,
+  "device.hdmi-hdcp": deviceHdmiHdcp,
+  "device.hdmi-input-channels": deviceHdmiInputChannels,
+  "device.sample-rate": deviceSampleRate,
+  "device.follow-usb": deviceFollowUsb,
+  "device.console-lock": deviceConsoleLock,
 };
 
 function unknownId(): Promise<never> {
@@ -406,15 +439,35 @@ export function validateSetting<A extends WriteArgs>(model: string, ...[id, targ
  * prerequisite reads (O13): no setting write is sent. A setting whose plan
  * needs no device state reads nothing and plans as `previewSetting` does.
  */
-export function dryRunSetting<A extends WriteArgs>(
-  context: OperationContext,
-  ...[id, target, value]: A
-): Promise<WritePlan<Input<A[0]>>> {
+export function dryRunSetting<A extends WriteArgs>(context: OperationContext, ...[id, target, value]: A): Promise<VerifiedPlan<Input<A[0]>>> {
   return settled(() => {
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
-    return handler.dryRun === undefined
-      ? Promise.resolve(handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>))
-      : handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>);
+    if (handler.dryRun === undefined) {
+      const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
+      return Promise.resolve({ requested: plan.requested, planned: plan.planned, unverified: [] });
+    }
+    return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>);
+  });
+}
+
+/**
+ * `dryRunSetting` for a write planned after earlier unsent writes (O13): the
+ * caller names the conditions those writes can change (`affected`). Each is
+ * reported unverified rather than refused; every other prerequisite, and
+ * every read failure or invalid response, is handled as in `dryRunSetting`.
+ */
+export function dryRunSettingAfter<A extends WriteArgs>(
+  context: OperationContext,
+  affected: ReadonlySet<UnverifiedCondition>,
+  ...[id, target, value]: A
+): Promise<DryRunPlan<Input<A[0]>>> {
+  return settled(() => {
+    const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    if (handler.dryRun === undefined) {
+      const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
+      return Promise.resolve({ requested: plan.requested, planned: plan.planned, unverified: [] });
+    }
+    return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>, affected);
   });
 }
 

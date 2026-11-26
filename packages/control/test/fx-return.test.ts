@@ -4,7 +4,7 @@ import { FX2_FREQUENCY_DECIHZ, INITIAL_DELAY_DECIMS, REVX_FREQUENCY_HZ, REVX_TIM
 import type { StopsRule, ValueRule } from "../src/catalog/rules.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { dryRunSetting, previewSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, dryRunSettingAfter, previewSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -230,6 +230,55 @@ describe("FX returns (F06-F, F06-V)", () => {
     const plain = new FakeTransport();
     expect((await dryAny(new OperationContext(plain, "URX44"), "channel.fader", { channel: 1 }, -3)).planned).toBe(-3);
     expect(plain.calls).toEqual([]);
+  });
+
+  it("leave the FX type and Room Size conversion unverified after an unsent type or Room Size write (O13)", async () => {
+    const time = { bus: "fx-1", effect: "rev-x-hall", parameter: "reverb-time" } as const;
+    const typeChanging = new Set(["fx_type_matches", "revx_room_size"] as const);
+    // A Delay is selected now and a REV-X Hall selection is pending: the selector is read, the array is not
+    // interpreted in a hypothetical layout, and the time stays unplanned.
+    const delayNow = new FakeTransport().script("getNumeric", read("1024"));
+    expect(await dryRunSettingAfter(new OperationContext(delayNow, "URX44"), typeChanging, "bus.fx.parameter", time, 0.93)).toEqual({
+      requested: 0.93,
+      planned: null,
+      unverified: ["fx_type_matches", "revx_room_size"],
+    });
+    expect(delayNow.calls.length).toBe(1);
+    // REV-X Hall already selected, a reset pending: Room Size is still read, the conversion unverified.
+    const hallNow = new FakeTransport().script("getNumeric", read("0"), read("0"));
+    expect(await dryRunSettingAfter(new OperationContext(hallNow, "URX44"), typeChanging, "bus.fx.parameter", time, 0.93)).toEqual({
+      requested: 0.93,
+      planned: null,
+      unverified: ["fx_type_matches", "revx_room_size"],
+    });
+    expect(hallNow.calls.length).toBe(2);
+    // Another REV-X type is selected now: its layout defines the same Room Size slot, so it is read and checked.
+    const roomNow = new FakeTransport().script("getNumeric", read("1"), read("31"));
+    expect(await dryRunSettingAfter(new OperationContext(roomNow, "URX44"), typeChanging, "bus.fx.parameter", time, 0.93)).toEqual({
+      requested: 0.93,
+      planned: null,
+      unverified: ["fx_type_matches", "revx_room_size"],
+    });
+    expect(roomNow.calls.length).toBe(2);
+    const badRoom = new FakeTransport().script("getNumeric", read("2"), read("32"));
+    expect((await failureOf(dryRunSettingAfter(new OperationContext(badRoom, "URX44"), typeChanging, "bus.fx.parameter", time, 0.93)))?.code).toBe(
+      "invalid_response",
+    );
+    // A parameter without a context keeps its static plan; an invalid selector is still an error.
+    const delayParam = { bus: "fx-1", effect: "mono-delay", parameter: "bpm" } as const;
+    const revxNow = new FakeTransport().script("getNumeric", read("0"));
+    expect(await dryRunSettingAfter(new OperationContext(revxNow, "URX44"), new Set(["fx_type_matches"]), "bus.fx.parameter", delayParam, 120)).toEqual({
+      requested: 120,
+      planned: 120,
+      unverified: ["fx_type_matches"],
+    });
+    const invalid = new FakeTransport().script("getNumeric", read("768"));
+    expect((await failureOf(dryRunSettingAfter(new OperationContext(invalid, "URX44"), typeChanging, "bus.fx.parameter", time, 0.93)))?.code).toBe(
+      "invalid_response",
+    );
+    // Unaffected, a mismatched type still refuses.
+    const refused = new FakeTransport().script("getNumeric", read("1024"));
+    expect((await failureOf(dryAny(new OperationContext(refused, "URX44"), "bus.fx.parameter", time, 0.93)))?.code).toBe("precondition_failed");
   });
 
   it("validate every FX parameter write without a device: the static checks, and no plan", () => {

@@ -27,7 +27,7 @@ import type {
 import { planSwitch, writableName } from "./channels.js";
 import type { OperationContext } from "./context.js";
 import { OperationFailureError } from "./failure.js";
-import type { Reading, WritePlan, WriteResult } from "./results.js";
+import type { DryRunPlan, Reading, UnverifiedCondition, VerifiedPlan, WritePlan, WriteResult } from "./results.js";
 import {
   address,
   modelOf,
@@ -153,6 +153,16 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
 /** The codec of `rule` on `model` (only a port choice depends on the model). */
 export function codecOf(rule: ValueRule, model = ""): Codec {
   switch (rule.kind) {
+    case "numeric-set":
+      return {
+        text: false,
+        decode: (raw) => {
+          const value = /^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : undefined;
+          return value !== undefined && rule.values.includes(value) ? value : undefined;
+        },
+        // Exact membership: no rounding to the nearest member.
+        plan: (value) => (typeof value === "number" && rule.values.includes(value) ? { planned: value, raw: `${value}` } : undefined),
+      };
     case "selector":
       return {
         text: false,
@@ -209,6 +219,23 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
       };
     }
   }
+}
+
+/**
+ * A dry run in both call forms (O13): with no `affected` nothing is
+ * unverified and the planned value is set; with it, the conditions earlier
+ * unsent writes can change. The set is copied at the call, so a caller's
+ * later change cannot alter a dry run already started.
+ */
+export interface DryRun<V> {
+  (context: OperationContext, target: unknown, requested: V): Promise<VerifiedPlan<V>>;
+  (context: OperationContext, target: unknown, requested: V, affected: ReadonlySet<UnverifiedCondition>): Promise<DryRunPlan<V>>;
+}
+
+function dryRunOf<V>(run: (context: OperationContext, target: unknown, requested: V, affected: ReadonlySet<UnverifiedCondition>) => Promise<DryRunPlan<V>>): DryRun<V> {
+  // With no affected condition a plan is never left null, so the first form's type holds.
+  return ((context: OperationContext, target: unknown, requested: V, affected?: ReadonlySet<UnverifiedCondition>) =>
+    run(context, target, requested, new Set(affected ?? []))) as DryRun<V>;
 }
 
 /** A handler for the address and codec `resolve` gives a target, for a read or a write. */
@@ -442,8 +469,18 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
     const planned = codecOf(field.value).plan(value);
     return planned === undefined || planned === "unsupported" ? refuse("invalid_input") : planned;
   };
-  /** The prerequisite reads; the codec for the leaf. */
-  const prepare = async (context: OperationContext, resolved: ReturnType<typeof resolve>): Promise<Codec> => {
+  /**
+   * The prerequisite reads; the codec for the leaf. With `affected` (a dry
+   * run after unsent writes, O13), an affected selector match or Room Size
+   * conversion is reported in `unverified` instead of refused, and the leaf's
+   * codec is null where its conversion is unverified.
+   */
+  const prepare = async (
+    context: OperationContext,
+    resolved: ReturnType<typeof resolve>,
+    affected: ReadonlySet<UnverifiedCondition> = new Set(),
+    unverified: UnverifiedCondition[] = [],
+  ): Promise<Codec | null> => {
     const { raw } = await readRawValue(context, address(resolved.at.selector, 0));
     if (!/^(0|[1-9][0-9]*)$/.test(raw)) {
       return failed("invalid_response");
@@ -455,17 +492,43 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
     if (!offered.includes(raw)) {
       return failed("invalid_response");
     }
-    if (raw !== resolved.selector) {
+    const typeAffected = affected.has("fx_type_matches");
+    if (typeAffected) {
+      unverified.push("fx_type_matches");
+    }
+    const matches = raw === resolved.selector;
+    if (!matches && !typeAffected) {
       return failed("precondition_failed");
     }
     const value = resolved.field.value;
     if (value.kind !== "context-stops") {
       return codecOf(value);
     }
+    // The array is read only in the layout the live selector establishes: Room Size is read where the
+    // selected type defines the same context slot (every REV-X type), and not interpreted otherwise.
+    if (!matches) {
+      const observed = Object.entries(rule.effects).find(([, each]) => each?.selector[resolved.bus] === raw)?.[0];
+      const observedTables = observed === undefined ? undefined : value.contexts[observed];
+      if (observedTables !== undefined) {
+        const room = await readRawValue(context, address(resolved.at.array, value.contextSlot));
+        if (decodeInteger(room.raw, 0, observedTables.length - 1) === undefined) {
+          return failed("invalid_response");
+        }
+      }
+      unverified.push("revx_room_size");
+      return null;
+    }
     const room = await readRawValue(context, address(resolved.at.array, value.contextSlot));
     const tables = value.contexts[resolved.effect] ?? [];
     const index = decodeInteger(room.raw, 0, tables.length - 1);
-    return index === undefined ? failed("invalid_response") : contextCodec(value, tables[index] as readonly number[]);
+    if (index === undefined) {
+      return failed("invalid_response");
+    }
+    if (affected.has("revx_room_size")) {
+      unverified.push("revx_room_size");
+      return null;
+    }
+    return contextCodec(value, tables[index] as readonly number[]);
   };
   const leaf = (resolved: ReturnType<typeof resolve>) => address(resolved.at.array, resolved.field.slot);
   const plannedWith = (codec: Codec, requested: V) => {
@@ -475,7 +538,7 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
   return {
     async read(context: OperationContext, target: unknown): Promise<Reading<V>> {
       const resolved = resolve(context.model, target);
-      const codec = await prepare(context, resolved);
+      const codec = (await prepare(context, resolved)) as Codec;
       return readDecoded(context, leaf(resolved), (raw) => codec.decode(raw) as V | undefined);
     },
     /**
@@ -493,16 +556,17 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
       const resolved = resolve(model, target);
       staticCheck(resolved.field, resolved.effect, requested);
     },
-    async dryRun(context: OperationContext, target: unknown, requested: V): Promise<WritePlan<V>> {
+    dryRun: dryRunOf<V>(async (context, target, requested, affected) => {
       const resolved = resolve(context.model, target);
       staticCheck(resolved.field, resolved.effect, requested);
-      const result = plannedWith(await prepare(context, resolved), requested);
-      return { requested, planned: result.planned as V };
-    },
+      const unverified: UnverifiedCondition[] = [];
+      const codec = await prepare(context, resolved, affected, unverified);
+      return { requested, planned: codec === null ? null : (plannedWith(codec, requested).planned as V), unverified };
+    }),
     async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
       const resolved = resolve(context.model, target);
       staticCheck(resolved.field, resolved.effect, requested);
-      const result = plannedWith(await prepare(context, resolved), requested);
+      const result = plannedWith((await prepare(context, resolved)) as Codec, requested);
       return writeRaw(context, leaf(resolved), result.raw as I64Text, { requested, planned: result.planned as V });
     },
   };
@@ -559,11 +623,22 @@ export function busSideRuleSetting<V>(rule: BusSideSettingRule) {
  * (F07-G): the required type proceeds, another known type is
  * `precondition_failed`, any other value `invalid_response`.
  */
-async function requireEqType(context: OperationContext, rule: GeqGainRule, at: { paramId: number; y: number }): Promise<void> {
+async function requireEqType(
+  context: OperationContext,
+  rule: GeqGainRule,
+  at: { paramId: number; y: number },
+  affected: ReadonlySet<UnverifiedCondition> = new Set(),
+  unverified: UnverifiedCondition[] = [],
+): Promise<void> {
   const type = await readRawValue(context, address(at.paramId, at.y));
   const token = rule.eqType.choices.find((choice) => choice.raw === type.raw)?.token;
   if (token === undefined) {
     failed("invalid_response");
+  }
+  // An earlier unsent write can change the type (O13): unverified, whatever it reads now.
+  if (affected.has("geq_type_selected")) {
+    unverified.push("geq_type_selected");
+    return;
   }
   if (token !== rule.eqType.required) {
     failed("precondition_failed");
@@ -608,12 +683,13 @@ export function eqTypeGated<V, I = V>(base: ReturnType<typeof handler<V, I>>, ga
     validate(model: string, target: unknown, requested: I): void {
       base.plan(model, target, requested);
     },
-    async dryRun(context: OperationContext, target: unknown, requested: I): Promise<WritePlan<I>> {
+    dryRun: dryRunOf<I>(async (context, target, requested, affected) => {
       const own = fixed(target);
       const plan = base.plan(context.model, own, requested);
-      await requireEqType(context, gain, eqTypeOf(own));
-      return plan;
-    },
+      const unverified: UnverifiedCondition[] = [];
+      await requireEqType(context, gain, eqTypeOf(own), affected, unverified);
+      return { requested: plan.requested, planned: plan.planned, unverified };
+    }),
     async write(context: OperationContext, target: unknown, requested: I): Promise<WriteResult<I>> {
       const own = fixed(target);
       base.plan(context.model, own, requested);
@@ -648,12 +724,24 @@ export function geqGainSetting(rule: GeqGainRule) {
   const union = { min: Math.min(...rule.limits.map((limit) => limit.min)), max: Math.max(...rule.limits.map((limit) => limit.max)) };
   const staticCheck = (value: unknown) =>
     typeof value === "number" && Number.isFinite(value) && value >= union.min && value <= union.max ? value : refuse("invalid_input");
-  /** The EQ Type and Limit reads; the side's current range. */
-  const prepare = async (context: OperationContext, resolved: ReturnType<typeof resolve>) => {
-    await requireEqType(context, rule, resolved.at.eqType);
+  /** The EQ Type and Limit reads; the side's current range, or null where an unsent write can change it (O13). */
+  const prepare = async (
+    context: OperationContext,
+    resolved: ReturnType<typeof resolve>,
+    affected: ReadonlySet<UnverifiedCondition> = new Set(),
+    unverified: UnverifiedCondition[] = [],
+  ) => {
+    await requireEqType(context, rule, resolved.at.eqType, affected, unverified);
     const limit = await readRawValue(context, address(resolved.at.limit, resolved.at.y[resolved.side]));
     const index = decodeInteger(limit.raw, 0, rule.limits.length - 1);
-    return index === undefined ? failed("invalid_response") : (rule.limits[index] as { min: number; max: number });
+    if (index === undefined) {
+      return failed("invalid_response");
+    }
+    if (affected.has("geq_limit_allows_gain")) {
+      unverified.push("geq_limit_allows_gain");
+      return null;
+    }
+    return rule.limits[index] as { min: number; max: number };
   };
   const planWithin = (range: { min: number; max: number }, value: number) => {
     const planned = planOnGrid(value, range.min, range.max, 1 / rule.step);
@@ -678,17 +766,18 @@ export function geqGainSetting(rule: GeqGainRule) {
       resolve(model, target, true);
       staticCheck(requested);
     },
-    async dryRun(context: OperationContext, target: unknown, requested: number): Promise<WritePlan<number>> {
+    dryRun: dryRunOf<number>(async (context, target, requested, affected) => {
       const resolved = resolve(context.model, target, true);
       const value = staticCheck(requested);
-      const { planned } = planWithin(await prepare(context, resolved), value);
-      return { requested, planned };
-    },
+      const unverified: UnverifiedCondition[] = [];
+      const range = await prepare(context, resolved, affected, unverified);
+      return { requested, planned: range === null ? null : planWithin(range, value).planned, unverified };
+    }),
     async write(context: OperationContext, target: unknown, requested: number): Promise<WriteResult<number>> {
       const resolved = resolve(context.model, target, true);
       // Static checks before any read.
       const value = staticCheck(requested);
-      const { planned, raw } = planWithin(await prepare(context, resolved), value);
+      const { planned, raw } = planWithin((await prepare(context, resolved)) as { min: number; max: number }, value);
       return writeRaw(context, resolved.leaf, raw, { requested, planned });
     },
   };
@@ -752,13 +841,77 @@ export function outputRuleSetting<V>(rule: OutputSettingRule) {
   });
 }
 
-/** A device-wide setting whose handler is built from `rule`: the target has no keys. */
+/**
+ * A device-wide setting whose handler is built from `rule`: the target has no
+ * keys. A model without it is unsupported. With write prerequisites, a write
+ * or dry-run reads each applicable one in order first, stopping at the first
+ * that does not allow it; the connection-free preview refuses such a setting.
+ */
 export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
   const codec = codecOf(rule.value);
-  return handler<V>((model, target) => {
-    modelOf(model);
+  const resolve = (model: string, target: unknown) => {
+    const known = modelOf(model);
     targetOf<object>(target, []);
-    return { at: address(rule.address.paramId, rule.address.y), codec };
-  });
+    return rule.models === undefined || rule.models.includes(known)
+      ? { at: address(rule.address.paramId, rule.address.y), codec }
+      : refuse("unsupported_operation");
+  };
+  const base = handler<V>(resolve);
+  const checks = rule.writePrerequisites;
+  if (checks === undefined) {
+    return base;
+  }
+  /** The applicable checks of `model`, in order: none means the plan needs no device state. */
+  const applicable = (model: string) => checks.filter((check) => check.models.includes(model));
+  const prepare = async (
+    context: OperationContext,
+    affected: ReadonlySet<UnverifiedCondition> = new Set(),
+    unverified: UnverifiedCondition[] = [],
+  ) => {
+    for (const check of applicable(context.model)) {
+      const { raw } = await readRawValue(context, address(check.paramId, check.y));
+      if (!check.allowed.includes(raw) && !check.refused.includes(raw)) {
+        failed("invalid_response");
+      }
+      // An earlier unsent write can change this one (O13): unverified, whatever it reads now.
+      if (check.condition !== undefined && affected.has(check.condition)) {
+        unverified.push(check.condition);
+        continue;
+      }
+      if (check.refused.includes(raw)) {
+        failed("precondition_failed");
+      }
+    }
+  };
+  const planned = (model: string, target: unknown, requested: V) => {
+    const { at } = resolve(model, target);
+    const result = codec.plan(requested);
+    return result === undefined || result === "unsupported"
+      ? refuse(result === "unsupported" ? "unsupported_operation" : "invalid_input")
+      : { at, raw: result.raw as I64Text, planned: result.planned as V };
+  };
+  return {
+    read: base.read,
+    /** A connection-free plan where `model` has no applicable prerequisite; refused where the plan needs device state. */
+    plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      const { planned: p } = planned(model, target, requested);
+      return applicable(model).length === 0 ? { requested, planned: p } : refuse("invalid_input");
+    },
+    /** The static checks alone: model, target and value; the prerequisites are read by the operation. */
+    validate(model: string, target: unknown, requested: V): void {
+      planned(model, target, requested);
+    },
+    dryRun: dryRunOf<V>(async (context, target, requested, affected) => {
+      const { planned: p } = planned(context.model, target, requested);
+      const unverified: UnverifiedCondition[] = [];
+      await prepare(context, affected, unverified);
+      return { requested, planned: p, unverified };
+    }),
+    async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      const { at, raw, planned: p } = planned(context.model, target, requested);
+      await prepare(context);
+      return writeRaw(context, at, raw, { requested, planned: p });
+    },
+  };
 }
 

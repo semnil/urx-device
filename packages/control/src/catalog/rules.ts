@@ -6,7 +6,7 @@
 import type { ChannelKind } from "./channels.js";
 
 /** A public unit; null for unitless numbers. */
-export type ValueUnit = "dB" | "ms" | "s" | "Hz" | "%" | "bpm" | "ratio" | null;
+export type ValueUnit = "dB" | "ms" | "s" | "min" | "Hz" | "%" | "bpm" | "ratio" | null;
 
 /** A named value outside the finite range, with its exact raw value. */
 export interface Sentinel {
@@ -138,7 +138,15 @@ export interface SelectorLimits {
   readonly slot: string | null;
 }
 
+/** Numbers from a fixed set, raw = value: no rounding to a member (F11-C). */
+export interface NumericSetRule {
+  readonly kind: "numeric-set";
+  readonly unit: ValueUnit;
+  readonly values: readonly number[];
+}
+
 export type ValueRule =
+  | NumericSetRule
   | SwitchRule
   | ChoiceRule
   | GridRule
@@ -353,11 +361,30 @@ export interface OutputSettingRule {
   readonly value: ValueRule;
 }
 
+/**
+ * A state a write requires (F11-C): one read of `paramId`, y, on the listed
+ * models only. `allowed` raw values let the write proceed, `refused` ones are
+ * a failed precondition, and any other value is an invalid response.
+ */
+export interface WritePrerequisite {
+  /** The O13 condition this check is, where an earlier write can change it; absent where none can. */
+  readonly condition?: "follow_usb_off";
+  readonly paramId: number;
+  readonly y: number;
+  readonly models: readonly string[];
+  readonly allowed: readonly string[];
+  readonly refused: readonly string[];
+}
+
 /** A device-wide setting (F08-C): the target is empty. */
 export interface DeviceSettingRule {
   readonly target: "device";
   readonly address: { readonly paramId: number; readonly y: number };
   readonly value: ValueRule;
+  /** The models that have it; absent: every model. */
+  readonly models?: readonly string[];
+  /** The reads a write (or dry-run) performs first, in order. */
+  readonly writePrerequisites?: readonly WritePrerequisite[];
 }
 
 export type SettingRule =

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { GEQ_BANDS, OUTPUT_EQ_RULES } from "../src/catalog/output-eq.js";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { dryRunSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, dryRunSettingAfter, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -253,7 +253,48 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
   it("dry-run a gain with the two reads and no write", async () => {
     const transport = new FakeTransport().script("getNumeric", read("2"), read("0"));
     const plan = await dryRunSetting(new OperationContext(transport, "URX44"), "bus.geq.gain", { bus: "mix-1", side: "left", band: "20" }, 2.75);
-    expect(plan).toEqual({ requested: 2.75, planned: 2.5 });
+    expect(plan).toEqual({ requested: 2.75, planned: 2.5, unverified: [] });
     expect(transport.calls.map((call) => call.method)).toEqual(["getNumeric", "getNumeric"]);
+  });
+
+  it("leave the GEQ conditions an unsent write can change unverified, still reading and checking them (O13)", async () => {
+    const target = { bus: "mix-1", side: "left", band: "20" } as const;
+    // The type is PEQ now, but an earlier unsent write can change it: unverified, and the Limit still plans the gain.
+    const typed = new FakeTransport().script("getNumeric", read("0"), read("0"));
+    expect(await dryRunSettingAfter(new OperationContext(typed, "URX44"), new Set(["geq_type_selected"]), "bus.geq.gain", target, 2.75)).toEqual({
+      requested: 2.75,
+      planned: 2.5,
+      unverified: ["geq_type_selected"],
+    });
+    // An affected Limit leaves the gain unplanned; the Limit is still read and checked.
+    const limited = new FakeTransport().script("getNumeric", read("2"), read("3"));
+    expect(await dryRunSettingAfter(new OperationContext(limited, "URX44"), new Set(["geq_limit_allows_gain"]), "bus.geq.gain", target, 9)).toEqual({
+      requested: 9,
+      planned: null,
+      unverified: ["geq_limit_allows_gain"],
+    });
+    const badLimit = new FakeTransport().script("getNumeric", read("2"), read("7"));
+    expect((await failureOf(dryRunSettingAfter(new OperationContext(badLimit, "URX44"), new Set(["geq_limit_allows_gain"]), "bus.geq.gain", target, 9)))?.code).toBe(
+      "invalid_response",
+    );
+    // On, Link and Limit: an affected type is unverified; an invalid one is still an error; unaffected PEQ refuses.
+    for (const [id, t, value] of [
+      ["bus.geq.on", { bus: "mix-1", side: "left" }, true],
+      ["bus.geq.link", { bus: "mix-1" }, "off"],
+      ["bus.geq.limit", { bus: "mix-1", side: "left" }, "plus-minus-6"],
+    ] as const) {
+      const args = [id, t, value] as unknown as WriteArgs;
+      const peq = new FakeTransport().script("getNumeric", read("0"));
+      expect(await dryRunSettingAfter(new OperationContext(peq, "URX44"), new Set(["geq_type_selected"]), ...args), id).toEqual({
+        requested: value,
+        planned: value,
+        unverified: ["geq_type_selected"],
+      });
+      const invalid = new FakeTransport().script("getNumeric", read("1"));
+      expect((await failureOf(dryRunSettingAfter(new OperationContext(invalid, "URX44"), new Set(["geq_type_selected"]), ...args)))?.code, id).toBe("invalid_response");
+      const refused = new FakeTransport().script("getNumeric", read("0"));
+      expect((await failureOf(dryRunSetting(new OperationContext(refused, "URX44"), ...args)))?.code, id).toBe("precondition_failed");
+      expect([...peq.calls, ...invalid.calls, ...refused.calls].filter((c) => c.method.startsWith("set"))).toEqual([]);
+    }
   });
 });

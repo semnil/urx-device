@@ -33,6 +33,7 @@ export { GEQ_BANDS, OUTPUT_EQ_RULES } from "./output-eq.js";
 export { OUTPUT_PEQ_RULES } from "./output-peq.js";
 export { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, OUTPUT_TOKENS, STREAM_DELAY_RULES } from "./output-routing.js";
 export { OSCILLATOR_RULES } from "./oscillator.js";
+export { DEVICE_RULES } from "./device.js";
 export {
   LEVEL_TAPS,
   METER_BUSES,
@@ -72,6 +73,8 @@ export type {
   OutputSideSettingRule,
   OutputSettingRule,
   DeviceSettingRule,
+  NumericSetRule,
+  WritePrerequisite,
   BusSideAddress,
   BusSideSettingRule,
   GeqGainRule,
@@ -133,6 +136,11 @@ export type {
   CueMode,
   OscillatorAssignTarget,
   OscillatorMode,
+  DateFormat,
+  DeviceLanguage,
+  HdmiInputChannels,
+  TimeFormat,
+  UsbSuppression,
   BusSideBandTarget,
   BusSideTarget,
   GeqLimit,
