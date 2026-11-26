@@ -1176,6 +1176,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
+            response_gate: std::sync::Mutex::new(None),
         }),
         written: Vec::new(),
         end_before_write,
@@ -1691,20 +1692,26 @@ fn unit_holding_its_first_read() -> (
     (port, closed, received, answer)
 }
 
-/// Options whose response deadline no case reaches.
-fn patient() -> ConnectionOptions {
-    ConnectionOptions {
-        response_deadline: Duration::from_secs(30),
-        ..options()
-    }
+/// Holds the response deadline of the next request `connection` sends from
+/// starting until the returned sender is used or dropped.
+fn hold_the_next_response_deadline(connection: &Connection) -> mpsc::Sender<()> {
+    let (start, gate) = mpsc::channel();
+    *super::lock(&connection.shared.response_gate) = Some(gate);
+    start
 }
 
-/// Has the next close on this thread answer the held read once it has taken
-/// what waits, and run `then` after.
-fn answer_once_taken(answer: mpsc::Sender<()>, then: impl FnOnce() + 'static) {
+/// Has the next close on this thread, once it has taken what waits, run
+/// `then`, start the held read's response deadline and have the unit answer
+/// the read.
+fn answer_once_taken(
+    deadline: mpsc::Sender<()>,
+    answer: mpsc::Sender<()>,
+    then: impl FnOnce() + 'static,
+) {
     super::CLOSE_TAKEN.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
             then();
+            let _ = deadline.send(());
             let _ = answer.send(());
         }))
     });
@@ -1724,14 +1731,15 @@ fn a_close_with_no_thread_to_start_completes_waiting_requests_and_returns() {
     // returns that it could not finish, as does a second close; nothing panics. The read
     // is answered once the close has taken the write.
     let (port, closed, received, answer) = unit_holding_its_first_read();
-    let connection = open(port, ID, &patient(), &Control::new()).unwrap();
+    let connection = open(port, ID, &options(), &Control::new()).unwrap();
+    let deadline = hold_the_next_response_deadline(&connection);
     let operation = connection.create_operation().unwrap();
     let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
     received
         .recv_timeout(Duration::from_secs(5))
         .expect("the read on the wire");
     let waiting = submit(&connection, &operation, Request::SetNumeric(address(2), 5));
-    answer_once_taken(answer, || {});
+    answer_once_taken(deadline, answer, || {});
     let closed_with = refusing_threads(0, || connection.close(Duration::from_millis(300)));
     assert_eq!(closed_with, could_not_finish());
     assert_eq!(
@@ -1806,7 +1814,8 @@ fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_aft
     // threads. Each callback still gets its result once, before the close returns. The read
     // on the wire is answered after that.
     let (port, _closed, received, answer) = unit_holding_its_first_read();
-    let connection = open(port, ID, &patient(), &Control::new()).unwrap();
+    let connection = open(port, ID, &options(), &Control::new()).unwrap();
+    let deadline = hold_the_next_response_deadline(&connection);
     let operation = connection.create_operation().unwrap();
     let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
     received
@@ -1834,10 +1843,11 @@ fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_aft
         let _ = again.send(outcome);
     });
     let expiry = Arc::clone(&connection.shared.expiry);
-    answer_once_taken(answer, move || {
+    answer_once_taken(deadline, answer, move || {
         expiry.stop();
-        // Long enough for threads with nothing queued to end.
-        thread::sleep(Duration::from_millis(50));
+        // Every completing thread has ended: what was not queued before the stop has no
+        // thread left to run it.
+        wait_until(|| super::lock(&expiry.pool).alive == 0);
     });
     assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     let unsent = failed(
@@ -1879,7 +1889,8 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
     // itself never gets there, and the case fails rather than waits.
     for refused in [true, false] {
         let (port, _closed, received, answer) = unit_holding_its_first_read();
-        let connection = Arc::new(open(port, ID, &patient(), &Control::new()).unwrap());
+        let connection = Arc::new(open(port, ID, &options(), &Control::new()).unwrap());
+        let deadline = hold_the_next_response_deadline(&connection);
         let operation = connection.create_operation().unwrap();
         let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
         received
@@ -1898,7 +1909,7 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
         let (closed_tx, closed_with) = mpsc::channel();
         let closing = Arc::clone(&connection);
         thread::spawn(move || {
-            answer_once_taken(answer, || {});
+            answer_once_taken(deadline, answer, || {});
             let close = || closing.close(Duration::from_millis(50));
             let outcome = if refused {
                 refusing_threads(0, close)
