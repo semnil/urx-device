@@ -314,5 +314,11 @@ describe("selector judgments from the published catalog match the operations", (
     }
     // A port another model takes is unsupported here, from the catalog alone.
     expect(judge(source, "URX44", "hdmi-left")).toBe("unsupported_operation");
+    // A mono-only Rec Point stage is an invalid value for a fixed stereo channel, not a known one it lacks.
+    const monoOnly = recPoint.rules.mono.known.filter((stage) => !recPoint.rules.stereo.known.includes(stage));
+    expect(monoOnly.length).toBeGreaterThan(0);
+    for (const stage of monoOnly) {
+      expect(operation("URX44", "channel.rec-point", { channel: STEREO_CHANNELS.URX44[0] as number }, stage), stage).toBe("invalid_input");
+    }
   });
 });
