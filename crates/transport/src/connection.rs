@@ -428,8 +428,8 @@ impl Connection {
         options: &ConnectionOptions,
         notifications: Option<NotificationHandler>,
     ) -> std::io::Result<Connection> {
-        // Every fallible step comes before any thread starts, so a failure
-        // leaves nothing running.
+        // A failure leaves nothing running: the clones come before any thread
+        // starts, and a thread that cannot be started stops those that did.
         let reader_sock = sock.try_clone()?;
         let worker_sock = sock.try_clone()?;
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -447,24 +447,58 @@ impl Connection {
             delivery_stop: AtomicBool::new(false),
         });
         let (events, inbox) = mpsc::channel();
-        let delivery_thread = notifications.map(|handler| {
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        // A thread that cannot be started fails the opening; the ones already
+        // started are stopped and waited for first, so nothing is left running.
+        let abandon = |started: Vec<JoinHandle<()>>| {
+            reader_stop.store(true, Ordering::SeqCst);
+            let _ = sock.shutdown(Shutdown::Both);
+            match &shared.notifications {
+                Some(queue) => {
+                    let _queue = lock(queue);
+                    shared.delivery_stop.store(true, Ordering::SeqCst);
+                }
+                None => shared.delivery_stop.store(true, Ordering::SeqCst),
+            }
+            shared.deliverable.notify_all();
+            for thread in started {
+                let _ = thread.join();
+            }
+        };
+        let spawner = &shared.expiry.spawner;
+        let delivery_thread = match notifications.map(|handler| {
             let shared = Arc::clone(&shared);
             let events = events.clone();
-            thread::spawn(move || deliver_notifications(&shared, &handler, &events))
-        });
-        let reader_stop = Arc::new(AtomicBool::new(false));
+            spawner.spawn(move || deliver_notifications(&shared, &handler, &events))
+        }) {
+            Some(Ok(thread)) => Some(thread),
+            Some(Err(error)) => return Err(error),
+            None => None,
+        };
         let reader_thread = {
             let sock = reader_sock;
             let events = events.clone();
             let stop = Arc::clone(&reader_stop);
             let shared = Arc::clone(&shared);
-            thread::spawn(move || read_frames(sock, reader, events, stop, shared))
+            match spawner.spawn(move || read_frames(sock, reader, events, stop, shared)) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    abandon(delivery_thread.into_iter().collect());
+                    return Err(error);
+                }
+            }
         };
         let worker_thread = {
             let sock = worker_sock;
             let shared = Arc::clone(&shared);
             let options = *options;
-            thread::spawn(move || serve(sock, inbox, shared, options))
+            match spawner.spawn(move || serve(sock, inbox, shared, options)) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    abandon(delivery_thread.into_iter().chain([reader_thread]).collect());
+                    return Err(error);
+                }
+            }
         };
         Ok(Connection {
             generation,
@@ -709,16 +743,33 @@ impl Connection {
         // Waiting requests complete on their own thread, which the close
         // waits for within the budget; a close called from one of their
         // callbacks returns `Started` instead of waiting for itself.
-        let delivery = (!waiting.is_empty()).then(|| {
+        let delivery = if waiting.is_empty() {
+            None
+        } else {
             let (go, ready) = mpsc::channel::<()>();
-            let handle = thread::spawn(move || {
+            let slot = Arc::new(Mutex::new(Some(waiting)));
+            let taken = Arc::clone(&slot);
+            match self.shared.expiry.spawner.spawn(move || {
                 let _ = ready.recv();
-                waiting.complete(cause);
-            });
-            lock(&self.close.exempt).push(handle.thread().id());
-            let _ = go.send(());
-            handle
-        });
+                if let Some(waiting) = lock(&taken).take() {
+                    waiting.complete(cause);
+                }
+            }) {
+                Ok(handle) => {
+                    lock(&self.close.exempt).push(handle.thread().id());
+                    let _ = go.send(());
+                    Some(handle)
+                }
+                // Without a thread of their own they complete here, before
+                // the close goes on.
+                Err(_) => {
+                    if let Some(waiting) = lock(&slot).take() {
+                        waiting.complete(cause);
+                    }
+                    None
+                }
+            }
+        };
         {
             let mut state = self.shared.lock();
             while state.active || state.job {
@@ -751,8 +802,23 @@ impl Connection {
             // A completion or delivery callback cannot wait for the thread it
             // runs on; a helper finishes the close within the same budget.
             let cell = Arc::clone(&self.close);
-            thread::spawn(move || cell.record(rest.finish()));
-            return CloseOutcome::Started;
+            let slot = Arc::new(Mutex::new(Some(rest)));
+            let taken = Arc::clone(&slot);
+            let helper = self.shared.expiry.spawner.spawn(move || {
+                if let Some(rest) = lock(&taken).take() {
+                    cell.record(rest.finish());
+                }
+            });
+            if helper.is_ok() {
+                return CloseOutcome::Started;
+            }
+            // Without a helper the close cannot wait here: it stops what it
+            // can and records that it could not finish.
+            let outcome = lock(&slot)
+                .take()
+                .map_or(CloseOutcome::Started, Teardown::abandon);
+            self.close.record(outcome);
+            return outcome;
         }
         let outcome = rest.finish();
         self.close.record(outcome);
@@ -787,6 +853,25 @@ struct Teardown {
 }
 
 impl Teardown {
+    /// What a close does with no thread to finish on: it stops the threads
+    /// and shuts the socket down without waiting for either, and could not
+    /// finish.
+    fn abandon(self) -> CloseOutcome {
+        self.reader_stop.store(true, Ordering::SeqCst);
+        if let Some(sock) = self.sock {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+        match &self.shared.notifications {
+            Some(queue) => {
+                let _queue = lock(queue);
+                self.shared.delivery_stop.store(true, Ordering::SeqCst);
+            }
+            None => self.shared.delivery_stop.store(true, Ordering::SeqCst),
+        }
+        self.shared.deliverable.notify_all();
+        CloseOutcome::Incomplete(Failure::cause(Cause::InternalError, Phase::Teardown))
+    }
+
     /// Waits, within the budget, for the worker's unregistrations (or the
     /// connection's end), then shuts the socket down and waits for the
     /// threads.
@@ -861,20 +946,25 @@ fn wait_for<const N: usize>(
     let incomplete =
         CloseOutcome::Incomplete(Failure::cause(Cause::TeardownTimeout, Phase::Teardown));
     let (joined, all_joined) = mpsc::channel();
-    let expiry = Arc::clone(expiry);
-    thread::spawn(move || {
+    let joining = Arc::clone(expiry);
+    let joiner = expiry.spawner.spawn(move || {
         for thread in threads.into_iter().flatten() {
             let _ = thread.join();
         }
         // Taken after the worker is joined: it starts no expiry thread after.
         // Their identities stay recorded, so a close from one never waits
         // for itself.
-        let expiries = std::mem::take(&mut lock(&expiry.pool).threads);
+        let expiries = std::mem::take(&mut lock(&joining.pool).threads);
         for thread in expiries {
             let _ = thread.join();
         }
         let _ = joined.send(());
     });
+    // Without a thread to join on, the threads cannot be waited for within
+    // the budget: they are let go, and the close could not finish.
+    if joiner.is_err() {
+        return CloseOutcome::Incomplete(Failure::cause(Cause::InternalError, Phase::Teardown));
+    }
     let remaining = end.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return incomplete;
@@ -1109,6 +1199,73 @@ fn tear_down(
     shared.settled.notify_all();
 }
 
+/// Starts the connection's threads. A thread the system cannot create is an
+/// error each caller handles, never a panic: an opening fails, and a close or
+/// a completion goes on without the thread.
+#[derive(Default)]
+pub(crate) struct Spawner {
+    /// Refuses every thread, for a case that stands in for the system.
+    #[cfg(test)]
+    pub(crate) refuse: AtomicBool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Refuses the threads started from this thread once this many more have
+    /// started, for a case that stands in for the system.
+    pub(crate) static REFUSE_SPAWN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Counts the threads started from this thread that have not yet
+    /// finished, for a case that checks none is left running.
+    pub(crate) static RUNNING: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One thread counted in [`RUNNING`], until it finishes or never starts.
+#[cfg(test)]
+struct Running(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Spawner {
+    pub(crate) fn spawn(
+        &self,
+        f: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<JoinHandle<()>> {
+        #[cfg(test)]
+        if self.refuse.load(Ordering::SeqCst)
+            || REFUSE_SPAWN.with(|left| match left.get() {
+                Some(0) => true,
+                Some(n) => {
+                    left.set(Some(n - 1));
+                    false
+                }
+                None => false,
+            })
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::WouldBlock,
+                "thread creation refused",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(running) = RUNNING.with(|running| running.borrow().clone()) {
+            // Counted before the thread starts, so it cannot be missed.
+            running.fetch_add(1, Ordering::SeqCst);
+            let counted = Running(running);
+            return thread::Builder::new().spawn(move || {
+                let _counted = counted;
+                f();
+            });
+        }
+        thread::Builder::new().spawn(f)
+    }
+}
+
 /// Requests that expired during a hold, waiting for a completing thread,
 /// and those threads (K5, K6).
 #[derive(Default)]
@@ -1116,6 +1273,7 @@ struct Expiry {
     pool: Mutex<ExpiryPool>,
     /// Signalled when a request is queued or the threads must stop.
     ready: Condvar,
+    spawner: Spawner,
 }
 
 #[derive(Default)]
@@ -1139,8 +1297,12 @@ impl Expiry {
     /// Queues expired requests, starting a thread for each one no idle
     /// thread takes, so a blocked completion delays no other. Every queued
     /// or running completion is charged, so the threads stay within the
-    /// waiting-request limit.
-    fn queue(self: &Arc<Self>, expired: VecDeque<Item>) {
+    /// waiting-request limit. Returns whether no thread is there to take
+    /// them, when the system starts none: the caller then completes them with
+    /// [`Expiry::complete_queued`] once it holds no lock, since their
+    /// callbacks may call into the connection.
+    #[must_use]
+    fn queue(self: &Arc<Self>, expired: VecDeque<Item>) -> bool {
         let mut pool = lock(&self.pool);
         for item in expired {
             pool.charged += 1;
@@ -1152,12 +1314,39 @@ impl Expiry {
             pool.starting += 1;
             let expiry = Arc::clone(self);
             // Registered before it can run: it waits for this lock first.
-            let thread = thread::spawn(move || expiry.complete());
-            pool.ids.push(thread.thread().id());
-            pool.threads.push(thread);
+            match self.spawner.spawn(move || expiry.complete()) {
+                Ok(thread) => {
+                    pool.ids.push(thread.thread().id());
+                    pool.threads.push(thread);
+                }
+                Err(_) => {
+                    pool.starting -= 1;
+                    break;
+                }
+            }
         }
+        let orphaned = pool.idle + pool.starting == 0;
         drop(pool);
         self.ready.notify_all();
+        orphaned
+    }
+
+    /// Completes the queued requests on this thread, which holds no lock.
+    fn complete_queued(&self) {
+        let mut pool = lock(&self.pool);
+        while let Some(item) = pool.queue.pop_front() {
+            drop(pool);
+            let bytes = item.frame.len();
+            let timeout = Outcome::failed(
+                RequestCause::SendTimeout,
+                RequestPhase::Admission,
+                Evidence::NotSent,
+            );
+            deliver(item.done, timeout, ResultAdoption::none());
+            pool = lock(&self.pool);
+            pool.charged -= 1;
+            pool.charged_bytes -= bytes;
+        }
     }
 
     /// One completing thread: completes queued requests until told to stop
@@ -2213,7 +2402,14 @@ fn hold(
             state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
             // Queued under the state lock, so a close marked after this
             // finds them queued before it stops the threads.
-            shared.expiry.queue(expired);
+            if shared.expiry.queue(expired) {
+                // No thread to complete them: this one does, without the
+                // state lock, since their callbacks may call into the
+                // connection.
+                drop(state);
+                shared.expiry.complete_queued();
+                state = shared.lock();
+            }
             continue;
         }
         let next = state

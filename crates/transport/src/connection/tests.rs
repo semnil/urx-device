@@ -1601,6 +1601,161 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
     drop(release);
 }
 
+/// Runs `f` with the system refusing threads started from this thread once
+/// `allowed` more have started.
+fn refusing_threads<T>(allowed: usize, f: impl FnOnce() -> T) -> T {
+    super::REFUSE_SPAWN.with(|left| left.set(Some(allowed)));
+    let result = f();
+    super::REFUSE_SPAWN.with(|left| left.set(None));
+    result
+}
+
+/// A peer that answers the opening and nothing else, and reports when the
+/// connection's socket is closed from the other end.
+fn silent_unit() -> (u16, mpsc::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (closed_tx, closed) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut requests = BufReader::new(stream);
+        let mut request = String::new();
+        for reply in [
+            get_reply("/vd/synchronize", online(ID)),
+            get_reply("/vd/device", firmware()),
+        ] {
+            request.clear();
+            requests.read_line(&mut request).unwrap();
+            writer.write_all(&reply).unwrap();
+        }
+        loop {
+            request.clear();
+            match requests.read_line(&mut request) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    (port, closed)
+}
+
+fn could_not_finish() -> CloseOutcome {
+    CloseOutcome::Incomplete(Failure::Cause {
+        code: Cause::InternalError,
+        phase: Phase::Teardown,
+    })
+}
+
+#[test]
+fn a_close_with_no_thread_to_start_completes_waiting_requests_and_returns() {
+    // A read is on the wire and a write waits behind it when the system stops starting
+    // threads. The close completes the waiting write unsent, closes the socket, and
+    // returns that it could not finish, as does a second close; nothing panics.
+    let (port, closed) = silent_unit();
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        ..options()
+    };
+    let connection = open(port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    thread::sleep(Duration::from_millis(20));
+    let waiting = submit(&connection, &operation, Request::SetNumeric(address(2), 5));
+    let closed_with = refusing_threads(0, || connection.close(Duration::from_millis(300)));
+    assert_eq!(closed_with, could_not_finish());
+    assert_eq!(
+        outcome(&waiting),
+        failed(
+            RequestCause::NotConnected,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    closed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the socket closed");
+    assert_eq!(
+        connection.close(Duration::from_millis(300)),
+        could_not_finish()
+    );
+}
+
+#[test]
+fn a_close_with_nothing_waiting_and_no_thread_to_start_returns() {
+    let (port, closed) = silent_unit();
+    let connection = open(port, ID, &options(), &Control::new()).unwrap();
+    let outcome = refusing_threads(0, || connection.close(Duration::from_millis(300)));
+    assert_eq!(outcome, could_not_finish());
+    closed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the socket closed");
+    assert_eq!(
+        connection.close(Duration::from_millis(300)),
+        could_not_finish()
+    );
+}
+
+#[test]
+fn a_close_from_a_callback_with_no_helper_thread_returns_what_it_could_do() {
+    // A completion callback runs on the connection's own thread, which a close cannot wait
+    // for; with no helper thread to finish on, the close stops what it can and returns.
+    let (port, closed) = silent_unit();
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        ..options()
+    };
+    let connection = Arc::new(open(port, ID, &options, &Control::new()).unwrap());
+    let operation = connection.create_operation().unwrap();
+    let (tx, from_callback) = mpsc::channel();
+    let inner = Arc::clone(&connection);
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
+        let outcome = refusing_threads(0, || inner.close(Duration::from_millis(300)));
+        let _ = tx.send(outcome);
+    });
+    assert_eq!(
+        from_callback.recv_timeout(Duration::from_secs(5)).unwrap(),
+        could_not_finish()
+    );
+    closed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the socket closed");
+    assert_eq!(
+        connection.close(Duration::from_millis(300)),
+        could_not_finish()
+    );
+}
+
+#[test]
+fn an_opening_with_no_thread_to_start_fails_and_leaves_nothing_running() {
+    // The connect attempt runs on a thread of its own; then the connection starts its
+    // reader and worker. Whichever cannot start, the opening fails as an internal error and
+    // the socket is closed.
+    for allowed in 0..3 {
+        let (port, closed) = silent_unit();
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        super::RUNNING.with(|counted| *counted.borrow_mut() = Some(Arc::clone(&running)));
+        let result = refusing_threads(allowed, || open(port, ID, &options(), &Control::new()));
+        let left = running.load(std::sync::atomic::Ordering::SeqCst);
+        super::RUNNING.with(|counted| *counted.borrow_mut() = None);
+        assert_eq!(
+            result.map(|_| ()).map_err(|failed| failed.failure),
+            Err(Failure::Cause {
+                code: Cause::InternalError,
+                phase: Phase::Connect
+            }),
+            "{allowed} thread(s) allowed"
+        );
+        assert_eq!(left, 0, "{allowed} thread(s) allowed: none still running");
+        if allowed > 0 {
+            closed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the socket closed");
+        }
+    }
+}
+
 mod lifecycle {
     use super::{connect, firmware, online, options, ID, TEARDOWN};
     use crate::connection::{
@@ -3441,6 +3596,51 @@ mod notifications {
         );
         assert!(held.try_recv().is_err(), "still held");
         assert_eq!(connection.shared.lock().waiting_bytes, 0);
+    }
+
+    #[test]
+    fn a_waiting_request_expires_while_a_result_is_held_with_no_thread_to_complete_it() {
+        // The system starts no completing thread: the expired request completes on the
+        // thread that found it expired, with no lock held, so its callback can call into the
+        // connection.
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let _ = tx.lock().unwrap().send(batch);
+        });
+        let short = crate::connection::ConnectionOptions {
+            send_deadline: Duration::from_millis(80),
+            ..options()
+        };
+        let connection =
+            Arc::new(open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap());
+        let _token = activate(&connection, &[p(1)]);
+        connection
+            .shared
+            .expiry
+            .spawner
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        let other = connection.create_operation().unwrap();
+        let (tx, waiting) = mpsc::channel();
+        let inner = Arc::clone(&connection);
+        connection.submit(&other, Request::GetNumeric(param(6)), move |outcome, _| {
+            // Reads the connection's state from inside the callback.
+            let _ = inner.terminal();
+            let _ = tx.send(outcome);
+        });
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            unsent_with(RequestCause::SendTimeout)
+        );
+        assert!(held.try_recv().is_err(), "still held");
+        assert_eq!(connection.shared.expiry.charged(), (0, 0));
     }
 
     #[test]
