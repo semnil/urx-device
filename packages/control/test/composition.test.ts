@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MONO_CHANNELS } from "../src/catalog/channels.js";
 import { FX_RETURN_RULES } from "../src/catalog/fx-return.js";
 import { HI_Z_JACKS, INPUT_JACKS, SOURCE_TOKENS } from "../src/catalog/inputs.js";
 import type { Model } from "../src/catalog/models.js";
@@ -428,6 +429,83 @@ describe("CURRENT composition (K36, F18)", () => {
     const file = synthesize("URX22");
     (file.current.params as Map<number, unknown>).delete(139);
     expect(operationFailureOf((() => { try { planCurrent(file, "URX22"); } catch (error) { return error; } return undefined; })())?.code).toBe("invalid_input");
+  });
+
+  // F18-I-C-A with F18-B-A: every mono channel's internal Threshold and Makeup, in either file mode, right after
+  // the SSMCS knee (F18-O-B); requested as stored, a missing or invalid one refusing the file, one write each.
+  it("plan the SSMCS internal Threshold and Makeup of every mono channel, whatever the file's mode", async () => {
+    const internal = ["channel.ssmcs.internal-threshold", "channel.ssmcs.internal-makeup"] as const;
+    const stored = (channel: number) => [channel === 1 ? 200 : 0, 70 + channel] as const;
+    const fileFor = (model: Model, mode: number) => {
+      const overrides: Record<string, number> = {};
+      for (const channel of MONO_CHANNELS[model]) {
+        overrides[`21:${channel - 1}`] = mode;
+        overrides[`100:${channel - 1}`] = stored(channel)[0];
+        overrides[`101:${channel - 1}`] = stored(channel)[1];
+      }
+      return synthesize(model, overrides);
+    };
+    const refusal = (file: UrxfFile, model: Model) => {
+      try {
+        planCurrent(file, model);
+      } catch (error) {
+        return operationFailureOf(error)?.code;
+      }
+      return undefined;
+    };
+    for (const model of models) {
+      for (const mode of [0, 1]) {
+        const plan = planCurrent(fileFor(model, mode), model);
+        const rows = plan.steps.filter((s) => (internal as readonly string[]).includes(s.setting));
+        expect(
+          rows.map((s) => [s.phase, s.setting, s.target, s.component, s.requested, s.planned]),
+          `${model} ${mode}`,
+        ).toEqual(
+          MONO_CHANNELS[model].flatMap((channel) =>
+            internal.map((setting, i) => [4, setting, { channel }, null, stored(channel)[i], stored(channel)[i]]),
+          ),
+        );
+        for (const channel of MONO_CHANNELS[model]) {
+          const own = plan.steps.filter((s) => (s.target as { channel?: number }).channel === channel).map((s) => s.setting);
+          const knee = own.indexOf("channel.ssmcs.comp.knee");
+          expect(own.slice(knee, knee + 4), `${model} ${mode} ${channel}`).toEqual([
+            "channel.ssmcs.comp.knee",
+            ...internal,
+            "channel.ssmcs.sidechain.on",
+          ]);
+        }
+        expect(plan.omissions.filter((o) => (internal as readonly string[]).includes(o.setting)), `${model} ${mode}`).toEqual([]);
+      }
+      // A missing or invalid stored value refuses the whole file; no default stands in.
+      for (const paramId of [100, 101]) {
+        const missing = fileFor(model, 1);
+        (missing.current.params as Map<number, unknown>).delete(paramId);
+        expect(refusal(missing, model), `${model} ${paramId} missing`).toBe("invalid_input");
+        expect(refusal(synthesize(model, { [`${paramId}:0`]: 201 }), model), `${model} ${paramId} 201`).toBe("invalid_input");
+      }
+    }
+    // Applied, each is one write at its channel's address, with no read of its own after the lock and the rate.
+    const plan = planCurrent(fileFor("URX22", 1), "URX22");
+    const head = { ...plan, steps: plan.steps.filter((s) => (internal as readonly string[]).includes(s.setting)), omissions: [] };
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
+    const transport = new FakeTransport().script("getNumeric", read("0"), read("48000")).script("setNumeric", ...head.steps.map(() => accepted));
+    const context = new OperationContext(transport, "URX22");
+    const guard = await ConsoleLockGuard.open(context);
+    try {
+      const result = await applyCurrent(context, head, { guard });
+      expect(result.error).toBeNull();
+    } finally {
+      await guard.release();
+    }
+    expect(transport.calls.map(({ method, address, value }) => [method, address.paramId, address.y, value])).toEqual([
+      ["getNumeric", 895, "0", undefined],
+      ["getNumeric", 766, "0", undefined],
+      ["setNumeric", 100, "0", "200"],
+      ["setNumeric", 101, "0", "71"],
+      ["setNumeric", 100, "1", "0"],
+      ["setNumeric", 101, "1", "72"],
+    ]);
   });
 
   it("check the sample rate first, write the steps in order, and stop at the first failure", async () => {

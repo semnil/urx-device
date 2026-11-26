@@ -59,6 +59,8 @@ export const PHASES: readonly { readonly phase: number; readonly settings: reado
       "channel.ssmcs.comp.release",
       "channel.ssmcs.comp.ratio",
       "channel.ssmcs.comp.knee",
+      "channel.ssmcs.internal-threshold",
+      "channel.ssmcs.internal-makeup",
       "channel.ssmcs.sidechain.on",
       "channel.ssmcs.sidechain.q",
       "channel.ssmcs.sidechain.frequency",
