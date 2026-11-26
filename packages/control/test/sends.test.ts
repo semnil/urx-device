@@ -20,12 +20,16 @@ async function failureOf(promise: Promise<unknown>) {
 type Field = "on" | "level" | "pan" | "tap";
 /** The F05-S address table: [base a for b = 0, stride, offsets level/pan/on/tap, writable fields]. */
 const FAMILY = {
-  "mono-mix": { a: 146, stride: 12, offsets: { level: 0, pan: 1, on: 2, tap: 5 }, writes: ["tap"] },
-  "stereo-mix": { a: 273, stride: 12, offsets: { level: 0, pan: 1, on: 2, tap: 5 }, writes: ["tap"] },
-  "mono-fx": { a: 193, stride: 4, offsets: { level: 1, on: 3, tap: 0 }, writes: ["level", "on"] },
-  "stereo-fx": { a: 320, stride: 4, offsets: { level: 1, on: 3, tap: 0 }, writes: ["level", "on"] },
-  "fx-mix": { a: 342, stride: 10, offsets: { level: 1, pan: 2, on: 3, tap: 0 }, writes: ["tap"] },
-} as const satisfies Record<string, { a: number; stride: number; offsets: { [F in Field]?: number }; writes: readonly Field[] }>;
+  "mono-mix": { a: 146, stride: 12, offsets: { level: 0, pan: 1, on: 2, tap: 5 }, writes: ["tap"], urx22: ["level", "pan", "on"] },
+  "stereo-mix": { a: 273, stride: 12, offsets: { level: 0, pan: 1, on: 2, tap: 5 }, writes: ["tap"], urx22: ["level", "on"] },
+  "mono-fx": { a: 193, stride: 4, offsets: { level: 1, on: 3, tap: 0 }, writes: ["level", "on"], urx22: [] },
+  "stereo-fx": { a: 320, stride: 4, offsets: { level: 1, on: 3, tap: 0 }, writes: ["level", "on"], urx22: [] },
+  "fx-mix": { a: 342, stride: 10, offsets: { level: 1, pan: 2, on: 3, tap: 0 }, writes: ["tap"], urx22: ["level", "pan", "on"] },
+} as const satisfies Record<
+  string,
+  // `urx22`: the fields whose one representative write is evidenced on URX22 only (F03-G).
+  { a: number; stride: number; offsets: { [F in Field]?: number }; writes: readonly Field[]; urx22: readonly Field[] }
+>;
 const sample: Record<Field, [string, unknown]> = { on: ["1", true], level: ["-1234", -12.34], pan: ["-63", -63], tap: ["1", "pre"] };
 
 /** Every send of a model: [source, destination, family, y, b]. */
@@ -78,7 +82,8 @@ describe("sends (F05-S)", () => {
     const values: Record<Field, [unknown, string]> = { on: [false, "0"], level: [-12.34, "-1234"], pan: [10, "10"], tap: ["post", "0"] };
     for (const model of models) {
       for (const [source, destination, family, y, b] of sends(model)) {
-        const { a, stride, offsets, writes } = FAMILY[family];
+        const { a, stride, offsets, writes, urx22 } = FAMILY[family];
+        const bound: readonly Field[] = model === "URX22" ? [...writes, ...urx22] : writes;
         for (const field of ["on", "level", "pan", "tap"] as const) {
           const offset = (offsets as { [F in Field]?: number })[field];
           const transport = new FakeTransport().script("setNumeric", accepted);
@@ -86,20 +91,20 @@ describe("sends (F05-S)", () => {
           const [value, raw] = values[field];
           const label = `${model} ${source} → ${destination} ${field}`;
           const result = writeAny(new OperationContext(transport, model), `send.${field}`, { source, destination }, value);
-          if (offset !== undefined && (writes as readonly Field[]).includes(field)) {
+          if (offset !== undefined && bound.includes(field)) {
             expect((await result).planned, label).toBe(value);
             expect(transport.calls.map(({ address, value: sent }) => ({ address, value: sent })), label).toEqual([
               { address: { paramId: a + offset + stride * b, x: "0", y: `${y}` }, value: raw },
             ]);
           } else {
-            // send.pan, with no bound route, is a known read-only setting: unsupported like the others.
+            // A field with no bound route on this model: unsupported, before any request.
             expect((await failureOf(result))?.code, label).toBe("unsupported_operation");
             expect(transport.calls, label).toEqual([]);
           }
         }
       }
     }
-    // The read-only send.pan still checks its target: unknown tokens are invalid, unmatched pairs unsupported.
+    // send.pan checks its target first: unknown tokens are invalid, unmatched pairs unsupported.
     for (const [target, code] of [
       [{ source: "channel-6", destination: "mix-1" }, "invalid_input"],
       [{ source: "channel-1", destination: "mix-1", side: "left" }, "invalid_input"],

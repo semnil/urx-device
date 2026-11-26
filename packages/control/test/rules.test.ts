@@ -258,10 +258,9 @@ describe("every read-only setting exposes no write path", () => {
 
   it("sends nothing from a direct write where every target's write is unbound", async () => {
     for (const [id, target, value] of [
-      ["send.pan", { source: "channel-1", destination: "mix-1" }, 0],
+      // send.pan and bus.eq.on bind some targets on URX22 (partner-writes.test.ts).
       ["bus.type", { bus: "mix-1" }, "fixed"],
       ["bus.eq.type", { bus: "stereo" }, "peq"],
-      ["bus.eq.on", { bus: "mix-1" }, true],
     ] as const) {
       for (const model of ["URX22", "URX44", "URX44V"] as const) {
         const none = new FakeTransport();

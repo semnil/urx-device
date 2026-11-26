@@ -92,7 +92,11 @@ describe("CURRENT composition (K36, F18)", () => {
       // Writes awaiting evidence and read-only settings are known omissions, not steps.
       expect(new Set(omitted("channel.stereo-link")), model).toEqual(new Set(["not_writable"]));
       expect(new Set(omitted("bus.type")), model).toEqual(new Set(["not_writable"]));
-      expect(plan.omissions.some((o) => o.setting === "bus.fader" && (o.target as { bus: string }).bus === "mix-1")).toBe(true);
+      // The MIX fader's one write is evidenced on URX22 only (F03-G): a step there, an omission elsewhere.
+      const mixFader = (entries: readonly { setting: string; target: unknown }[]) =>
+        entries.some((e) => e.setting === "bus.fader" && (e.target as { bus: string }).bus === "mix-1");
+      expect(mixFader(plan.steps), model).toBe(model === "URX22");
+      expect(mixFader(plan.omissions), model).toBe(model !== "URX22");
       expect(plan.steps.some((s) => s.setting === "bus.fader" && (s.target as { bus: string }).bus === "stereo")).toBe(true);
       expect(new Set(omitted("device.brightness"))).toEqual(new Set(["excluded_by_scope"]));
       // F18-G-A: every bus's file EQ Type here is PEQ, so no GEQ setting is a step. STEREO's non-20 Hz gains are
@@ -117,6 +121,9 @@ describe("CURRENT composition (K36, F18)", () => {
         expect(new Set(omitted(setting)), `${model} ${setting}`).toEqual(new Set(["not_writable"]));
         const skipped = plan.omissions.filter((o) => o.setting === setting).map((o) => (o.target as { bus: string }).bus);
         expect(skipped.slice(0, 2), `${model} ${setting}`).toEqual(["mix-1", "mix-2"]);
+        // STREAMING's one write is evidenced on URX22 only (F03-G): a step there, an omission elsewhere.
+        expect(stepped.some(([, bus]) => bus === "stream"), `${model} ${setting}`).toBe(model === "URX22");
+        expect(skipped.includes("stream"), `${model} ${setting}`).toBe(model !== "URX22");
       }
       // Every catalog setting is in a phase or excluded.
       const covered = new Set<string>([...PHASES.flatMap((p) => p.settings), ...Object.keys(EXCLUDED)]);

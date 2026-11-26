@@ -1,20 +1,24 @@
 // Bus rules (F05-B): master on/fader/balance, MIX type and Pan Link, STEREO
 // assignments and identity, x 0 at each bus's representative y. MIX on,
 // fader, balance, type, name and color have a partner instance (y + 1) and
-// the STREAM identity another slot (y 1): their writes await F03-G evidence
-// and stay unbound. The channel STEREO assignment is a channel setting.
+// the STREAM identity another slot (y 1). MIX on, fader and balance and the
+// STREAM name and color write the representative once on the models in
+// PARTNER_FOLLOWS, where the partner follows natively (F03-G); elsewhere, and
+// for MIX type, name and color on every model, the write stays unbound. The
+// channel STEREO assignment is a channel setting.
 
 import { CHANNEL_COLORS, FADER_LEVEL_RULE, NAME_MAX_CODE_POINTS, PAN_RULE } from "./channels.js";
 import { frozen } from "./frozen.js";
-import type { BusSettingRule, ChannelSettingRule, ValueRule } from "./rules.js";
+import { PARTNER_FOLLOWS } from "./models.js";
+import type { BusSettingRule, ChannelSettingRule, ValueRule, WriteGate } from "./rules.js";
 
 export const BUS_TOKENS = frozen(["stereo", "mix-1", "mix-2", "fx-1", "fx-2", "stream", "monitor-1", "monitor-2"] as const);
 
 type Bus = (typeof BUS_TOKENS)[number];
-type At = { paramId: number; y: number; write: boolean };
+type At = { paramId: number; y: number; write: WriteGate };
 
 /** STEREO and FX master settings are single; MIX ones single only where `mixWrite`. */
-function master(stereo: number, mix: number, fx: number, mixWrite: boolean): { [B in Bus]?: At } {
+function master(stereo: number, mix: number, fx: number, mixWrite: WriteGate): { [B in Bus]?: At } {
   return {
     stereo: { paramId: stereo, y: 0, write: true },
     "mix-1": { paramId: mix, y: 0, write: mixWrite },
@@ -30,7 +34,7 @@ const monitor = (paramId: number): { [B in Bus]?: At } => ({
   "monitor-2": { paramId, y: 1, write: true },
 });
 
-const mixOnly = (paramId: number, write: boolean): { [B in Bus]?: At } => ({
+const mixOnly = (paramId: number, write: WriteGate): { [B in Bus]?: At } => ({
   "mix-1": { paramId, y: 0, write },
   "mix-2": { paramId, y: 2, write },
 });
@@ -43,9 +47,9 @@ const bus = (address: { [B in Bus]?: At }, value: ValueRule): BusSettingRule => 
 });
 
 export const BUS_RULES = frozen({
-  "bus.on": bus({ ...master(582, 675, 338, false), ...monitor(723) }, { kind: "switch" }),
-  "bus.fader": bus({ ...master(581, 674, 337, false), ...monitor(724) }, FADER_LEVEL_RULE),
-  "bus.balance": bus(master(583, 676, 339, false), PAN_RULE),
+  "bus.on": bus({ ...master(582, 675, 338, PARTNER_FOLLOWS), ...monitor(723) }, { kind: "switch" }),
+  "bus.fader": bus({ ...master(581, 674, 337, PARTNER_FOLLOWS), ...monitor(724) }, FADER_LEVEL_RULE),
+  "bus.balance": bus(master(583, 676, 339, PARTNER_FOLLOWS), PAN_RULE),
   "bus.type": bus(mixOnly(587, false), { kind: "choice", choices: ["vari", "fixed"] }),
   "bus.pan-link": bus(mixOnly(589, true), { kind: "switch" }),
   "bus.stereo-assign": bus(
@@ -64,7 +68,7 @@ export const BUS_RULES = frozen({
       "mix-2": { paramId: 584, y: 2, write: false },
       "fx-1": { paramId: 333, y: 0, write: true },
       "fx-2": { paramId: 333, y: 1, write: true },
-      stream: { paramId: 702, y: 0, write: false },
+      stream: { paramId: 702, y: 0, write: PARTNER_FOLLOWS },
     },
     { kind: "name", maxCodePoints: NAME_MAX_CODE_POINTS },
   ),
@@ -75,7 +79,7 @@ export const BUS_RULES = frozen({
       "mix-2": { paramId: 586, y: 2, write: false },
       "fx-1": { paramId: 335, y: 0, write: true },
       "fx-2": { paramId: 335, y: 1, write: true },
-      stream: { paramId: 704, y: 0, write: false },
+      stream: { paramId: 704, y: 0, write: PARTNER_FOLLOWS },
     },
     { kind: "choice", choices: CHANNEL_COLORS },
   ),

@@ -1,12 +1,14 @@
 // Output EQ switches and Flex12GEQ rules (F07-G): STEREO, MIX 1 and MIX 2.
 // EQ Type and overall EQ On are read at the representative y; their writes
-// follow F03-G's evidence-selected address plan and stay unbound until that
-// evidence exists. Link writes the representative instance once; GEQ On,
+// follow F03-G's evidence-selected address plan: the MIX EQ On writes the
+// representative once on the models in PARTNER_FOLLOWS, and every other EQ
+// Type and EQ On write stays unbound until evidence exists. Link writes the representative instance once; GEQ On,
 // Limit and band gain write the named side once.
 
 import { BUS_TOKENS } from "./buses.js";
 import { byToken, frozen } from "./frozen.js";
-import type { BusSettingRule, BusSideSettingRule, GeqGainRule, SelectorRule } from "./rules.js";
+import { PARTNER_FOLLOWS } from "./models.js";
+import type { BusSettingRule, BusSideSettingRule, GeqGainRule, SelectorRule, WriteGate } from "./rules.js";
 
 export const GEQ_BANDS = frozen([
   "20", "25", "31.5", "40", "50", "63", "80", "100", "125", "160", "200", "250", "315", "400", "500", "630",
@@ -39,11 +41,11 @@ const EQ_TYPE: SelectorRule = {
   }),
 };
 
-function representative(stereo: number, mix: number, write: boolean): BusSettingRule["address"] {
+function representative(stereo: number, mix: number, stereoWrite: WriteGate, mixWrite: WriteGate): BusSettingRule["address"] {
   return {
-    stereo: { paramId: stereo, y: REPRESENTATIVE.stereo, write },
-    "mix-1": { paramId: mix, y: REPRESENTATIVE["mix-1"], write },
-    "mix-2": { paramId: mix, y: REPRESENTATIVE["mix-2"], write },
+    stereo: { paramId: stereo, y: REPRESENTATIVE.stereo, write: stereoWrite },
+    "mix-1": { paramId: mix, y: REPRESENTATIVE["mix-1"], write: mixWrite },
+    "mix-2": { paramId: mix, y: REPRESENTATIVE["mix-2"], write: mixWrite },
   };
 }
 
@@ -63,12 +65,12 @@ const LIMITS = [
 ] as const;
 
 export const OUTPUT_EQ_RULES = frozen({
-  "bus.eq.type": { target: "bus", known: BUS_TOKENS, address: representative(497, 590, false), value: EQ_TYPE },
-  "bus.eq.on": { target: "bus", known: BUS_TOKENS, address: representative(498, 591, false), value: { kind: "switch" } },
+  "bus.eq.type": { target: "bus", known: BUS_TOKENS, address: representative(497, 590, false, false), value: EQ_TYPE },
+  "bus.eq.on": { target: "bus", known: BUS_TOKENS, address: representative(498, 591, false, PARTNER_FOLLOWS), value: { kind: "switch" } },
   "bus.geq.link": {
     target: "bus",
     known: BUS_TOKENS,
-    address: representative(544, 637, true),
+    address: representative(544, 637, true, true),
     value: { kind: "choice", choices: ["off", "left-to-right", "right-to-left"] },
   },
   "bus.geq.on": { target: "bus-side", known: BUS_TOKENS, address: sides(543, 636), value: { kind: "switch" } },

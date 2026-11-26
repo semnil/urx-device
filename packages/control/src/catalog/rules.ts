@@ -5,6 +5,12 @@
 
 import type { ChannelKind } from "./channels.js";
 
+/**
+ * Whether a write is bound: on every model (true), on none (false), or on
+ * the listed models, where its write sequence is evidenced (F03-G).
+ */
+export type WriteGate = boolean | readonly string[];
+
 /** A public unit; null for unitless numbers. */
 export type ValueUnit = "dB" | "ms" | "s" | "min" | "Hz" | "%" | "bpm" | "ratio" | "tracks" | null;
 
@@ -214,7 +220,7 @@ export interface SendRoute {
   readonly to: "mix" | "fx";
   readonly base: number;
   readonly stride: number;
-  readonly write: boolean;
+  readonly write: WriteGate;
 }
 
 /**
@@ -241,7 +247,7 @@ export interface BusSettingRule {
   /** Undefined for a known bus without the setting. */
   readonly address: {
     readonly [bus: string]:
-      | { readonly paramId: number; readonly y: number; readonly write: boolean; readonly value?: ValueRule }
+      | { readonly paramId: number; readonly y: number; readonly write: WriteGate; readonly value?: ValueRule }
       | undefined;
   };
   /** The value rule; an address entry's own `value` replaces it for that bus. */
@@ -286,7 +292,7 @@ export interface BusSideAddress {
   /** One ID for both sides, or one per side. */
   readonly paramId: number | { readonly left: number; readonly right: number };
   readonly y: { readonly left: number; readonly right: number };
-  readonly write: boolean;
+  readonly write: WriteGate;
   /** This bus's own value rule, replacing the shared one. */
   readonly value?: ValueRule;
   /** A mono bus of a per-side setting: it takes no side, and `y.left` is its y. */
@@ -343,7 +349,7 @@ export interface BusBandSettingRule {
   readonly known: readonly string[];
   readonly bands: readonly string[];
   readonly address: {
-    readonly [bus: string]: { readonly [band: string]: { readonly paramId: number; readonly y: number; readonly write: boolean } | undefined } | undefined;
+    readonly [bus: string]: { readonly [band: string]: { readonly paramId: number; readonly y: number; readonly write: WriteGate } | undefined } | undefined;
   };
   readonly value: ValueRule | ByBandRule;
 }
@@ -447,7 +453,13 @@ export interface SourceSettingRule {
   readonly target: "source";
   readonly sources: {
     readonly [source: string]:
-      | { readonly models: readonly string[]; readonly paramId: number; readonly read: number; readonly write: number | null }
+      | {
+          readonly models: readonly string[];
+          readonly paramId: number;
+          readonly read: number;
+          /** The one write instance and the models it is bound on; null while unbound (F03-G). */
+          readonly write: { readonly y: number; readonly on: WriteGate } | null;
+        }
       | undefined;
   };
   readonly value: ValueRule;

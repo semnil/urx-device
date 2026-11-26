@@ -2,17 +2,20 @@
 // y 0) and MIX 1/2 (anchor 591, representative y 0 or 2). Band i's base is
 // anchor + 5 + 5i: on/type/Q/frequency/gain at base + 0…4; only low and high
 // have a type. 1-knob On/Type/Level at anchor + 2/3/4. MIX writes have a
-// partner instance (y + 1) and await F03-G evidence; STEREO writes once.
+// partner instance (y + 1): they write the representative once on the
+// models in PARTNER_FOLLOWS (F03-G) and stay unbound elsewhere; STEREO
+// writes once.
 
 import { BUS_TOKENS } from "./buses.js";
 import { EQ_BANDS, EQ_BAND_FIELDS, EQ_ONE_KNOB_FIELDS, EQ_RULES } from "./eq.js";
 import { frozen } from "./frozen.js";
+import { PARTNER_FOLLOWS } from "./models.js";
 import type { BusBandSettingRule, BusSettingRule } from "./rules.js";
 
 const BUSES = {
   stereo: { anchor: 498, y: 0, write: true },
-  "mix-1": { anchor: 591, y: 0, write: false },
-  "mix-2": { anchor: 591, y: 2, write: false },
+  "mix-1": { anchor: 591, y: 0, write: PARTNER_FOLLOWS },
+  "mix-2": { anchor: 591, y: 2, write: PARTNER_FOLLOWS },
 } as const;
 
 function bandAddress(field: keyof typeof EQ_BAND_FIELDS, bands: readonly string[] = EQ_BANDS): BusBandSettingRule["address"] {

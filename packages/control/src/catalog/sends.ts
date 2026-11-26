@@ -3,12 +3,14 @@
 // a/a+1/a+2/a+5. CH → FX: a = 193 + 4b mono, 320 + 4b stereo; level/on at
 // a+1/a+3, tap a (read-only), no pan. FX → MIX: a = 342 + 10b; level/pan/on/
 // tap at a+1/a+2/a+3/a. Level, pan and on writes with a linked-address
-// candidate (CH → MIX, FX → MIX) await F03-G evidence and stay unbound.
+// candidate (CH → MIX, FX → MIX) write the representative once on the models
+// in PARTNER_FOLLOWS, where the partner follows natively (F03-G), except the
+// unmeasured stereo CH → MIX pan; elsewhere they stay unbound.
 
 import { FADER_LEVEL_RULE, MONO_CHANNELS, PAN_RULE, STEREO_CHANNELS } from "./channels.js";
 import { frozen } from "./frozen.js";
-import { MODELS } from "./models.js";
-import type { SendRoute, SendSettingRule, ValueRule } from "./rules.js";
+import { MODELS, PARTNER_FOLLOWS } from "./models.js";
+import type { SendRoute, SendSettingRule, ValueRule, WriteGate } from "./rules.js";
 
 const channels = [...new Set(MODELS.flatMap((model) => [...MONO_CHANNELS[model], ...STEREO_CHANNELS[model]]))].sort((a, b) => a - b);
 
@@ -19,12 +21,12 @@ const KNOWN_DESTINATIONS = ["mix-1", "mix-2", "fx-1", "fx-2", "stereo"];
 type Field = "level" | "pan" | "on" | "tap";
 
 /** Field offsets from each family's base a, and whether its write is bound. */
-const FAMILIES: readonly { from: SendRoute["from"]; to: SendRoute["to"]; a: number; stride: number; fields: { [F in Field]?: [number, boolean] } }[] = [
-  { from: "mono", to: "mix", a: 146, stride: 12, fields: { level: [0, false], pan: [1, false], on: [2, false], tap: [5, true] } },
-  { from: "stereo", to: "mix", a: 273, stride: 12, fields: { level: [0, false], pan: [1, false], on: [2, false], tap: [5, true] } },
+const FAMILIES: readonly { from: SendRoute["from"]; to: SendRoute["to"]; a: number; stride: number; fields: { [F in Field]?: [number, WriteGate] } }[] = [
+  { from: "mono", to: "mix", a: 146, stride: 12, fields: { level: [0, PARTNER_FOLLOWS], pan: [1, PARTNER_FOLLOWS], on: [2, PARTNER_FOLLOWS], tap: [5, true] } },
+  { from: "stereo", to: "mix", a: 273, stride: 12, fields: { level: [0, PARTNER_FOLLOWS], pan: [1, false], on: [2, PARTNER_FOLLOWS], tap: [5, true] } },
   { from: "mono", to: "fx", a: 193, stride: 4, fields: { level: [1, true], on: [3, true], tap: [0, false] } },
   { from: "stereo", to: "fx", a: 320, stride: 4, fields: { level: [1, true], on: [3, true], tap: [0, false] } },
-  { from: "fx", to: "mix", a: 342, stride: 10, fields: { level: [1, false], pan: [2, false], on: [3, false], tap: [0, true] } },
+  { from: "fx", to: "mix", a: 342, stride: 10, fields: { level: [1, PARTNER_FOLLOWS], pan: [2, PARTNER_FOLLOWS], on: [3, PARTNER_FOLLOWS], tap: [0, true] } },
 ];
 
 function send(field: Field, value: ValueRule): SendSettingRule {
