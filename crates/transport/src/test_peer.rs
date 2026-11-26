@@ -95,12 +95,9 @@ pub(crate) fn resetting(answers: Vec<Vec<u8>>) -> u16 {
 
 /// Whether `loss` is the socket error a reset connection reads as.
 pub(crate) fn is_reset(loss: Option<crate::connection::LinkLoss>) -> bool {
-    matches!(
-        loss,
-        Some(crate::connection::LinkLoss::SocketError(
-            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-        ))
-    )
+    loss == Some(crate::connection::LinkLoss::SocketError(
+        std::io::ErrorKind::ConnectionReset,
+    ))
 }
 
 pub(crate) fn line(message: Value) -> Vec<u8> {
