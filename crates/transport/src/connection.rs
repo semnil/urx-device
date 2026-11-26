@@ -472,10 +472,13 @@ impl Connection {
         self.shared.lock().terminal
     }
 
-    /// How the link was lost, once the connection has ended as
-    /// `connection_lost` and the way it was lost is known (R1-L-A).
+    /// How the link was lost, once the connection's recorded end is
+    /// `connection_lost` and the way it was lost is known (R1-L-A). The end
+    /// is recorded before any request, lifecycle call or close is handed it,
+    /// so this answers from inside that callback and after that close.
     pub fn lost_link(&self) -> Option<LinkLoss> {
-        if self.terminal() != Some(RequestCause::ConnectionLost) {
+        let ended = self.shared.lock().ended;
+        if ended != Some(RequestCause::ConnectionLost) {
             return None;
         }
         *lock(&self.shared.loss)
@@ -1984,7 +1987,19 @@ impl Io<'_> {
             let posted = self.post_cleanup(unregister(address));
             let (verdict, cause) = match posted {
                 Posted::Accepted => (Verdict::Accepted, None),
-                Posted::Refused { verdict, cause, .. } => (verdict, Some(cause)),
+                Posted::Refused {
+                    verdict,
+                    cause,
+                    ends,
+                } => {
+                    // A failure that ends the link is the connection's end,
+                    // recorded before the close reports it, as a request's is
+                    // before its outcome.
+                    if let Some(end) = ends {
+                        record_end(self.shared, end);
+                    }
+                    (verdict, Some(cause))
+                }
                 Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected)),
             };
             self.shared.lock().ledger.unregistered(address, verdict);
