@@ -63,6 +63,18 @@ pub struct ConnectionOptions {
     pub response_deadline: Duration,
 }
 
+/// How a link that ended as `connection_lost` was lost (R1-L-A). The request
+/// cause stays `connection_lost`; this tells a consumer which wording fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkLoss {
+    /// Device Center reported the unit lost.
+    UnitLost,
+    /// The peer closed the stream.
+    PeerClosed,
+    /// The socket failed with this error.
+    SocketError(ErrorKind),
+}
+
 type Done = Box<dyn FnOnce(Outcome, ResultAdoption) + Send>;
 
 /// The acknowledgment of one app-issued request's completion (K6, K37):
@@ -191,6 +203,9 @@ struct Shared {
     /// before reporting it, and the worker starts each write while holding
     /// this lock, so a write never starts after the end is recorded.
     link_end: Mutex<Option<RequestCause>>,
+    /// How the link was lost, recorded before a `connection_lost` end is
+    /// (R1-L-A). The first one recorded stands.
+    loss: Mutex<Option<LinkLoss>>,
     /// Signalled when the worker settles its active request.
     settled: Condvar,
     /// Signalled, with the state lock, when what a held result waits for may
@@ -392,6 +407,7 @@ impl Connection {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
+            loss: Mutex::new(None),
             settled: Condvar::new(),
             advance: Condvar::new(),
             expiry: Arc::new(Expiry::default()),
@@ -454,6 +470,18 @@ impl Connection {
     /// The cause that ended the connection, if one has.
     pub fn terminal(&self) -> Option<RequestCause> {
         self.shared.lock().terminal
+    }
+
+    /// How the link was lost, once the connection's recorded end is
+    /// `connection_lost` and the way it was lost is known (R1-L-A). The end
+    /// is recorded before any request, lifecycle call or close is handed it,
+    /// so this answers from inside that callback and after that close.
+    pub fn lost_link(&self) -> Option<LinkLoss> {
+        let ended = self.shared.lock().ended;
+        if ended != Some(RequestCause::ConnectionLost) {
+            return None;
+        }
+        *lock(&self.shared.loss)
     }
 
     /// A new operation owner, or `not_connected` once the connection is
@@ -1282,7 +1310,8 @@ fn read_frames(
     // After an overflow, replies to a request already sent still arrive;
     // further notifications are not queued, even once budget is released.
     let mut overflowed = false;
-    if sock.set_read_timeout(Some(READ_POLL)).is_err() {
+    if let Err(error) = sock.set_read_timeout(Some(READ_POLL)) {
+        note_loss(&shared, LinkLoss::SocketError(error.kind()));
         record(RequestCause::ConnectionLost);
         let _ = events.send(Event::ReadFailed(RequestCause::ConnectionLost));
         return;
@@ -1292,6 +1321,7 @@ fn read_frames(
             Ok(Some(frame)) => {
                 if let Some(json) = frame.json {
                     if lost_notification(&json) {
+                        note_loss(&shared, LinkLoss::UnitLost);
                         record(RequestCause::ConnectionLost);
                     }
                     let mut received = Received {
@@ -1328,7 +1358,14 @@ fn read_frames(
                 if !stop.load(Ordering::SeqCst) {
                     let cause = match error {
                         ReadError::Oversized { .. } => RequestCause::InvalidResponse,
-                        ReadError::Closed | ReadError::Io(_) => RequestCause::ConnectionLost,
+                        ReadError::Closed => {
+                            note_loss(&shared, LinkLoss::PeerClosed);
+                            RequestCause::ConnectionLost
+                        }
+                        ReadError::Io(kind) => {
+                            note_loss(&shared, LinkLoss::SocketError(kind));
+                            RequestCause::ConnectionLost
+                        }
                     };
                     record(cause);
                     let _ = events.send(Event::ReadFailed(cause));
@@ -1337,6 +1374,12 @@ fn read_frames(
             }
         }
     }
+}
+
+/// Records how the link was lost, unless that is already recorded; called
+/// before the `connection_lost` end it explains is recorded (R1-L-A).
+fn note_loss(shared: &Shared, loss: LinkLoss) {
+    lock(&shared.loss).get_or_insert(loss);
 }
 
 /// The worker: runs admitted requests one at a time until the connection
@@ -1449,9 +1492,10 @@ fn serve(
             }
             None => match inbox.recv() {
                 Ok(Event::Wake) => None,
-                Ok(Event::Frame(received)) => {
-                    lost_notification(&received.message).then_some(RequestCause::ConnectionLost)
-                }
+                Ok(Event::Frame(received)) => lost_notification(&received.message).then(|| {
+                    note_loss(&shared, LinkLoss::UnitLost);
+                    RequestCause::ConnectionLost
+                }),
                 Ok(Event::ReadFailed(cause)) => Some(cause),
                 Err(_) => return,
             },
@@ -1943,7 +1987,19 @@ impl Io<'_> {
             let posted = self.post_cleanup(unregister(address));
             let (verdict, cause) = match posted {
                 Posted::Accepted => (Verdict::Accepted, None),
-                Posted::Refused { verdict, cause, .. } => (verdict, Some(cause)),
+                Posted::Refused {
+                    verdict,
+                    cause,
+                    ends,
+                } => {
+                    // A failure that ends the link is the connection's end,
+                    // recorded before the close reports it, as a request's is
+                    // before its outcome.
+                    if let Some(end) = ends {
+                        record_end(self.shared, end);
+                    }
+                    (verdict, Some(cause))
+                }
                 Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected)),
             };
             self.shared.lock().ledger.unregistered(address, verdict);
@@ -2307,6 +2363,7 @@ fn exchange(
         match event {
             Ok(Event::Frame(received)) => {
                 if lost_notification(&received.message) {
+                    note_loss(shared, LinkLoss::UnitLost);
                     return unconfirmed(RequestCause::ConnectionLost);
                 }
                 let inbound = Inbound::new(received.message);
@@ -2362,10 +2419,8 @@ fn write_frame<O: Outgoing>(
         if remaining.is_zero() {
             return failed(RequestCause::SendTimeout);
         }
-        if sock
-            .set_write_timeout(Some(remaining.min(WRITE_POLL)))
-            .is_err()
-        {
+        if let Err(error) = sock.set_write_timeout(Some(remaining.min(WRITE_POLL))) {
+            note_loss(shared, LinkLoss::SocketError(error.kind()));
             return failed(RequestCause::ConnectionLost);
         }
         // Held across the write: the reader cannot record an end, and a
@@ -2394,14 +2449,20 @@ fn write_frame<O: Outgoing>(
         let outcome = sock.write(&frame[written..]);
         drop(link_end);
         match outcome {
-            Ok(0) => return failed(RequestCause::ConnectionLost),
+            Ok(0) => {
+                note_loss(shared, LinkLoss::PeerClosed);
+                return failed(RequestCause::ConnectionLost);
+            }
             Ok(n) => written += n,
             Err(e)
                 if matches!(
                     e.kind(),
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                 ) => {}
-            Err(_) => return failed(RequestCause::ConnectionLost),
+            Err(e) => {
+                note_loss(shared, LinkLoss::SocketError(e.kind()));
+                return failed(RequestCause::ConnectionLost);
+            }
         }
     }
     Ok(())

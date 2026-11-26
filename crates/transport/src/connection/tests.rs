@@ -1,7 +1,8 @@
 //! The operational connection against a fake unit endpoint.
 
 use super::{
-    open, CloseOutcome, Connection, ConnectionOptions, MAX_WAITING_BYTES, MAX_WAITING_REQUESTS,
+    open, CloseOutcome, Connection, ConnectionOptions, LinkLoss, MAX_WAITING_BYTES,
+    MAX_WAITING_REQUESTS,
 };
 use crate::discovery::SystemFirmware;
 use crate::frame;
@@ -695,6 +696,7 @@ fn a_lost_push_or_a_closed_link_ends_the_connection() {
         )
     );
     assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
 
     // The unit pushes device-lost after the handshake, while nothing is active.
     let lost_idle = Peer::serve(|request| match uri_of(request) {
@@ -709,6 +711,7 @@ fn a_lost_push_or_a_closed_link_ends_the_connection() {
     let connection = connect(&lost_idle);
     wait_until(|| connection.terminal().is_some());
     assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
 
     // The unit closes the link when the first parameter request arrives.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -738,6 +741,63 @@ fn a_lost_push_or_a_closed_link_ends_the_connection() {
         )
     );
     assert_eq!(connection.terminal(), Some(RequestCause::ConnectionLost));
+    assert_eq!(connection.lost_link(), Some(LinkLoss::PeerClosed));
+}
+
+#[test]
+fn how_the_link_was_lost_is_known_to_requests_completed_before_the_worker_ends_it() {
+    // The unit's reply to the first request is followed by a device-lost
+    // push, which the reader records while that request's callback holds
+    // the worker: the worker has not yet ended the connection itself.
+    let held_then_lost = || {
+        unit(|request| {
+            let mut out = plain(request);
+            if uri_of(request).starts_with("/vd/parameters/1:") {
+                out.push(line(
+                    json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "offline" } } }),
+                ));
+            }
+            out
+        })
+    };
+    let lost_unsent = failed(
+        RequestCause::ConnectionLost,
+        RequestPhase::Admission,
+        Evidence::NotSent,
+    );
+
+    // A cancellation completes the waiting request.
+    let peer = held_then_lost();
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let release = hold_worker(&connection, &operation);
+    wait_until(|| connection.shared.link_end().is_some());
+    let waiting = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    operation.cancel();
+    assert_eq!(outcome(&waiting), lost_unsent);
+    assert_eq!(connection.terminal(), None, "the worker is still held");
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
+    drop(release);
+    wait_until(|| connection.terminal().is_some());
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
+
+    // A close completes the waiting request.
+    let peer = held_then_lost();
+    let connection = Arc::new(connect(&peer));
+    let operation = connection.create_operation().unwrap();
+    let release = hold_worker(&connection, &operation);
+    wait_until(|| connection.shared.link_end().is_some());
+    let waiting = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    let closing = {
+        let connection = Arc::clone(&connection);
+        thread::spawn(move || connection.close(TEARDOWN))
+    };
+    assert_eq!(outcome(&waiting), lost_unsent);
+    assert_eq!(connection.terminal(), None, "the worker is still held");
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
+    drop(release);
+    closing.join().unwrap();
+    assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
 }
 
 #[test]
@@ -1040,6 +1100,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
         shared: Arc::new(super::Shared {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
+            loss: std::sync::Mutex::new(None),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
@@ -1472,15 +1533,19 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
 }
 
 mod lifecycle {
-    use super::{connect, firmware, online, ID, TEARDOWN};
-    use crate::connection::{open, CloseOutcome, Connection, ConnectionOptions, Subscription};
+    use super::{connect, firmware, online, options, ID, TEARDOWN};
+    use crate::connection::{
+        open, CloseOutcome, Connection, ConnectionOptions, LinkLoss, Subscription,
+    };
     use crate::lifecycle::{
         Cause, Cleanup, CleanupState, Control, Failure, LifecycleFailure, LifecycleOutcome, Phase,
     };
     use crate::subscription::SubscriptionAddress;
     use crate::test_peer::{get_reply, line, uri_of, Peer};
     use crate::wire::{MeterAddress, ParameterAddress};
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Shutdown, TcpListener};
     use std::sync::mpsc::{self, Receiver};
     use std::sync::Arc;
     use std::thread;
@@ -2037,6 +2102,80 @@ mod lifecycle {
             "a repeated close shares the outcome and sends nothing"
         );
         assert_eq!(posts(&peer).len(), 3);
+    }
+
+    #[test]
+    fn a_link_lost_during_the_close_is_known_by_how_it_was_lost() {
+        /// How the unit meets the close's unregistration.
+        enum Meets {
+            /// A device-lost push and no reply.
+            LostPush,
+            /// Its end of the link closing.
+            Close,
+            /// Nothing: the test shuts the connection's sending side down
+            /// first, so the unregistration's write fails.
+            Nothing,
+        }
+        let lost_at_close = |meets: Meets| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (keep, kept) = mpsc::channel::<()>();
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                for request in BufReader::new(stream).lines() {
+                    let Ok(request) = request else { break };
+                    let request: Value = serde_json::from_str(&request).unwrap();
+                    let uri = uri_of(&request).to_string();
+                    let reply = match uri.as_str() {
+                        "/vd/synchronize" => get_reply("/vd/synchronize", online(ID)),
+                        "/vd/device" => get_reply("/vd/device", firmware()),
+                        uri if uri.ends_with("operation=regist") => line(
+                            json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": 200 } } }),
+                        ),
+                        _ => match meets {
+                            Meets::LostPush => line(
+                                json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "offline" } } }),
+                            ),
+                            Meets::Close => return,
+                            Meets::Nothing => continue,
+                        },
+                    };
+                    writer.write_all(&reply).unwrap();
+                }
+                // The link stays open until the test is done with it.
+                let _ = kept.recv();
+            });
+            let connection = open(port, ID, &options(), &Control::new()).unwrap();
+            let token = connection.prepare_subscription(&[p(1)]).unwrap();
+            assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+            (connection, keep)
+        };
+        let lost = CloseOutcome::Failed(Failure::Cause {
+            code: Cause::ConnectionLost,
+            phase: Phase::Teardown,
+        });
+
+        let (connection, _keep) = lost_at_close(Meets::LostPush);
+        assert_eq!(connection.close(TEARDOWN), lost);
+        assert_eq!(connection.lost_link(), Some(LinkLoss::UnitLost));
+
+        let (connection, _keep) = lost_at_close(Meets::Close);
+        assert_eq!(connection.close(TEARDOWN), lost);
+        assert_eq!(connection.lost_link(), Some(LinkLoss::PeerClosed));
+
+        let (connection, _keep) = lost_at_close(Meets::Nothing);
+        super::super::lock(&connection.sock)
+            .as_ref()
+            .unwrap()
+            .shutdown(Shutdown::Write)
+            .unwrap();
+        assert_eq!(connection.close(TEARDOWN), lost);
+        assert!(
+            matches!(connection.lost_link(), Some(LinkLoss::SocketError(_))),
+            "{:?}",
+            connection.lost_link()
+        );
     }
 
     #[test]
