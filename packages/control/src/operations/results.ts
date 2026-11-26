@@ -13,6 +13,8 @@ export interface Reading<V> {
 export interface WritePlan<V> {
   readonly requested: V;
   readonly planned: V;
+  /** For a composite setting: its component writes in order, all `not_sent` in a plan (O11). */
+  readonly steps?: readonly CompositeStep[];
 }
 
 /**
@@ -35,8 +37,7 @@ export type UnverifiedCondition =
  * null where that needs a context an unsent write can change, and the
  * conditions left unverified, in check order.
  */
-export interface DryRunPlan<V> {
-  readonly requested: V;
+export interface DryRunPlan<V> extends Omit<WritePlan<V>, "planned"> {
   readonly planned: V | null;
   readonly unverified: readonly UnverifiedCondition[];
 }
@@ -46,9 +47,29 @@ export interface VerifiedPlan<V> extends WritePlan<V> {
   readonly unverified: readonly UnverifiedCondition[];
 }
 
+/**
+ * A composite read's failure (O12): the component whose request failed, or
+ * null when the operation was stopped before or between component requests.
+ * No component value is exposed.
+ */
+export interface CompositeReadProgress {
+  readonly failedComponent: string | null;
+}
+
+/** One component write of a composite setting, in planned order (O11). */
+export interface CompositeStep {
+  readonly component: string;
+  readonly requested: string;
+  readonly planned: string;
+  readonly outcome: WriteOutcome;
+  readonly responseCode?: I64Text;
+}
+
 /** A write the unit accepted (W1): acceptance, not readback. */
 export interface WriteResult<V> extends WritePlan<V> {
   readonly outcome: "accepted";
+  /** For a composite setting, each component write in order (O11). */
+  readonly steps?: readonly CompositeStep[];
 }
 
 /** How a failed write ended, from its request's evidence (K34, O11). */
@@ -59,4 +80,6 @@ export interface WriteProgress<V> extends WritePlan<V> {
   readonly outcome: WriteOutcome;
   /** The device's rejection code, for a rejected write. */
   readonly responseCode?: I64Text;
+  /** For a composite setting: accepted steps kept, the failed one, later ones not sent (O11). */
+  readonly steps?: readonly CompositeStep[];
 }

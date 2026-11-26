@@ -4,7 +4,7 @@
 
 import { DEVICE_RULES } from "../catalog/device.js";
 import type { DateFormat, DeviceLanguage, HdmiInputChannels, TimeFormat, UsbSuppression } from "../catalog/settings.js";
-import { deviceRuleSetting } from "./rules.js";
+import { deviceRuleSetting, readOnly } from "./rules.js";
 
 export const deviceBrightness = deviceRuleSetting<number>(DEVICE_RULES["device.brightness"]);
 export const deviceAutoPowerOff = deviceRuleSetting<boolean>(DEVICE_RULES["device.auto-power-off"]);
@@ -20,8 +20,3 @@ export const deviceSampleRate = deviceRuleSetting<number>(DEVICE_RULES["device.s
 export const deviceFollowUsb = deviceRuleSetting<boolean>(DEVICE_RULES["device.follow-usb"]);
 /** Read only (F20-L): no plan, write, validation or dry run is exposed. */
 export const deviceConsoleLock = readOnly(deviceRuleSetting<boolean>(DEVICE_RULES["device.console-lock"]));
-
-function readOnly<H extends { plan?: unknown; write?: unknown; validate?: unknown; dryRun?: unknown }>(handler: H) {
-  const { plan: _plan, write: _write, validate: _validate, dryRun: _dryRun, ...rest } = handler;
-  return rest;
-}

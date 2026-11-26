@@ -34,6 +34,7 @@ export { OUTPUT_PEQ_RULES } from "./output-peq.js";
 export { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, OUTPUT_TOKENS, STREAM_DELAY_RULES } from "./output-routing.js";
 export { OSCILLATOR_RULES } from "./oscillator.js";
 export { DEVICE_RULES } from "./device.js";
+export { INTEGRATION_RULES, KNOB_RULES } from "./integration-panel.js";
 export {
   LEVEL_TAPS,
   METER_BUSES,
@@ -74,6 +75,8 @@ export type {
   OutputSettingRule,
   DeviceSettingRule,
   NumericSetRule,
+  FlagRule,
+  KnobAssignmentRule,
   WritePrerequisite,
   BusSideAddress,
   BusSideSettingRule,
@@ -137,6 +140,10 @@ export type {
   OscillatorAssignTarget,
   OscillatorMode,
   DateFormat,
+  KnobAssignment,
+  KnobAssignmentReading,
+  KnobTarget,
+  SendsTarget,
   DeviceLanguage,
   HdmiInputChannels,
   TimeFormat,

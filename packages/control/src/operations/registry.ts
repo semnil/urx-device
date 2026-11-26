@@ -135,6 +135,8 @@ import {
   deviceTimeZoneIndex,
   deviceUsbSuppression,
 } from "./device.js";
+import { integrationActive, integrationPostFaderSource, knobBank, panelSendsTarget } from "./integration-panel.js";
+import { knobAssignment } from "./knob.js";
 import {
   compOn,
   eqOn,
@@ -332,6 +334,11 @@ export const settingHandlers: SettingHandlers = {
   "device.sample-rate": deviceSampleRate,
   "device.follow-usb": deviceFollowUsb,
   "device.console-lock": deviceConsoleLock,
+  "knob.assignment": knobAssignment,
+  "knob.bank": knobBank,
+  "integration.active": integrationActive,
+  "integration.post-fader-source": integrationPostFaderSource,
+  "panel.sends-target": panelSendsTarget,
 };
 
 function unknownId(): Promise<never> {
@@ -444,7 +451,7 @@ export function dryRunSetting<A extends WriteArgs>(context: OperationContext, ..
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
     if (handler.dryRun === undefined) {
       const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
-      return Promise.resolve({ requested: plan.requested, planned: plan.planned, unverified: [] });
+      return Promise.resolve({ ...plan, unverified: [] });
     }
     return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>);
   });
@@ -465,7 +472,7 @@ export function dryRunSettingAfter<A extends WriteArgs>(
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
     if (handler.dryRun === undefined) {
       const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
-      return Promise.resolve({ requested: plan.requested, planned: plan.planned, unverified: [] });
+      return Promise.resolve({ ...plan, unverified: [] });
     }
     return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>, affected);
   });

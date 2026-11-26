@@ -153,6 +153,12 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
 /** The codec of `rule` on `model` (only a port choice depends on the model). */
 export function codecOf(rule: ValueRule, model = ""): Codec {
   switch (rule.kind) {
+    case "flag":
+      return {
+        text: false,
+        decode: (raw) => (/^(0|-?[1-9][0-9]*)$/.test(raw) ? raw !== "0" : undefined),
+        plan: () => undefined,
+      };
     case "numeric-set":
       return {
         text: false,
@@ -236,6 +242,12 @@ function dryRunOf<V>(run: (context: OperationContext, target: unknown, requested
   // With no affected condition a plan is never left null, so the first form's type holds.
   return ((context: OperationContext, target: unknown, requested: V, affected?: ReadonlySet<UnverifiedCondition>) =>
     run(context, target, requested, new Set(affected ?? []))) as DryRun<V>;
+}
+
+/** A read-only setting's handler (a known setting without a write): no plan, write, validation or dry run. */
+export function readOnly<H extends { plan?: unknown; write?: unknown; validate?: unknown; dryRun?: unknown }>(handler: H) {
+  const { plan: _plan, write: _write, validate: _validate, dryRun: _dryRun, ...rest } = handler;
+  return rest;
 }
 
 /** A handler for the address and codec `resolve` gives a target, for a read or a write. */

@@ -14,6 +14,7 @@ import { OUTPUT_PEQ_RULES } from "./output-peq.js";
 import { CUE_RULES, MONITOR_RULES, OUTPUT_SOURCE_RULES, STREAM_DELAY_RULES, type OUTPUT_TOKENS } from "./output-routing.js";
 import { OSCILLATOR_RULES } from "./oscillator.js";
 import { DEVICE_RULES } from "./device.js";
+import { INTEGRATION_RULES, KNOB_RULES } from "./integration-panel.js";
 import { DYNAMICS_RULES } from "./dynamics.js";
 import type { I64Text } from "./i64.js";
 import { EQ_RULES, type EQ_BANDS, type EQ_ONE_KNOB_TYPES } from "./eq.js";
@@ -171,6 +172,11 @@ export const settingDefinitions = frozen({
   "device.sample-rate": { readable: true, writable: true, rule: DEVICE_RULES["device.sample-rate"] },
   "device.follow-usb": { readable: true, writable: true, rule: DEVICE_RULES["device.follow-usb"] },
   "device.console-lock": { readable: true, writable: false, rule: DEVICE_RULES["device.console-lock"] },
+  "knob.assignment": { readable: true, writable: true, rule: KNOB_RULES["knob.assignment"] },
+  "knob.bank": { readable: true, writable: false, rule: KNOB_RULES["knob.bank"] },
+  "integration.active": { readable: true, writable: false, rule: INTEGRATION_RULES["integration.active"] },
+  "integration.post-fader-source": { readable: true, writable: true, rule: INTEGRATION_RULES["integration.post-fader-source"] },
+  "panel.sends-target": { readable: true, writable: true, rule: INTEGRATION_RULES["panel.sends-target"] },
 } as const satisfies Record<string, SettingDefinitionBase>);
 
 /** A known setting ID. */
@@ -244,6 +250,36 @@ export interface OutputTarget {
 
 /** A device-wide setting's target: no keys (F08-C). */
 export type DeviceTarget = Readonly<Record<PropertyKey, never>>;
+
+/** A knob by bank 1…4 and panel letter (F12-K). */
+export interface KnobTarget {
+  readonly bank: number;
+  readonly knob: "a" | "b" | "c" | "d";
+  readonly band?: never;
+}
+
+/** A knob assignment write: the three exact device strings (F12-K). */
+export interface KnobAssignment {
+  readonly function: string;
+  readonly parameter1: string;
+  readonly parameter2: string;
+}
+
+/** One component of a knob assignment read, with its own observation time (O12). */
+export interface KnobComponentReading {
+  readonly value: string;
+  readonly observedAt: string;
+}
+
+/** A knob assignment read: each component with its own observation time (F12-K, O12). */
+export interface KnobAssignmentReading {
+  readonly function: KnobComponentReading;
+  readonly parameter1: KnobComponentReading;
+  readonly parameter2: KnobComponentReading;
+}
+
+/** The panel SEND display target (F13-S). */
+export type SendsTarget = "stereo" | "fx-1" | "fx-2" | "mix-1" | "mix-2";
 
 /** Device utility enums (F11-U, F11-H). */
 export type DeviceLanguage = "en" | "ja" | "zh-cn";
@@ -493,6 +529,11 @@ export interface SettingTypes {
   "device.sample-rate": { target: DeviceTarget; value: number };
   "device.follow-usb": { target: DeviceTarget; value: boolean };
   "device.console-lock": { target: DeviceTarget; value: boolean };
+  "knob.assignment": { target: KnobTarget; value: KnobAssignmentReading; input: KnobAssignment };
+  "knob.bank": { target: DeviceTarget; value: number };
+  "integration.active": { target: DeviceTarget; value: boolean };
+  "integration.post-fader-source": { target: BusTarget; value: "mix-1" | "mix-2" };
+  "panel.sends-target": { target: DeviceTarget; value: SendsTarget };
 }
 
 // Every catalog ID has its types, and every typed ID is in the catalog.
