@@ -59,6 +59,8 @@ export class FakeTransport implements Transport {
   activation: Error | undefined;
   /** When set, `release` rejects with it (after the subscription is marked released). */
   releaseFailure: Error | undefined;
+  /** When set, called as each subscription's `release` starts. */
+  onRelease: (() => void) | undefined;
   /** When set, an operation's `finish` throws it (after counting the call). */
   finishFailure: Error | undefined;
 
@@ -78,6 +80,7 @@ export class FakeTransport implements Transport {
         entry.state = "active";
       },
       release: async () => {
+        this.onRelease?.();
         entry.state = "released";
         if (this.releaseFailure !== undefined) {
           throw this.releaseFailure;

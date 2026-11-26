@@ -518,7 +518,8 @@ describe("CURRENT composition (K36, F18)", () => {
       try {
         return { result: await applyCurrent(context, head, { guard, dryRun }), t };
       } finally {
-        await guard.release();
+        // A release failure set for the rate observation fails the guard's release too; that is not under test.
+        await guard.release().catch(() => undefined);
       }
     };
     // Dry run: a lock, a rate change, or an invalid one during the rate read stops it, though no later step reads.
@@ -555,9 +556,45 @@ describe("CURRENT composition (K36, F18)", () => {
       "rejected device_rejected",
       "not_sent null",
     ]);
-    // A lock after every write was accepted leaves the accepted import a success.
-    const late = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, after(t, [lock("1")], accepted)).script("setText", accepted, accepted, after(t, [lock("1")], accepted)));
-    expect([late.result.error, ...late.result.steps.map((s) => s.outcome)]).toEqual([null, "accepted", "accepted", "accepted"]);
+    // E3: a stop while the last write is in flight is the overall error, the write keeping its acceptance.
+    const inFlight = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, after(t, [lock("1")], accepted)).script("setText", accepted, accepted, after(t, [lock("1")], accepted)));
+    expect([inFlight.result.error, ...inFlight.result.steps.map((s) => s.outcome)]).toEqual(["precondition_failed", "accepted", "accepted", "accepted"]);
+    for (const cause of ["interrupted", "connection_lost"] as const) {
+      let context: OperationContext | undefined;
+      const cancelling = (record: unknown) => ({
+        then(resolve: (value: unknown) => void) {
+          context?.cancel(cause);
+          resolve(record);
+        },
+      });
+      const t = new FakeTransport().script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, cancelling(accepted)).script("setText", accepted, accepted, cancelling(accepted));
+      context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      const result = await applyCurrent(context, head, { guard });
+      await guard.release();
+      expect([result.error, ...result.steps.map((s) => s.outcome)], cause).toEqual([cause, "accepted", "accepted", "accepted"]);
+    }
+    // A stop after every step settled (here, during the rate observation's release): the accepted import stays a
+    // success; a dry run, whose result is settled only after the release, reports it before a release failure.
+    const releasing = (t: FakeTransport, fail: boolean) => {
+      t.onRelease = () => {
+        t.onRelease = undefined;
+        t.notify(lock("1"));
+      };
+      if (fail) t.releaseFailure = new OperationFailureError({ code: "connection_lost", phase: "response", progress: null });
+    };
+    const settled = await apply((t) => {
+      t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
+      releasing(t, false);
+    });
+    expect([settled.result.error, settled.result.cleanup, ...settled.result.steps.map((s) => s.outcome)]).toEqual([null, null, "accepted", "accepted", "accepted"]);
+    for (const fail of [false, true]) {
+      const dry = await apply((t) => {
+        t.script("getNumeric", read("0"), read("48000"));
+        releasing(t, fail);
+      }, true);
+      expect([dry.result.error, dry.result.cleanup], `release fails: ${fail}`).toEqual(["precondition_failed", fail ? "connection_lost" : null]);
+    }
   });
 
   it("keep the first failure and every step's result when the rate observation's release fails", async () => {

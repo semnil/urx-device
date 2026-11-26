@@ -202,8 +202,10 @@ async function run(
   } finally {
     const cleanup = await rate.release();
     if (outcome !== undefined) {
-      // A release failure is the overall error only where nothing failed before it.
-      outcome = { ...outcome, error: outcome.error ?? cleanup, cleanup } as ApplyResult;
+      // E3, in processing order: the first failure or stop; for a dry run, whose result is settled only
+      // now, a stop recorded during the release; then a release failure.
+      const stop = dryRun ? (context.stopping ?? null) : null;
+      outcome = { ...outcome, error: outcome.error ?? stop ?? cleanup, cleanup } as ApplyResult;
     }
   }
   return outcome as ApplyResult;
@@ -218,7 +220,7 @@ async function runSteps(
 ): Promise<Outcome> {
   // O13: in a dry run nothing is sent, so every earlier step stays a pending change to what later steps check.
   const pending = new PendingEffects();
-  // A dry run sends no write, so it checks the stop itself: before each step and before its result.
+  // A dry run sends no write, so it checks the stop itself before each step.
   const stopped = () => (dryRun ? context.stopping : undefined);
   for (const [index, step] of plan.steps.entries()) {
     const args = [step.setting, step.target, step.requested] as unknown as WriteArgs;
@@ -241,7 +243,9 @@ async function runSteps(
       return failWith(index, error, progress?.outcome ?? "not_sent");
     }
   }
-  return { steps: results, error: stopped() ?? null };
+  // E3: a stop recorded while the last step was in flight (an interruption, a lock, a lost connection) is the
+  // overall error, the steps keeping their actual outcomes; a stop after it settled leaves the result as it is.
+  return { steps: results, error: context.stopping ?? null };
 }
 
 /**
