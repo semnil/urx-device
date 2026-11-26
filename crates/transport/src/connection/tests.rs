@@ -1176,6 +1176,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
+            response_gate: std::sync::Mutex::new(None),
         }),
         written: Vec::new(),
         end_before_write,
@@ -1641,6 +1642,81 @@ fn silent_unit() -> (u16, mpsc::Receiver<()>) {
     (port, closed)
 }
 
+/// A peer that answers the opening, reports when the first request after it
+/// arrives, answers that one as a read once told to, and then nothing else;
+/// it also reports when the connection's socket is closed from the other end.
+fn unit_holding_its_first_read() -> (
+    u16,
+    mpsc::Receiver<()>,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (closed_tx, closed) = mpsc::channel();
+    let (received_tx, received) = mpsc::channel();
+    let (answer, answering) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut requests = BufReader::new(stream);
+        let mut request = String::new();
+        for reply in [
+            get_reply("/vd/synchronize", online(ID)),
+            get_reply("/vd/device", firmware()),
+        ] {
+            request.clear();
+            requests.read_line(&mut request).unwrap();
+            writer.write_all(&reply).unwrap();
+        }
+        request.clear();
+        if requests.read_line(&mut request).unwrap_or(0) > 0 {
+            let _ = received_tx.send(());
+            let read: Value = serde_json::from_str(&request).unwrap();
+            if answering.recv().is_ok() {
+                let _ = writer.write_all(&get_reply(
+                    uri_of(&read),
+                    json!({ "current_value": 7, "response_code": 200 }),
+                ));
+            }
+        }
+        loop {
+            request.clear();
+            match requests.read_line(&mut request) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    (port, closed, received, answer)
+}
+
+/// Holds the response deadline of the next request `connection` sends from
+/// starting until the returned sender is used or dropped.
+fn hold_the_next_response_deadline(connection: &Connection) -> mpsc::Sender<()> {
+    let (start, gate) = mpsc::channel();
+    *super::lock(&connection.shared.response_gate) = Some(gate);
+    start
+}
+
+/// Has the next close on this thread, once it has taken what waits, run
+/// `then`, start the held read's response deadline and have the unit answer
+/// the read.
+fn answer_once_taken(
+    deadline: mpsc::Sender<()>,
+    answer: mpsc::Sender<()>,
+    then: impl FnOnce() + 'static,
+) {
+    super::CLOSE_TAKEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            then();
+            let _ = deadline.send(());
+            let _ = answer.send(());
+        }))
+    });
+}
+
 fn could_not_finish() -> CloseOutcome {
     CloseOutcome::Incomplete(Failure::Cause {
         code: Cause::InternalError,
@@ -1652,17 +1728,18 @@ fn could_not_finish() -> CloseOutcome {
 fn a_close_with_no_thread_to_start_completes_waiting_requests_and_returns() {
     // A read is on the wire and a write waits behind it when the system stops starting
     // threads. The close completes the waiting write unsent, closes the socket, and
-    // returns that it could not finish, as does a second close; nothing panics.
-    let (port, closed) = silent_unit();
-    let options = ConnectionOptions {
-        response_deadline: Duration::from_millis(100),
-        ..options()
-    };
-    let connection = open(port, ID, &options, &Control::new()).unwrap();
+    // returns that it could not finish, as does a second close; nothing panics. The read
+    // is answered once the close has taken the write.
+    let (port, closed, received, answer) = unit_holding_its_first_read();
+    let connection = open(port, ID, &options(), &Control::new()).unwrap();
+    let deadline = hold_the_next_response_deadline(&connection);
     let operation = connection.create_operation().unwrap();
     let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
-    thread::sleep(Duration::from_millis(20));
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the read on the wire");
     let waiting = submit(&connection, &operation, Request::SetNumeric(address(2), 5));
+    answer_once_taken(deadline, answer, || {});
     let closed_with = refusing_threads(0, || connection.close(Duration::from_millis(300)));
     assert_eq!(closed_with, could_not_finish());
     assert_eq!(
@@ -1734,16 +1811,16 @@ fn a_completing_thread_no_callback_holds_ends_after_its_linger() {
 fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_after() {
     // A read is on the wire; a read, a write, an activation and two releases wait behind it.
     // Right after the close takes them, the end of the connection stops the completing
-    // threads. Each callback still gets its result once, before the close returns.
-    let (port, _closed) = silent_unit();
-    let options = ConnectionOptions {
-        response_deadline: Duration::from_millis(100),
-        ..options()
-    };
-    let connection = open(port, ID, &options, &Control::new()).unwrap();
+    // threads. Each callback still gets its result once, before the close returns. The read
+    // on the wire is answered after that.
+    let (port, _closed, received, answer) = unit_holding_its_first_read();
+    let connection = open(port, ID, &options(), &Control::new()).unwrap();
+    let deadline = hold_the_next_response_deadline(&connection);
     let operation = connection.create_operation().unwrap();
     let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
-    thread::sleep(Duration::from_millis(20));
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the read on the wire");
     let read = submit(&connection, &operation, Request::GetNumeric(address(2)));
     let write = submit(&connection, &operation, Request::SetNumeric(address(3), 5));
     let parameter = |param_id| {
@@ -1766,12 +1843,11 @@ fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_aft
         let _ = again.send(outcome);
     });
     let expiry = Arc::clone(&connection.shared.expiry);
-    super::CLOSE_TAKEN.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || {
-            expiry.stop();
-            // Long enough for threads with nothing queued to end.
-            thread::sleep(Duration::from_millis(50));
-        }))
+    answer_once_taken(deadline, answer, move || {
+        expiry.stop();
+        // Every completing thread has ended: what was not queued before the stop has no
+        // thread left to run it.
+        wait_until(|| super::lock(&expiry.pool).alive == 0);
     });
     assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     let unsent = failed(
@@ -1808,17 +1884,18 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
     // A read is on the wire and a write waits behind it; the close completes the write on
     // the thread held for it at admission, whose callback does not return. With no thread
     // to start, the close returns that it could not finish; with threads, it returns at its
-    // budget that the teardown ran out. Either way a later close returns the same.
+    // budget that the teardown ran out. Either way a later close returns the same. The read is
+    // answered once the close has taken the write; a close that runs the write's callback
+    // itself never gets there, and the case fails rather than waits.
     for refused in [true, false] {
-        let (port, _closed) = silent_unit();
-        let options = ConnectionOptions {
-            response_deadline: Duration::from_millis(100),
-            ..options()
-        };
-        let connection = Arc::new(open(port, ID, &options, &Control::new()).unwrap());
+        let (port, _closed, received, answer) = unit_holding_its_first_read();
+        let connection = Arc::new(open(port, ID, &options(), &Control::new()).unwrap());
+        let deadline = hold_the_next_response_deadline(&connection);
         let operation = connection.create_operation().unwrap();
         let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
-        thread::sleep(Duration::from_millis(20));
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read on the wire");
         let (entered_tx, entered) = mpsc::channel();
         let (release, blocked) = mpsc::channel::<()>();
         connection.submit(
@@ -1832,6 +1909,7 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
         let (closed_tx, closed_with) = mpsc::channel();
         let closing = Arc::clone(&connection);
         thread::spawn(move || {
+            answer_once_taken(deadline, answer, || {});
             let close = || closing.close(Duration::from_millis(50));
             let outcome = if refused {
                 refusing_threads(0, close)
@@ -1849,17 +1927,18 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
             })
         };
         assert_eq!(
-            closed_with.recv_timeout(Duration::from_secs(2)),
+            closed_with.recv_timeout(Duration::from_secs(5)),
             Ok(expected),
             "refused: {refused}"
         );
         assert_eq!(
-            entered.recv_timeout(Duration::from_secs(2)).unwrap(),
+            entered.recv_timeout(Duration::from_secs(5)).unwrap(),
             failed(
                 RequestCause::NotConnected,
                 RequestPhase::Admission,
                 Evidence::NotSent
-            )
+            ),
+            "refused: {refused}"
         );
         assert_eq!(
             connection.close(Duration::from_millis(50)),
