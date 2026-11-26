@@ -227,5 +227,56 @@ describe("CURRENT composition (K36, F18)", () => {
     const interrupted = await apply(mid);
     expect(interrupted.error).toBe("precondition_failed");
     expect(interrupted.steps.map((s) => s.outcome).slice(0, 3)).toEqual(["accepted", "accepted", "not_sent"]);
+    // L5: a rate notification other than the file's after two accepted steps stops the third; a later
+    // return to the file's rate does not resume; a matching notification, another address, or none, changes nothing.
+    const rate = (value: string) => ({ kind: "numeric", address: { paramId: 766, x: "0", y: "0" }, value }) as const;
+    const scheduled = async (events: readonly (readonly ["at", number, ReturnType<typeof rate> | { kind: "numeric"; address: { paramId: number; x: string; y: string }; value: string }])[]) => {
+      const t = new FakeTransport().script("getNumeric", read("0"), read("48000"));
+      let count = 0;
+      t.script(
+        "setNumeric",
+        ...[0, 1, 2, 3, 4].map(() => ({
+          then(resolve: (record: unknown) => void) {
+            count += 1;
+            for (const [, after, notification] of events) if (after === count) t.notify(notification);
+            resolve(accepted);
+          },
+        })),
+      ).script("setText", accepted);
+      const outcome = await apply(t);
+      return { outcome, t };
+    };
+    const changed = await scheduled([["at", 2, rate("96000")], ["at", 2, rate("48000")]]);
+    expect([changed.outcome.error, ...changed.outcome.steps.map((s) => s.outcome).slice(0, 3)]).toEqual(["precondition_failed", "accepted", "accepted", "not_sent"]);
+    // One lock read and one rate read for the whole import, whatever arrives.
+    expect(changed.t.calls.filter((c) => c.method === "getNumeric").map((c) => c.address.paramId)).toEqual([895, 766]);
+    expect(changed.t.subscriptions.map((s) => [s.addresses[0]?.paramId, s.state])).toEqual([
+      [895, "released"],
+      [766, "released"],
+    ]);
+    for (const quiet of [[["at", 1, rate("48000")]], [["at", 1, { kind: "numeric", address: { paramId: 767, x: "0", y: "0" }, value: "96000" }]], []] as const) {
+      const { outcome } = await scheduled(quiet);
+      expect(outcome.error, JSON.stringify(quiet)).not.toBe("precondition_failed");
+      expect(outcome.steps[2]?.outcome, JSON.stringify(quiet)).toBe("accepted");
+    }
+    // The rate observation is active before the one rate read.
+    const ordered = new FakeTransport();
+    let observedAtRead: string | undefined;
+    ordered
+      .script("getNumeric", read("0"), {
+        then(resolve: (record: unknown) => void) {
+          observedAtRead = ordered.subscriptions.find((s) => s.addresses[0]?.paramId === 766)?.state;
+          resolve(read("96000"));
+        },
+      });
+    expect((await apply(ordered)).error).toBe("precondition_failed");
+    expect(observedAtRead).toBe("active");
+    const invalid = await scheduled([["at", 1, rate("-1")]]);
+    expect([invalid.outcome.error, invalid.outcome.steps[1]?.outcome]).toEqual(["invalid_response", "not_sent"]);
+    // A failed rate observation or read prevents every write, keeping its cause.
+    const readFails = new FakeTransport().script("getNumeric", read("0"), new Error("adapter failure"));
+    const noRead = await apply(readFails);
+    expect(noRead.error).toBe("internal_error");
+    expect(readFails.calls.filter((c) => c.method.startsWith("set"))).toEqual([]);
   });
 });

@@ -60,7 +60,7 @@ export class OperationContext {
   readonly #operation: TransportOperation;
   readonly #clock: () => Date;
   #stopping: OperationCause | undefined;
-  #writeGuard: WriteGuard | undefined;
+  readonly #writeGuards = new Set<WriteGuard>();
 
   /** `clock` gives observation times (O5); the system clock by default. */
   constructor(transport: Transport, model: string, clock: () => Date = () => new Date()) {
@@ -99,7 +99,7 @@ export class OperationContext {
    * also cancels the operation when it latches, so unsent work stops.
    */
   guardWrites(guard: WriteGuard): void {
-    this.#writeGuard = guard;
+    this.#writeGuards.add(guard);
   }
 
   /** The owner's stopping cause, once cancelled. */
@@ -149,9 +149,11 @@ export class OperationContext {
    * it before it is handed over (admission), so it is reported not sent.
    */
   #checkWriteGuard(): void {
-    const stop = this.#writeGuard?.stop;
-    if (stop !== undefined) {
-      throw new OperationFailureError({ code: stop, phase: "admission", progress: null });
+    for (const guard of this.#writeGuards) {
+      const stop = guard.stop;
+      if (stop !== undefined) {
+        throw new OperationFailureError({ code: stop, phase: "admission", progress: null });
+      }
     }
   }
 

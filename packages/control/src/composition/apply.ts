@@ -1,13 +1,19 @@
-// Executing a CURRENT plan (K36, O11, L3): the whole import is one logical
-// operation under the caller's Console Lock guard (F20-L-A), whose one lock
-// read comes first; then one device sample-rate read compared with the
-// file's before the first write, then each step's own operation in order. The first failure stops the unsent steps; accepted
+// Executing a CURRENT plan (K36, O11, L3, L5): the whole import is one
+// logical operation under the caller's Console Lock guard (F20-L-A), whose
+// one lock read comes first; then the rate subscription is registered and
+// one device sample-rate read is compared with the file's before the first
+// write; then each step's own operation runs in order. A received rate
+// notification that differs from the file's rate stops the unsent steps,
+// and a later return to the file's rate does not resume them; no further
+// rate read is made for this import-wide condition. The first failure stops the unsent steps; accepted
 // steps are kept, and nothing is rolled back, retried or read back. A
 // dry-run performs the same prerequisite reads and sends no setting write.
 
 import type { UrxfFile } from "../catalog/urxf.js";
 import type { ConsoleLockGuard } from "../operations/console-lock.js";
-import type { OperationContext } from "../operations/context.js";
+import type { OperationContext, WriteGuard } from "../operations/context.js";
+import type { OperationCause } from "../operations/failure.js";
+import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "../operations/transport.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
 import { decodeFileSetting, dryRunSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
 import type { WriteOutcome } from "../operations/results.js";
@@ -25,17 +31,92 @@ export interface ApplyResult {
   readonly error: string | null;
 }
 
+/** The device sample rate (F11-C): 766, x 0, y 0. */
+const RATE_ADDRESS: ParameterAddress = Object.freeze({ paramId: 766, x: "0", y: "0" });
+
 /**
- * The file's sample rate against the device's (L3): a mismatch is a failed
- * precondition and a missing or invalid file value invalid input, both before
- * any write. One read; the clock is never written from the file.
+ * The import-wide rate condition (L5): once registered, a valid rate
+ * notification other than the file's rate latches precondition_failed, an
+ * invalid one invalid_response, and the latch cancels the import and refuses
+ * its unsent writes; it never clears. Other addresses do not affect it.
  */
-async function checkRate(context: OperationContext, file: UrxfFile): Promise<void> {
-  const fileRate = decodeFileSetting(file.current, context.model, ...(["device.sample-rate", {}] as unknown as ReadArgs));
-  const device = await readSetting(context, "device.sample-rate", {});
-  if (device.value !== fileRate) {
-    throw new OperationFailureError({ code: "precondition_failed", phase: "preparation", progress: null });
+class RateWatch implements WriteGuard {
+  readonly #context: OperationContext;
+  readonly #fileRate: number;
+  #stop: OperationCause | undefined;
+
+  constructor(context: OperationContext, fileRate: number) {
+    this.#context = context;
+    this.#fileRate = fileRate;
   }
+
+  get stop(): OperationCause | undefined {
+    return this.#stop;
+  }
+
+  deliver(notification: TransportNotification): void {
+    if (notification.kind === "text" && sameAddress(notification.address, RATE_ADDRESS)) {
+      this.latch("invalid_response");
+    }
+    if (notification.kind !== "numeric" || !sameAddress(notification.address, RATE_ADDRESS)) {
+      return;
+    }
+    if (!/^(0|[1-9][0-9]*)$/.test(notification.value)) {
+      this.latch("invalid_response");
+    } else if (Number(notification.value) !== this.#fileRate) {
+      this.latch("precondition_failed");
+    }
+  }
+
+  latch(cause: OperationCause): void {
+    if (this.#stop === undefined) {
+      this.#stop = cause;
+      this.#context.cancel(cause);
+    }
+  }
+}
+
+const sameAddress = (a: ParameterAddress, b: ParameterAddress) => a.paramId === b.paramId && a.x === b.x && a.y === b.y;
+
+/**
+ * Registers the rate observation, then makes the one rate read (L3, L5):
+ * a mismatch is a failed precondition and a missing or invalid file value
+ * invalid input, both before any write. The clock is never written from the
+ * file. The returned function releases the observation.
+ */
+async function watchRate(context: OperationContext, file: UrxfFile): Promise<() => Promise<void>> {
+  const fileRate = decodeFileSetting(file.current, context.model, ...(["device.sample-rate", {}] as unknown as ReadArgs)) as number;
+  const watch = new RateWatch(context, fileRate);
+  let operation: TransportOperation;
+  try {
+    operation = context.transport.createOperation();
+  } catch {
+    throw new OperationFailureError({ code: "internal_error", phase: "admission", progress: null });
+  }
+  let subscription: TransportSubscription | undefined;
+  const release = async () => {
+    try {
+      await subscription?.release();
+    } finally {
+      operation.finish();
+    }
+  };
+  try {
+    subscription = context.transport.prepareSubscription([RATE_ADDRESS], operation, (notification) => watch.deliver(notification));
+    await subscription.activate();
+    context.guardWrites(watch);
+    const device = await readSetting(context, "device.sample-rate", {});
+    if (device.value !== fileRate) {
+      watch.latch("precondition_failed");
+    }
+    if (watch.stop !== undefined) {
+      throw new OperationFailureError({ code: watch.stop, phase: "preparation", progress: null });
+    }
+  } catch (error) {
+    await release();
+    throw operationFailureOf(error) === undefined ? new OperationFailureError({ code: "internal_error", phase: "admission", progress: null }) : error;
+  }
+  return release;
 }
 
 /**
@@ -78,11 +159,26 @@ async function run(
   failWith: (index: number, error: unknown, outcome: WriteOutcome) => ApplyResult,
   dryRun: boolean,
 ): Promise<ApplyResult> {
+  let releaseRate: () => Promise<void>;
   try {
-    await checkRate(context, file);
+    releaseRate = await watchRate(context, file);
   } catch (error) {
     return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error" };
   }
+  try {
+    return await runSteps(context, plan, results, failWith, dryRun);
+  } finally {
+    await releaseRate();
+  }
+}
+
+async function runSteps(
+  context: OperationContext,
+  plan: CurrentPlan,
+  results: StepResult[],
+  failWith: (index: number, error: unknown, outcome: WriteOutcome) => ApplyResult,
+  dryRun: boolean,
+): Promise<ApplyResult> {
   for (const [index, step] of plan.steps.entries()) {
     const args = [step.setting, step.target, step.requested] as unknown as WriteArgs;
     try {
