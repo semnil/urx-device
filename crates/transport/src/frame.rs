@@ -87,6 +87,12 @@ impl FrameReader {
         }
     }
 
+    /// Whether a complete frame is already buffered, so the next
+    /// [`FrameReader::read_once`] returns it without reading.
+    pub fn has_buffered_frame(&self) -> bool {
+        self.pending.contains(&b'\n')
+    }
+
     /// A frame already buffered, or else the frame completed by at most one
     /// read of `src`; `None` when that read timed out or left the frame
     /// incomplete. A caller that keeps receiving data regains control after

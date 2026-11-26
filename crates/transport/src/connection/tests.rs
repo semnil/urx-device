@@ -1293,6 +1293,228 @@ fn a_tolerated_deadline_is_reported_at_the_deadline_and_holds_up_no_close() {
         .contains(&"/vd/parameters/9:0:0?operation=unregist".to_string()));
 }
 
+/// A connection with notifications, so the reader takes the notification
+/// queue's lock for every reply it hands over, and a case can hold that lock
+/// to hold the reader up at the first reply that arrives.
+fn open_holdable(port: u16, options: &ConnectionOptions) -> Connection {
+    let handler: super::NotificationHandler = Arc::new(|_| {});
+    super::open_with(port, ID, options, &Control::new(), Some(handler)).unwrap()
+}
+
+/// Holds the reader up from now until `until` after `from`.
+fn hold_reader(connection: &Connection, from: Instant, until: Duration) {
+    let queue = connection.shared.notifications.as_ref().unwrap();
+    let _held = super::lock(queue);
+    thread::sleep(until.saturating_sub(from.elapsed()));
+}
+
+#[test]
+fn an_owed_reply_received_in_its_wait_is_dropped_however_late_the_reader_judges_it() {
+    // The late answer arrives 150 ms after the deadline, inside the 300 ms quiet, and the
+    // reader is held up on it until well after the quiet would have ended by the clock. It
+    // is judged by when it was received: still owed, so dropped, and the next read of the
+    // address, which waits for the reader rather than for the clock, gets its own value.
+    let peer = counting_gets(|n, uri| match n {
+        1 => {
+            thread::sleep(Duration::from_millis(250));
+            vec![value_reply(uri, 111)]
+        }
+        _ => vec![value_reply(uri, 222)],
+    });
+    let options = tolerating_with(3, Duration::from_millis(300), 64);
+    let connection = open_holdable(peer.port, &options);
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    let again = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    thread::sleep(Duration::from_millis(200).saturating_sub(started.elapsed()));
+    hold_reader(&connection, started, Duration::from_millis(700));
+    assert_eq!(outcome(&again), read(222));
+}
+
+#[test]
+fn a_frame_received_before_the_deadline_does_not_count_toward_the_late_reply_budget() {
+    // A reply to an address nothing waits for, at 20 ms, holds the reader up until 200 ms;
+    // a second one arrives at 30 ms, before the 100 ms deadline, and is judged only after
+    // it. With a budget of one frame it still does not count: the late answer, 200 ms after
+    // the deadline, is dropped, and the next read of the address gets its own value.
+    let port = timed_gets(|n, uri| match n {
+        1 => vec![
+            (Duration::from_millis(20), other_reply()),
+            (Duration::from_millis(10), other_reply()),
+            (Duration::from_millis(270), value_reply(uri, 111)),
+        ],
+        _ => vec![(Duration::ZERO, value_reply(uri, 222))],
+    });
+    let options = tolerating_with(3, Duration::from_secs(5), 1);
+    let connection = open_holdable(port, &options);
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    let again = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    thread::sleep(Duration::from_millis(10));
+    hold_reader(&connection, started, Duration::from_millis(200));
+    assert_eq!(outcome(&first), timed_out());
+    assert_eq!(outcome(&again), read(222));
+}
+
+#[test]
+fn a_reply_still_its_requests_own_after_the_wait_ends_the_run() {
+    // The first read's answer comes 300 ms after its deadline, past the 150 ms quiet: no
+    // longer waited for, but no request with its key has been sent since, so it is still
+    // that read's answer. It ends the run, and with a limit of two the next unanswered read
+    // leaves the connection open.
+    let peer = counting_gets(|n, uri| match n {
+        1 => {
+            thread::sleep(Duration::from_millis(400));
+            vec![value_reply(uri, 111)]
+        }
+        _ => vec![],
+    });
+    let options = tolerating_with(2, Duration::from_millis(150), 64);
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    thread::sleep(Duration::from_millis(550).saturating_sub(started.elapsed()));
+    assert_eq!(connection.timeouts_in_a_row(), 0);
+    let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(outcome(&second), timed_out());
+    assert_eq!(connection.terminal(), None);
+    assert_eq!(connection.timeouts_in_a_row(), 1);
+}
+
+#[test]
+fn a_reply_after_the_limit_th_deadline_does_not_undo_the_end() {
+    // Neither read is answered in time; the first read's answer comes 50 ms after the second
+    // read's deadline. With a limit of two the second deadline ends the connection, and the
+    // later answer does not keep it open.
+    let peer = counting_gets(|n, _| match n {
+        2 => {
+            thread::sleep(Duration::from_millis(150));
+            vec![value_reply("/vd/parameters/1:0:0", 111)]
+        }
+        _ => vec![],
+    });
+    let connection = open(peer.port, ID, &tolerating(2), &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    assert_eq!(outcome(&second), timed_out());
+    wait_until(|| connection.terminal().is_some());
+    assert_eq!(connection.terminal(), Some(RequestCause::ResponseTimeout));
+}
+
+/// A unit that answers its parameter GETs, counted from 1, with the lines
+/// `script` returns, each written after its delay from the one before.
+fn timed_gets(script: impl Fn(usize, &str) -> Vec<(Duration, Vec<u8>)> + Send + 'static) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reads = 0;
+        for request in BufReader::new(stream).lines() {
+            let Ok(request) = request else { return };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            let uri = uri_of(&request).to_string();
+            let lines = match uri.as_str() {
+                "/vd/synchronize" => vec![(Duration::ZERO, get_reply(&uri, online(ID)))],
+                "/vd/device" => vec![(Duration::ZERO, get_reply(&uri, firmware()))],
+                _ => {
+                    reads += 1;
+                    script(reads, &uri)
+                }
+            };
+            for (delay, line) in lines {
+                thread::sleep(delay);
+                if writer.write_all(&line).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn a_reply_received_before_its_deadline_is_its_answer_however_late_it_is_judged() {
+    // A reply to an address nothing waits for, at 100 ms, holds the reader up until 600 ms;
+    // the answer arrives at 200 ms, before the 300 ms deadline. It is judged by when it was
+    // received, so it is the read's answer, not a reply after its deadline.
+    let port = timed_gets(|_, uri| {
+        vec![
+            (Duration::from_millis(100), other_reply()),
+            (Duration::from_millis(100), value_reply(uri, 111)),
+        ]
+    });
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(300),
+        ..tolerating_with(3, Duration::from_secs(5), 64)
+    };
+    let connection = open_holdable(port, &options);
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let answered = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    thread::sleep(Duration::from_millis(50));
+    hold_reader(&connection, started, Duration::from_millis(600));
+    assert_eq!(outcome(&answered), read(111));
+    assert_eq!(connection.timeouts_in_a_row(), 0);
+}
+
+#[test]
+fn a_reply_counts_against_the_run_by_when_it_was_received() {
+    // Neither read is answered in time. A reply to an address nothing waits for, 100 ms after
+    // the second read, holds the reader up until 600 ms after it, across its 300 ms deadline,
+    // and the first read's
+    // answer arrives meanwhile. Received before that deadline, it breaks the run and the
+    // connection stays; received after it, the limit of two was reached first and the
+    // connection ends.
+    for (after_second, ends) in [(200, false), (400, true)] {
+        let port = timed_gets(move |n, _| match n {
+            2 => vec![
+                (Duration::from_millis(100), other_reply()),
+                (
+                    Duration::from_millis(after_second - 100),
+                    value_reply("/vd/parameters/1:0:0", 111),
+                ),
+            ],
+            _ => vec![],
+        });
+        let options = ConnectionOptions {
+            response_deadline: Duration::from_millis(300),
+            ..tolerating_with(2, Duration::from_secs(5), 64)
+        };
+        let connection = open_holdable(port, &options);
+        let operation = connection.create_operation().unwrap();
+        let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+        assert_eq!(outcome(&first), timed_out());
+        let sent = Instant::now();
+        let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+        thread::sleep(Duration::from_millis(50));
+        hold_reader(&connection, sent, Duration::from_millis(600));
+        assert_eq!(
+            outcome(&second),
+            timed_out(),
+            "answer {after_second} ms after the second read"
+        );
+        if ends {
+            wait_until(|| connection.terminal().is_some());
+            assert_eq!(connection.terminal(), Some(RequestCause::ResponseTimeout));
+        } else {
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                connection.terminal(),
+                None,
+                "answer {after_second} ms after the second read"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_unit_lost_push_while_reading_for_a_late_reply_ends_the_connection() {
     // The read goes unanswered past its deadline; while the late reply is read for, the unit
@@ -1623,7 +1845,6 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             loss: std::sync::Mutex::new(None),
-            awaiting_late: std::sync::atomic::AtomicBool::new(false),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
