@@ -132,6 +132,21 @@ function portChoiceCodec(rule: PortChoiceRule, model: string): Codec {
 /** The codec of `rule` on `model` (only a port choice depends on the model). */
 export function codecOf(rule: ValueRule, model = ""): Codec {
   switch (rule.kind) {
+    case "selector":
+      return {
+        text: false,
+        decode: (raw) => (raw === rule.none.raw ? rule.none.value : rule.choices.find((choice) => choice.raw === raw)?.token),
+        plan: (value) => {
+          if (value === rule.none.value) {
+            return { planned: value, raw: rule.none.raw };
+          }
+          const choice = rule.choices.find((each) => each.token === value);
+          if (choice !== undefined) {
+            return { planned: value, raw: choice.raw };
+          }
+          return rule.known.includes(value as string) ? "unsupported" : undefined;
+        },
+      };
     case "name":
       return {
         text: true,

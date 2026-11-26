@@ -85,6 +85,7 @@ import {
   busType,
   channelStereoAssign,
 } from "./buses.js";
+import { busInsertFxOn, busInsertFxType, channelInsertFxOn, channelInsertFxType } from "./insert-fx.js";
 import {
   compOn,
   eqOn,
@@ -216,6 +217,10 @@ export const settingHandlers: SettingHandlers = {
   "bus.name": busName,
   "bus.color": busColor,
   "channel.stereo-assign": channelStereoAssign,
+  "channel.insert-fx.type": channelInsertFxType,
+  "channel.insert-fx.on": channelInsertFxOn,
+  "bus.insert-fx.type": busInsertFxType,
+  "bus.insert-fx.on": busInsertFxOn,
 };
 
 function unknownId(): Promise<never> {
