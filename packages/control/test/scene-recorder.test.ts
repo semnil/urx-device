@@ -15,8 +15,12 @@ async function failed(promise: Promise<unknown>) {
 }
 async function observe(id: string, raw: string, model = "URX44", target: object = {}) {
   const transport = new FakeTransport().script("getNumeric", read(raw));
+  // A read is exactly one GET: any further request shows as `calls` and fails an exact comparison.
   return readAny(new OperationContext(transport, model), id, target).then(
-    (reading) => ({ value: reading.value, address: transport.calls[0]?.address }),
+    (reading) =>
+      transport.calls.length === 1
+        ? { value: reading.value, address: transport.calls[0]?.address }
+        : { value: reading.value, address: transport.calls[0]?.address, calls: transport.calls.length },
     (error: unknown) => ({ code: operationFailureOf(error)?.code, calls: transport.calls.length }),
   );
 }
@@ -121,6 +125,70 @@ describe("scene and recorder reads expose no write path", () => {
       const handler = settingHandlers[id] as unknown as Record<string, unknown>;
       expect(["plan", "write", "validate", "dryRun"].filter((key) => key in handler), id).toEqual([]);
       expect(typeof handler["read"], id).toBe("function");
+    }
+  });
+});
+
+describe("recorder sources on every track (F16-R)", () => {
+  const WRITABLE: [string, string][] = [
+    ["none", "4294967295"],
+    ["channel-1", "0"],
+    ["channel-2", "1"],
+    ["channel-3", "2"],
+    ["channel-4", "3"],
+    ...[5, 7, 9, 11].flatMap((n, i): [string, string][] => [
+      [`channel-${n}-left`, `${4 + 2 * i}`],
+      [`channel-${n}-right`, `${5 + 2 * i}`],
+    ]),
+    ["stereo-left", "256"],
+    ["stereo-right", "257"],
+    ["mix-1-left", "288"],
+    ["mix-1-right", "289"],
+    ["mix-2-left", "290"],
+    ["mix-2-right", "291"],
+  ];
+  const READ_ONLY = ["monitor-1-left", "monitor-1-right", "monitor-2-left", "monitor-2-right", "stream-left", "stream-right"];
+
+  it("write each of the 19 writable lanes once at the named track, on both models", async () => {
+    expect(WRITABLE.length).toBe(19);
+    for (const model of ["URX44", "URX44V"] as const) {
+      for (let track = 1; track <= 16; track += 1) {
+        for (const [token, raw] of WRITABLE) {
+          const transport = new FakeTransport().script("setNumeric", accepted);
+          const result = await writeAny(new OperationContext(transport, model), "recorder.source", { track }, token);
+          const label = `${model} ${track} ${token}`;
+          expect(result.planned, label).toBe(token);
+          expect(transport.calls.map(({ method, address, value }) => [method, address, value]), label).toEqual([
+            ["setNumeric", { paramId: 736, x: "0", y: `${track - 1}` }, raw],
+          ]);
+        }
+      }
+    }
+  });
+
+  it("refuse the read-only lanes on every track before any request, and report a failed write once", async () => {
+    for (const model of ["URX44", "URX44V"] as const) {
+      for (let track = 1; track <= 16; track += 1) {
+        for (const token of READ_ONLY) {
+          const label = `${model} ${track} ${token}`;
+          const args = ["recorder.source", { track }, token] as unknown as WriteArgs;
+          expect(() => previewSetting(model, ...args), label).toThrow(/unsupported_operation/);
+          const none = new FakeTransport();
+          expect((await failed(writeSetting(new OperationContext(none, model), ...args)))?.code, label).toBe("unsupported_operation");
+          expect(none.calls, label).toEqual([]);
+        }
+      }
+      // A rejection or a timeout is the operation's result: one request, no resend.
+      for (const [record, code] of [
+        [{ kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } }, "device_rejected"],
+        [{ kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } }, "response_timeout"],
+      ] as const) {
+        for (const track of [1, 2, 15, 16]) {
+          const transport = new FakeTransport().script("setNumeric", record, accepted);
+          expect((await failed(writeAny(new OperationContext(transport, model), "recorder.source", { track }, "mix-1-left")))?.code, `${model} ${track}`).toBe(code);
+          expect(transport.calls.length, `${model} ${track}`).toBe(1);
+        }
+      }
     }
   });
 });
