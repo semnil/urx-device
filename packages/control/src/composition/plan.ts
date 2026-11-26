@@ -61,12 +61,12 @@ function invalid(): never {
 }
 
 /** Builds the plan, refusing the whole file before any write on a missing or invalid value or an over-limit plan. */
-export function planCurrent(file: UrxfFile, model: Model): CurrentPlan {
+export function planCurrent(file: UrxfFile, model: Model, limit: number = PLAN_ITEM_LIMIT): CurrentPlan {
   const chunk = file.current;
   const steps: PlannedStep[] = [];
   const omissions: Omission[] = [];
   const room = () => {
-    if (steps.length + omissions.length >= PLAN_ITEM_LIMIT) {
+    if (steps.length + omissions.length >= limit) {
       invalid();
     }
   };

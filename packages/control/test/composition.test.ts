@@ -131,6 +131,31 @@ describe("CURRENT composition (K36, F18)", () => {
     }
   });
 
+  it("refuse the whole file for a stored value the setting cannot write, and for a plan over its bound", () => {
+    for (const model of models) {
+      // A stored name of nine code points reads, but no write takes it: the file is refused, not the row omitted.
+      const tooLong = synthesize(model, { "18:0": "NineChars" });
+      const failure = (() => {
+        try {
+          planCurrent(tooLong, model);
+          return undefined;
+        } catch (error) {
+          return operationFailureOf(error)?.code;
+        }
+      })();
+      expect(failure, model).toBe("invalid_input");
+      // F18-Q: steps and omissions together within the bound; one item over it refuses the file.
+      const file = synthesize(model);
+      const size = (() => {
+        const plan = planCurrent(file, model);
+        return plan.steps.length + plan.omissions.length;
+      })();
+      expect(size, model).toBeLessThanOrEqual(PLAN_ITEM_LIMIT);
+      expect(() => planCurrent(file, model, size), model).not.toThrow();
+      expect(() => planCurrent(file, model, size - 1), model).toThrow(/invalid_input/);
+    }
+  });
+
   it("omit the automatically controlled values the file enables (F18-C), and fail whole on a missing value", () => {
     const base = planCurrent(synthesize("URX22"), "URX22");
     const oneKnob = planCurrent(synthesize("URX22", { "42:0": 1 }), "URX22");
