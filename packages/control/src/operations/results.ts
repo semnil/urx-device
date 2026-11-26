@@ -37,8 +37,7 @@ export type UnverifiedCondition =
  * null where that needs a context an unsent write can change, and the
  * conditions left unverified, in check order.
  */
-export interface DryRunPlan<V> {
-  readonly requested: V;
+export interface DryRunPlan<V> extends Omit<WritePlan<V>, "planned"> {
   readonly planned: V | null;
   readonly unverified: readonly UnverifiedCondition[];
 }

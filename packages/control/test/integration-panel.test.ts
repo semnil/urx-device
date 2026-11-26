@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { dryRunSetting, previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, dryRunSettingAfter, previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { settingHandlers } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
@@ -238,5 +238,9 @@ describe("knob assignment review fixes (PR #32)", () => {
     expect(preview.requested).toEqual(MON);
     expect(dry.planned).toEqual(MON);
     expect(Object.isFrozen(result.requested)).toBe(true);
+    // The steps are typed on every preview path, a dry run after unsent writes included.
+    const after = await dryRunSettingAfter(new OperationContext(new FakeTransport(), "URX44"), new Set(), "knob.assignment", { bank: 1, knob: "a" }, MON);
+    const names: readonly string[] | undefined = after.steps?.map((step) => step.component);
+    expect(names).toEqual(["function", "parameter1", "parameter2"]);
   });
 });
