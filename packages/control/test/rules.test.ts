@@ -1,5 +1,8 @@
 import { settingHandlers } from "../src/operations/registry.js";
 import { type SelectorRule } from "../src/catalog/rules.js";
+import { validateSetting } from "../src/operations/registry.js";
+import { dryRunSetting } from "../src/operations/registry.js";
+import { dryRunSettingAfter } from "../src/operations/registry.js";
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
 import { BASIC_RULES } from "../src/catalog/basic-rules.js";
@@ -291,8 +294,38 @@ describe("selector judgments from the published catalog match the operations", (
     }
     return "planned";
   };
+  /** Every write entry's verdict for one value: each must equal the catalog's, with the sent value and request count. */
+  const everyPath = async (model: string, id: string, target: object, token: string) => {
+    const args = [id, target, token] as unknown as WriteArgs;
+    const code = (run: () => unknown) => {
+      try {
+        run();
+        return "planned";
+      } catch (error) {
+        return operationFailureOf(error)?.code;
+      }
+    };
+    const settle = (promise: () => Promise<unknown>) =>
+      Promise.resolve()
+        .then(promise)
+        .then(
+          () => "planned",
+          (error: unknown) => operationFailureOf(error)?.code,
+        );
+    const dry = new FakeTransport();
+    const after = new FakeTransport();
+    const write = new FakeTransport().script("setNumeric", { kind: "success", value: null, evidence: { state: "accepted" } });
+    const verdicts = {
+      validate: code(() => validateSetting(model, ...args)),
+      preview: code(() => previewSetting(model, ...args)),
+      dryRun: await settle(() => dryRunSetting(new OperationContext(dry, model), ...args)),
+      dryRunAfter: await settle(() => dryRunSettingAfter(new OperationContext(after, model), new Set(["geq_type_selected"]), ...args)),
+      write: await settle(() => writeSetting(new OperationContext(write, model), ...args)),
+    };
+    return { verdicts, previews: dry.calls.length + after.calls.length, sent: write.calls.map((call) => call.value) };
+  };
 
-  it("for the channel input source and Rec Point on every model and channel kind", () => {
+  it("for the channel input source and Rec Point on every model and channel kind", async () => {
     const source = settingDefinitions["channel.source"].rule.value as SelectorRule;
     const recPoint = settingDefinitions["channel.rec-point"].rule.value as { rules: { mono: SelectorRule; stereo: SelectorRule } };
     for (const model of ["URX22", "URX44", "URX44V"] as const) {
@@ -310,6 +343,30 @@ describe("selector judgments from the published catalog match the operations", (
           const verdict = judge(rule, model, token);
           expect(operation(model, "channel.rec-point", { channel }, token), `${model} ${kind} ${token}`).toBe(verdict.startsWith("planned") ? "planned" : verdict);
         }
+      }
+    }
+    // Every write entry, with the sent value and the request count, agrees with the catalog.
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      const mono = MONO_CHANNELS[model][0] as number;
+      const stereo = STEREO_CHANNELS[model][0] as number;
+      const cases: [string, object, SelectorRule, string][] = [
+        ...[...source.known, "Input-1"].flatMap((token): [string, object, SelectorRule, string][] => [
+          ["channel.source", { channel: mono }, source, token],
+          ["channel.source", { channel: stereo, side: "right" }, source, token],
+        ]),
+        ...[...recPoint.rules.mono.known, "pre-anything"].flatMap((token): [string, object, SelectorRule, string][] => [
+          ["channel.rec-point", { channel: mono }, recPoint.rules.mono, token],
+          ["channel.rec-point", { channel: stereo }, recPoint.rules.stereo, token],
+        ]),
+      ];
+      for (const [id, target, rule, token] of cases) {
+        const verdict = judge(rule, model, token);
+        const expected = verdict.startsWith("planned") ? "planned" : verdict;
+        const label = `${model} ${id} ${JSON.stringify(target)} ${token}`;
+        const { verdicts, previews, sent } = await everyPath(model, id, target, token);
+        expect(verdicts, label).toEqual({ validate: expected, preview: expected, dryRun: expected, dryRunAfter: expected, write: expected });
+        expect(previews, label).toBe(0);
+        expect(sent, label).toEqual(verdict.startsWith("planned") ? [verdict.slice("planned ".length)] : []);
       }
     }
     // A port another model takes is unsupported here, from the catalog alone.
