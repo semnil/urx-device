@@ -49,7 +49,8 @@ export class ConsoleLockGuard implements WriteGuard {
       guard.#subscription = context.transport.prepareSubscription([CONSOLE_LOCK_ADDRESS], operation, (notification) => guard.#deliver(notification));
       await guard.#subscription.activate();
     } catch (error) {
-      await guard.release();
+      // The failed registration is the first failure; a failing release does not replace it.
+      await guard.release().catch(() => undefined);
       throw operationFailureOf(error) === undefined ? new OperationFailureError({ code: "internal_error", phase: "admission", progress: null }) : error;
     }
     return guard;

@@ -146,13 +146,14 @@ export class OperationContext {
 
   /**
    * The send boundary of every setting write: a latched guard stop refuses
-   * it before it is handed over (admission), so it is reported not sent.
+   * it before it is handed over (admission), so it is reported not sent,
+   * with the operation's first stopping cause where guards latched in turn.
    */
   #checkWriteGuard(): void {
     for (const guard of this.#writeGuards) {
       const stop = guard.stop;
       if (stop !== undefined) {
-        throw new OperationFailureError({ code: stop, phase: "admission", progress: null });
+        throw new OperationFailureError({ code: this.#stopping ?? stop, phase: "admission", progress: null });
       }
     }
   }

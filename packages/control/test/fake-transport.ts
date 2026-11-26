@@ -54,6 +54,8 @@ export class FakeTransport implements Transport {
   }[] = [];
   /** When set, `activate` rejects with it (after the subscription is marked released). */
   activation: Error | undefined;
+  /** When set, `release` rejects with it (after the subscription is marked released). */
+  releaseFailure: Error | undefined;
 
   prepareSubscription(
     addresses: readonly ParameterAddress[],
@@ -72,6 +74,9 @@ export class FakeTransport implements Transport {
       },
       release: async () => {
         entry.state = "released";
+        if (this.releaseFailure !== undefined) {
+          throw this.releaseFailure;
+        }
       },
     };
   }

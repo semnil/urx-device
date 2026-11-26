@@ -10,7 +10,7 @@ import { PLAN_ITEM_LIMIT, planCurrent } from "../src/composition/plan.js";
 import { targetsOf } from "../src/composition/targets.js";
 import { ConsoleLockGuard } from "../src/operations/console-lock.js";
 import { OperationContext } from "../src/operations/context.js";
-import { operationFailureOf } from "../src/operations/failure.js";
+import { OperationFailureError, operationFailureOf } from "../src/operations/failure.js";
 import { settingHandlers, validateSetting, type WriteArgs } from "../src/operations/registry.js";
 import { codecOf } from "../src/operations/rules.js";
 import { FakeTransport } from "./fake-transport.js";
@@ -484,10 +484,121 @@ describe("CURRENT composition (K36, F18)", () => {
     expect(observedAtRead).toBe("active");
     const invalid = await scheduled([["at", 1, rate("-1")]]);
     expect([invalid.outcome.error, invalid.outcome.steps[1]?.outcome]).toEqual(["invalid_response", "not_sent"]);
+    // A rate notification is judged by the rate read's codec: a rate the unit cannot run is invalid, not a mismatch.
+    const unknown = await scheduled([["at", 1, rate("32000")]]);
+    expect([unknown.outcome.error, unknown.outcome.steps[1]?.outcome]).toEqual(["invalid_response", "not_sent"]);
     // A failed rate observation or read prevents every write, keeping its cause.
     const readFails = new FakeTransport().script("getNumeric", read("0"), new Error("adapter failure"));
     const noRead = await apply(readFails);
     expect(noRead.error).toBe("internal_error");
     expect(readFails.calls.filter((c) => c.method.startsWith("set"))).toEqual([]);
+  });
+
+  it("report the first cause that stopped the import, in a dry run and at execution", async () => {
+    const plan = planCurrent(synthesize("URX22"), "URX22");
+    const head = { ...plan, steps: plan.steps.filter((s) => s.planned !== null).slice(0, 3), omissions: [] };
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
+    const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
+    const lock = (value: string) => ({ kind: "numeric", address: { paramId: 895, x: "0", y: "0" }, value }) as const;
+    const rate = (value: string) => ({ kind: "numeric", address: { paramId: 766, x: "0", y: "0" }, value }) as const;
+    type Note = { readonly kind: "numeric"; readonly address: { readonly paramId: number; readonly x: string; readonly y: string }; readonly value: string };
+    /** A reply that delivers `notes` before it settles with `record`. */
+    const after = (t: FakeTransport, notes: readonly Note[], record: unknown) => ({
+      then(resolve: (value: unknown) => void) {
+        for (const note of notes) t.notify(note);
+        resolve(record);
+      },
+    });
+    const apply = async (build: (t: FakeTransport) => void, dryRun = false) => {
+      const t = new FakeTransport();
+      build(t);
+      const context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      try {
+        return { result: await applyCurrent(context, head, { guard, dryRun }), t };
+      } finally {
+        await guard.release();
+      }
+    };
+    // Dry run: a lock, a rate change, or an invalid one during the rate read stops it, though no later step reads.
+    for (const [note, code] of [
+      [lock("1"), "precondition_failed"],
+      [lock("2"), "invalid_response"],
+      [rate("96000"), "precondition_failed"],
+      [rate("32000"), "invalid_response"],
+    ] as const) {
+      const { result, t } = await apply((t) => t.script("getNumeric", read("0"), after(t, [note], read("48000"))), true);
+      expect([result.error, ...result.steps.map((s) => s.outcome)], JSON.stringify(note)).toEqual([code, "not_sent", "not_sent", "not_sent"]);
+      expect(t.calls.filter((c) => c.method.startsWith("set"))).toEqual([]);
+    }
+    // Execution: a rate change, then an invalid lock value, keeps the rate's cause; the reverse keeps the lock's.
+    for (const [notes, code] of [
+      [[rate("96000"), lock("2")], "precondition_failed"],
+      [[lock("2"), rate("96000")], "invalid_response"],
+    ] as const) {
+      const { result } = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", after(t, notes, accepted), accepted, accepted).script("setText", accepted, accepted, accepted));
+      // The refused step reports the same first cause.
+      expect([result.error, ...result.steps.map((s) => `${s.outcome} ${s.error}`)], JSON.stringify(notes)).toEqual([code, "accepted null", `not_sent ${code}`, "not_sent null"]);
+    }
+    // During the rate read, an invalid lock value before a mismatched rate: the lock's cause stays.
+    const early = await apply((t) => t.script("getNumeric", read("0"), after(t, [lock("2")], read("96000"))));
+    expect(early.result.error).toBe("invalid_response");
+    // A sent write rejected after a lock: the step keeps its rejection, the import the lock.
+    const raced = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, after(t, [lock("1")], rejected), accepted).script("setText", accepted, accepted, accepted));
+    expect([raced.result.error, ...raced.result.steps.map((s) => `${s.outcome} ${s.error}`)]).toEqual([
+      "precondition_failed",
+      "accepted null",
+      "rejected device_rejected",
+      "not_sent null",
+    ]);
+    // A lock after every write was accepted leaves the accepted import a success.
+    const late = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, after(t, [lock("1")], accepted)).script("setText", accepted, accepted, after(t, [lock("1")], accepted)));
+    expect([late.result.error, ...late.result.steps.map((s) => s.outcome)]).toEqual([null, "accepted", "accepted", "accepted"]);
+  });
+
+  it("keep the first failure and every step's result when the rate observation's release fails", async () => {
+    const plan = planCurrent(synthesize("URX22"), "URX22");
+    const head = { ...plan, steps: plan.steps.filter((s) => s.planned !== null).slice(0, 2), omissions: [] };
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
+    const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
+    const lost = new OperationFailureError({ code: "connection_lost", phase: "response", progress: null });
+    const apply = async (build: (t: FakeTransport) => void, activation?: Error) => {
+      const t = new FakeTransport();
+      build(t);
+      const context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      t.activation = activation;
+      t.releaseFailure = lost;
+      try {
+        return await applyCurrent(context, head, { guard });
+      } finally {
+        await guard.release().catch(() => undefined);
+      }
+    };
+    const outcomes = (result: { error: string | null; cleanup: string | null; steps: readonly { outcome: string }[] }) => [
+      result.error,
+      result.cleanup,
+      ...result.steps.map((s) => s.outcome),
+    ];
+    // The rate registration fails: its own cause stays, the failed release beside it.
+    const activation = await apply((t) => t.script("getNumeric", read("0")), new OperationFailureError({ code: "device_rejected", phase: "response", progress: null }));
+    expect(outcomes(activation)).toEqual(["device_rejected", "connection_lost", "not_sent", "not_sent"]);
+    // The rate read fails.
+    const readFails = await apply((t) => t.script("getNumeric", read("0"), { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } }));
+    expect(outcomes(readFails)).toEqual(["response_timeout", "connection_lost", "not_sent", "not_sent"]);
+    // The second write is rejected: the accepted and rejected steps are still returned.
+    const second = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, rejected).script("setText", accepted, rejected));
+    expect(outcomes(second)).toEqual(["device_rejected", "connection_lost", "accepted", "rejected"]);
+    // Every write accepted: the release is the first failure.
+    const all = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted).script("setText", accepted, accepted));
+    expect(outcomes(all)).toEqual(["connection_lost", "connection_lost", "accepted", "accepted"]);
+    // A released observation reports no cleanup failure.
+    const t = new FakeTransport().script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted).script("setText", accepted, accepted);
+    const context = new OperationContext(t, "URX22");
+    const guard = await ConsoleLockGuard.open(context);
+    expect(outcomes(await applyCurrent(context, head, { guard }))).toEqual([null, null, "accepted", "accepted"]);
+    await guard.release();
   });
 });

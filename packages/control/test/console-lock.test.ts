@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CONSOLE_LOCK_ADDRESS, ConsoleLockGuard } from "../src/operations/console-lock.js";
 import { OperationContext } from "../src/operations/context.js";
-import { operationFailureOf } from "../src/operations/failure.js";
+import { OperationFailureError, operationFailureOf } from "../src/operations/failure.js";
 import { readSetting, writeSetting } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
@@ -110,6 +110,14 @@ describe("Console Lock write guard (F20-L-A)", () => {
     a.notify({ kind: "numeric", address: lock, value: "1" });
     expect(other.stopping).toBeUndefined();
     await guard.release();
+  });
+
+  it("keep a failed registration's cause when its release also fails", async () => {
+    const t = new FakeTransport();
+    t.activation = new OperationFailureError({ code: "device_rejected", phase: "response", progress: null });
+    t.releaseFailure = new OperationFailureError({ code: "connection_lost", phase: "response", progress: null });
+    expect((await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44"))))?.code).toBe("device_rejected");
+    expect(t.finished).toBe(1);
   });
 
   it("leave an operation that is not attached alone: a read-only line still reads after a lock", async () => {

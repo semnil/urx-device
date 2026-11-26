@@ -14,7 +14,9 @@ import type { OperationContext, WriteGuard } from "../operations/context.js";
 import type { OperationCause } from "../operations/failure.js";
 import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "../operations/transport.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
+import { DEVICE_RULES } from "../catalog/device.js";
 import { dryRunSettingAfter, readSetting, writeSetting, type WriteArgs } from "../operations/registry.js";
+import { codecOf } from "../operations/rules.js";
 import type { UnverifiedCondition, WriteOutcome } from "../operations/results.js";
 import type { CurrentPlan, PlannedStep } from "./plan.js";
 
@@ -28,8 +30,15 @@ export interface StepResult extends PlannedStep {
 
 export interface ApplyResult {
   readonly steps: readonly StepResult[];
-  /** The overall failure code, or null when every step was accepted (or planned in a dry-run). */
+  /**
+   * The overall failure code: the operation's first stopping cause where one
+   * stopped it, otherwise the first failure (a failed release of the rate
+   * observation included); null when every step was accepted (or planned in
+   * a dry-run) and the observation released.
+   */
   readonly error: string | null;
+  /** The rate observation's release failure code, reported even after an earlier failure; null when released or never registered. */
+  readonly cleanup: string | null;
 }
 
 /** The device sample rate (F11-C): 766, x 0, y 0. */
@@ -55,6 +64,7 @@ class RateWatch implements WriteGuard {
     return this.#stop;
   }
 
+  /** Judged by the same rate codec as the rate read: a value it does not decode is invalid. */
   deliver(notification: TransportNotification): void {
     if (notification.kind === "text" && sameAddress(notification.address, RATE_ADDRESS)) {
       this.latch("invalid_response");
@@ -62,9 +72,10 @@ class RateWatch implements WriteGuard {
     if (notification.kind !== "numeric" || !sameAddress(notification.address, RATE_ADDRESS)) {
       return;
     }
-    if (!/^(0|[1-9][0-9]*)$/.test(notification.value)) {
+    const rate = RATE_CODEC.decode(notification.value);
+    if (rate === undefined) {
       this.latch("invalid_response");
-    } else if (Number(notification.value) !== this.#fileRate) {
+    } else if (rate !== this.#fileRate) {
       this.latch("precondition_failed");
     }
   }
@@ -79,24 +90,37 @@ class RateWatch implements WriteGuard {
 
 const sameAddress = (a: ParameterAddress, b: ParameterAddress) => a.paramId === b.paramId && a.x === b.x && a.y === b.y;
 
+/** The device sample rate's codec, shared with its read (F11-C). */
+const RATE_CODEC = codecOf(DEVICE_RULES["device.sample-rate"].value);
+
+/** An observation's outcome: its first failure, and the release that reports its own failure. */
+interface RateObservation {
+  readonly error: string | null;
+  readonly release: () => Promise<string | null>;
+}
+
 /**
  * Registers the rate observation, then makes the one rate read (L3, L5):
- * a mismatch is a failed precondition and a missing or invalid file value
- * invalid input, both before any write. The clock is never written from the
- * file. The returned function releases the observation.
+ * a mismatch is a failed precondition before any write. The clock is never
+ * written from the file. A failure is the operation's first stopping cause
+ * where one stopped it. The observation's release is always returned, and
+ * reports its own failure instead of replacing an earlier one.
  */
-async function watchRate(context: OperationContext, fileRate: number): Promise<() => Promise<void>> {
+async function watchRate(context: OperationContext, fileRate: number): Promise<RateObservation> {
   const watch = new RateWatch(context, fileRate);
   let operation: TransportOperation;
   try {
     operation = context.transport.createOperation();
   } catch {
-    throw new OperationFailureError({ code: "internal_error", phase: "admission", progress: null });
+    return { error: "internal_error", release: async () => null };
   }
   let subscription: TransportSubscription | undefined;
   const release = async () => {
     try {
       await subscription?.release();
+      return null;
+    } catch (error) {
+      return operationFailureOf(error)?.code ?? "internal_error";
     } finally {
       operation.finish();
     }
@@ -109,14 +133,10 @@ async function watchRate(context: OperationContext, fileRate: number): Promise<(
     if (device.value !== fileRate) {
       watch.latch("precondition_failed");
     }
-    if (watch.stop !== undefined) {
-      throw new OperationFailureError({ code: watch.stop, phase: "preparation", progress: null });
-    }
+    return { error: watch.stop === undefined ? null : (context.stopping ?? watch.stop), release };
   } catch (error) {
-    await release();
-    throw operationFailureOf(error) === undefined ? new OperationFailureError({ code: "internal_error", phase: "admission", progress: null }) : error;
+    return { error: context.stopping ?? operationFailureOf(error)?.code ?? "internal_error", release };
   }
-  return release;
 }
 
 /**
@@ -134,23 +154,24 @@ export async function applyCurrent(
   options: { readonly guard: ConsoleLockGuard; readonly dryRun?: boolean },
 ): Promise<ApplyResult> {
   const results: StepResult[] = plan.steps.map((step) => ({ ...step, outcome: "not_sent", error: null, unverified: [] }));
-  const failWith = (index: number, error: unknown, outcome: WriteOutcome): ApplyResult => {
+  const failWith = (index: number, error: unknown, outcome: WriteOutcome): Outcome => {
     const failure = operationFailureOf(error);
     const step = results[index] as StepResult;
     // The operation's own planned value, where it settled one before failing (a live-prerequisite step included).
     const progress = failure?.progress as { planned?: unknown } | null | undefined;
     const planned = progress !== null && progress !== undefined && "planned" in progress ? progress.planned : step.planned;
     results[index] = { ...step, planned, outcome, error: failure?.code ?? "internal_error" };
-    return { steps: results, error: failure?.code ?? "internal_error" };
+    // The step keeps its own outcome and code; the overall error is the first cause that stopped the import.
+    return { steps: results, error: context.stopping ?? failure?.code ?? "internal_error" };
   };
   if (context.model !== plan.model) {
-    return { steps: results, error: "invalid_input" };
+    return { steps: results, error: "invalid_input", cleanup: null };
   }
   let detach: () => void;
   try {
     detach = await options.guard.begin(context);
   } catch (error) {
-    return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error" };
+    return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error", cleanup: null };
   }
   try {
     return await run(context, plan, results, failWith, options.dryRun === true);
@@ -159,37 +180,47 @@ export async function applyCurrent(
   }
 }
 
+/** The steps and overall error before the observation's release is added. */
+type Outcome = Omit<ApplyResult, "cleanup">;
+
 async function run(
   context: OperationContext,
   plan: CurrentPlan,
   results: StepResult[],
-  failWith: (index: number, error: unknown, outcome: WriteOutcome) => ApplyResult,
+  failWith: (index: number, error: unknown, outcome: WriteOutcome) => Outcome,
   dryRun: boolean,
 ): Promise<ApplyResult> {
-  let releaseRate: () => Promise<void>;
+  const rate = await watchRate(context, plan.fileRate);
+  let outcome: Outcome | undefined;
   try {
-    releaseRate = await watchRate(context, plan.fileRate);
-  } catch (error) {
-    return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error" };
-  }
-  try {
-    return await runSteps(context, plan, results, failWith, dryRun);
+    outcome = rate.error !== null ? { steps: results, error: rate.error } : await runSteps(context, plan, results, failWith, dryRun);
   } finally {
-    await releaseRate();
+    const cleanup = await rate.release();
+    if (outcome !== undefined) {
+      // A release failure is the overall error only where nothing failed before it.
+      outcome = { ...outcome, error: outcome.error ?? cleanup, cleanup } as ApplyResult;
+    }
   }
+  return outcome as ApplyResult;
 }
 
 async function runSteps(
   context: OperationContext,
   plan: CurrentPlan,
   results: StepResult[],
-  failWith: (index: number, error: unknown, outcome: WriteOutcome) => ApplyResult,
+  failWith: (index: number, error: unknown, outcome: WriteOutcome) => Outcome,
   dryRun: boolean,
-): Promise<ApplyResult> {
+): Promise<Outcome> {
   // O13: in a dry run nothing is sent, so every earlier step stays a pending change to what later steps check.
   const pending = new PendingEffects();
+  // A dry run sends no write, so it checks the stop itself: before each step and before its result.
+  const stopped = () => (dryRun ? context.stopping : undefined);
   for (const [index, step] of plan.steps.entries()) {
     const args = [step.setting, step.target, step.requested] as unknown as WriteArgs;
+    const stop = stopped();
+    if (stop !== undefined) {
+      return failWith(index, new OperationFailureError({ code: stop, phase: "admission", progress: null }), "not_sent");
+    }
     try {
       if (dryRun) {
         const planned = await dryRunSettingAfter(context, pending.affecting(step), ...args);
@@ -205,7 +236,7 @@ async function runSteps(
       return failWith(index, error, progress?.outcome ?? "not_sent");
     }
   }
-  return { steps: results, error: null };
+  return { steps: results, error: stopped() ?? null };
 }
 
 /**
