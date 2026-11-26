@@ -247,12 +247,8 @@ struct Shared {
     /// How the link was lost, recorded before a `connection_lost` end is
     /// (R1-L-A). The first one recorded stands.
     loss: Mutex<Option<LinkLoss>>,
-    /// The frames the reader has completed, of every kind, and when the last
-    /// one was (R1-T-A). A frame the worker is handed is counted after it is
-    /// handed over, so every counted one is already in the worker's inbox.
-    arrivals: Mutex<Arrivals>,
-    /// Whether the worker waits for a late reply, so the reader wakes it for
-    /// frames it does not hand over.
+    /// Whether the worker waits for an owed reply (R1-T-A), so the reader
+    /// wakes it when one is no longer owed.
     awaiting_late: AtomicBool,
     /// Signalled when the worker settles its active request.
     settled: Condvar,
@@ -270,85 +266,71 @@ struct Shared {
     delivery_stop: AtomicBool,
 }
 
-/// See [`Shared::arrivals`].
-#[derive(Default, Clone, Copy)]
-struct Arrivals {
-    frames: u64,
-    last: Option<Instant>,
-}
-
 /// The reply still owed to a request whose response deadline was tolerated
-/// (R1-T-A). It is dropped wherever it arrives; a request with the same key
-/// is not sent while it is owed.
+/// (R1-T-A). The reader, which sees every frame in the order it arrives,
+/// drops it when it arrives, counts the frames that arrive meanwhile and ends
+/// the wait; a request with the same key is not sent while it is owed.
 struct Late {
     key: ReplyKey,
-    /// When the deadline passed.
-    since: Instant,
-    /// [`Arrivals::frames`] when the deadline passed.
-    frames: u64,
+    /// When the deadline passed, or the last frame since then arrived.
+    last: Instant,
+    /// Frames that have arrived since the deadline.
+    seen: u64,
     tolerance: Tolerance,
 }
 
 impl Late {
-    /// Whether the reply is no longer waited for: `late_reply_frames` frames
-    /// have arrived since the deadline, or none for `late_reply_quiet`.
-    fn expired(&self, arrivals: Arrivals, now: Instant) -> bool {
-        if arrivals.frames - self.frames >= self.tolerance.late_reply_frames as u64 {
-            return true;
-        }
-        let last = arrivals
-            .last
-            .map_or(self.since, |last| last.max(self.since));
-        now.saturating_duration_since(last) >= self.tolerance.late_reply_quiet
+    /// Whether the wait had ended by `at`: no frame for `late_reply_quiet`.
+    fn quiet_by(&self, at: Instant) -> bool {
+        at.saturating_duration_since(self.last) >= self.tolerance.late_reply_quiet
     }
 
-    fn quiet_end(&self, arrivals: Arrivals) -> Instant {
-        arrivals
-            .last
-            .map_or(self.since, |last| last.max(self.since))
-            + self.tolerance.late_reply_quiet
+    fn quiet_end(&self) -> Instant {
+        self.last + self.tolerance.late_reply_quiet
     }
 }
 
-impl Shared {
-    fn arrivals(&self) -> Arrivals {
-        *lock(&self.arrivals)
+/// One frame the reader completed at `at`, in arrival order (R1-T-A). The
+/// owed reply it is, if any, is no longer owed, and the unit answering ends
+/// the deadline run. Every other owed reply whose wait had not ended before
+/// `at` counts the frame, and is no longer owed once its frame budget is
+/// reached. `message` is `None` for a frame that cannot be a reply. Returns
+/// whether the frame was an owed reply, and whether any owed reply is no
+/// longer owed.
+fn note_frame(state: &mut State, message: Option<&Value>, at: Instant) -> (bool, bool) {
+    if state.late.is_empty() {
+        return (false, false);
     }
-
-    /// Counts one completed frame, and wakes a worker waiting for a late
-    /// reply when the frame is not handed to it.
-    fn arrived(&self, events: &Sender<Event>, handed_over: bool) {
-        {
-            let mut arrivals = lock(&self.arrivals);
-            arrivals.frames += 1;
-            arrivals.last = Some(Instant::now());
-        }
-        if !handed_over && self.awaiting_late.load(Ordering::SeqCst) {
-            let _ = events.send(Event::Wake);
-        }
-    }
-
-    /// Drops `message` if it is a late reply still owed (R1-T-A), which also
-    /// shows the unit answering. Owed replies no longer waited for are
-    /// forgotten first.
-    fn take_late_reply(&self, message: &Value) -> bool {
-        let mut state = self.lock();
-        if state.late.is_empty() {
+    let inbound = message.map(|message| Inbound::new(message.clone()));
+    let before = state.late.len();
+    let mut dropped = false;
+    state.late.retain_mut(|late| {
+        if late.quiet_by(at) {
             return false;
         }
-        let inbound = Inbound::new(message.clone());
-        if let Some(at) = state
-            .late
-            .iter()
-            .position(|late| inbound.reply(&late.key).is_some())
-        {
-            state.late.remove(at);
-            state.timeouts = 0;
-            return true;
+        let owed = inbound
+            .as_ref()
+            .is_some_and(|inbound| inbound.reply(&late.key).is_some());
+        if owed && !dropped {
+            dropped = true;
+            return false;
         }
-        let (arrivals, now) = (self.arrivals(), Instant::now());
-        state.late.retain(|late| !late.expired(arrivals, now));
-        false
+        late.seen += 1;
+        late.last = at;
+        late.seen < late.tolerance.late_reply_frames as u64
+    });
+    if dropped {
+        state.timeouts = 0;
+    }
+    (dropped, state.late.len() != before)
+}
+
+impl Shared {
+    /// Wakes a worker waiting for an owed reply.
+    fn wake_awaiting(&self, events: &Sender<Event>) {
+        if self.awaiting_late.load(Ordering::SeqCst) {
+            let _ = events.send(Event::Wake);
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -453,6 +435,9 @@ enum CloseState {
 pub struct Operation {
     id: u64,
     shared: Weak<Shared>,
+    /// The worker's inbox, to wake it when a request it waits to send is
+    /// cancelled.
+    events: Sender<Event>,
 }
 
 /// Opens the unit at `port`, which must report `online` with identity
@@ -536,7 +521,6 @@ impl Connection {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
             loss: Mutex::new(None),
-            arrivals: Mutex::new(Arrivals::default()),
             awaiting_late: AtomicBool::new(false),
             settled: Condvar::new(),
             advance: Condvar::new(),
@@ -632,6 +616,7 @@ impl Connection {
         Ok(Operation {
             id: state.next_owner,
             shared: Arc::downgrade(&self.shared),
+            events: self.events.clone(),
         })
     }
 
@@ -1133,6 +1118,9 @@ impl Operation {
             state.waiting_bytes = state.waiting.iter().map(|item| item.frame.len()).sum();
             (mine, *gate)
         };
+        // A request of this owner the worker waits to send, behind an owed
+        // reply (R1-T-A), stops waiting now rather than at the next frame.
+        let _ = self.events.send(Event::Wake);
         for item in cancelled {
             // Once the end is recorded, the waiting requests end with it.
             let outcome = match ended {
@@ -1453,8 +1441,12 @@ fn read_frames(
     while !stop.load(Ordering::SeqCst) {
         match reader.read_frame(&mut sock) {
             Ok(Some(frame)) => {
+                let at = Instant::now();
                 let Some(json) = frame.json else {
-                    shared.arrived(&events, false);
+                    let (_, freed) = note_frame(&mut shared.lock(), None, at);
+                    if freed {
+                        shared.wake_awaiting(&events);
+                    }
                     continue;
                 };
                 {
@@ -1472,7 +1464,10 @@ fn read_frames(
                     match route(&shared, &received, !overflowed) {
                         Routed::NotNotification => {}
                         Routed::Queued | Routed::Dropped => {
-                            shared.arrived(&events, false);
+                            let (_, freed) = note_frame(&mut shared.lock(), None, at);
+                            if freed {
+                                shared.wake_awaiting(&events);
+                            }
                             continue;
                         }
                         Routed::Overflow => {
@@ -1482,7 +1477,10 @@ fn read_frames(
                                 let _ = events
                                     .send(Event::ReadFailed(RequestCause::NotificationOverflow));
                             }
-                            shared.arrived(&events, false);
+                            let (_, freed) = note_frame(&mut shared.lock(), None, at);
+                            if freed {
+                                shared.wake_awaiting(&events);
+                            }
                             continue;
                         }
                     }
@@ -1490,10 +1488,18 @@ fn read_frames(
                         .notifications
                         .as_ref()
                         .map_or(0, |queue| lock(queue).accepted());
-                    if events.send(Event::Frame(received)).is_err() {
+                    // Under the state lock, so a reply becomes owed either
+                    // before this frame is judged or after it is in the
+                    // worker's inbox, where the worker looks for it.
+                    let mut state = shared.lock();
+                    let (owed, freed) = note_frame(&mut state, Some(&received.message), at);
+                    if !owed && events.send(Event::Frame(received)).is_err() {
                         return;
                     }
-                    shared.arrived(&events, true);
+                    drop(state);
+                    if freed {
+                        shared.wake_awaiting(&events);
+                    }
                 }
             }
             Ok(None) => {}
@@ -1629,13 +1635,10 @@ fn serve(
             }
             None => match inbox.recv() {
                 Ok(Event::Wake) => None,
-                Ok(Event::Frame(received)) => {
-                    shared.take_late_reply(&received.message);
-                    lost_notification(&received.message).then(|| {
-                        note_loss(&shared, LinkLoss::UnitLost);
-                        RequestCause::ConnectionLost
-                    })
-                }
+                Ok(Event::Frame(received)) => lost_notification(&received.message).then(|| {
+                    note_loss(&shared, LinkLoss::UnitLost);
+                    RequestCause::ConnectionLost
+                }),
                 Ok(Event::ReadFailed(cause)) => Some(cause),
                 Err(_) => return,
             },
@@ -2285,14 +2288,40 @@ fn execute(
                     if state.timeouts >= tolerance.limit {
                         return (outcome, Some(RequestCause::ResponseTimeout));
                     }
-                    // The request completes now; its reply is still owed.
-                    let late = Late {
+                    // The request completes now; its reply is still owed,
+                    // unless no frame at all may be waited for.
+                    if tolerance.late_reply_frames == 0 {
+                        return (outcome, None);
+                    }
+                    state.late.push(Late {
                         key: key.clone(),
-                        since: Instant::now(),
-                        frames: shared.arrivals().frames,
+                        last: Instant::now(),
+                        seen: 0,
                         tolerance,
-                    };
-                    state.late.push(late);
+                    });
+                    // A frame the reader handed over before the reply became
+                    // owed is in the inbox now, and none can join it while
+                    // the state lock is held: the reply among them is dropped.
+                    while let Ok(event) = inbox.try_recv() {
+                        match event {
+                            Event::Frame(received) => {
+                                if Inbound::new(received.message.clone()).reply(key).is_some() {
+                                    if let Some(at) =
+                                        state.late.iter().rposition(|late| &late.key == key)
+                                    {
+                                        state.late.remove(at);
+                                    }
+                                    state.timeouts = 0;
+                                } else if lost_notification(&received.message) {
+                                    drop(state);
+                                    note_loss(shared, LinkLoss::UnitLost);
+                                    return (outcome, Some(RequestCause::ConnectionLost));
+                                }
+                            }
+                            Event::Wake => {}
+                            Event::ReadFailed(cause) => return (outcome, Some(cause)),
+                        }
+                    }
                     (outcome, None)
                 }
                 None => (outcome, failed.ends),
@@ -2301,12 +2330,11 @@ fn execute(
     }
 }
 
-/// Waits, before a request is sent, until no late reply with its `key` is
-/// owed (R1-T-A): each such reply is waited for until it arrives,
-/// `late_reply_frames` frames have arrived since its deadline, or none has
-/// for `late_reply_quiet`. The wait ends early at `send_end` or when the
-/// request must not start, leaving those to the send. Returns the cause that
-/// ends the connection, if one arrives first.
+/// Waits, before a request is sent, until no reply with its `key` is owed
+/// (R1-T-A): until the reader drops it, its frame budget is reached, or no
+/// frame has arrived for `late_reply_quiet`. The wait ends early at
+/// `send_end` or once the request must not start, leaving those to the send.
+/// Returns the cause that ends the connection, if one arrives first.
 fn await_late_reply(
     inbox: &Receiver<Event>,
     shared: &Shared,
@@ -2314,37 +2342,12 @@ fn await_late_reply(
     send_end: Instant,
     unstarted: &dyn Fn(&State) -> Option<Stop>,
 ) -> Option<RequestCause> {
-    let owed = |state: &State| state.late.iter().any(|late| &late.key == key);
-    if !owed(&shared.lock()) {
-        return None;
-    }
-    shared.awaiting_late.store(true, Ordering::SeqCst);
     let ended = loop {
+        // Before the state is read, so a reply the reader frees meanwhile
+        // wakes this wait.
+        shared.awaiting_late.store(true, Ordering::SeqCst);
         if let Some(cause) = *shared.link_end() {
             break Some(cause);
-        }
-        // What the inbox holds first: every frame counted below is in it.
-        let arrivals = shared.arrivals();
-        let mut ended = None;
-        while let Ok(event) = inbox.try_recv() {
-            match event {
-                Event::Frame(received) => {
-                    shared.take_late_reply(&received.message);
-                    if lost_notification(&received.message) {
-                        note_loss(shared, LinkLoss::UnitLost);
-                        ended = Some(RequestCause::ConnectionLost);
-                        break;
-                    }
-                }
-                Event::Wake => {}
-                Event::ReadFailed(cause) => {
-                    ended = Some(cause);
-                    break;
-                }
-            }
-        }
-        if ended.is_some() {
-            break ended;
         }
         let now = Instant::now();
         let wait_until = {
@@ -2352,14 +2355,14 @@ fn await_late_reply(
             if unstarted(&state).is_some() {
                 break None;
             }
-            state.late.retain(|late| !late.expired(arrivals, now));
-            let ends = state
+            state.late.retain(|late| !late.quiet_by(now));
+            let owed = state
                 .late
                 .iter()
                 .filter(|late| &late.key == key)
-                .map(|late| late.quiet_end(arrivals))
+                .map(Late::quiet_end)
                 .max();
-            match ends {
+            match owed {
                 None => break None,
                 Some(end) => end.min(send_end),
             }
@@ -2369,7 +2372,6 @@ fn await_late_reply(
         }
         match inbox.recv_timeout(wait_until.saturating_duration_since(now)) {
             Ok(Event::Frame(received)) => {
-                shared.take_late_reply(&received.message);
                 if lost_notification(&received.message) {
                     note_loss(shared, LinkLoss::UnitLost);
                     break Some(RequestCause::ConnectionLost);
@@ -2640,9 +2642,6 @@ fn exchange(
                 if lost_notification(&received.message) {
                     note_loss(shared, LinkLoss::UnitLost);
                     return unconfirmed(RequestCause::ConnectionLost);
-                }
-                if shared.take_late_reply(&received.message) {
-                    continue;
                 }
                 let inbound = Inbound::new(received.message);
                 if inbound.reply(key).is_some() {

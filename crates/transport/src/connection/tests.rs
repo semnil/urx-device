@@ -1074,12 +1074,34 @@ fn a_late_reply_frame_budget_of_zero_waits_for_nothing() {
     );
 }
 
+/// A unit that answers its parameter GETs, counted from 1, with what `answer` returns
+/// for that count and the request's own uri.
+fn counting_gets(answer: impl Fn(usize, &str) -> Vec<Vec<u8>> + Send + Sync + 'static) -> Peer {
+    let reads = Arc::new(std::sync::Mutex::new(0));
+    unit(move |request| {
+        let uri = uri_of(request).to_string();
+        let n = {
+            let mut reads = reads.lock().unwrap();
+            *reads += 1;
+            *reads
+        };
+        answer(n, &uri)
+    })
+}
+
+fn value_reply(uri: &str, value: i64) -> Vec<u8> {
+    get_reply(uri, json!({ "current_value": value, "response_code": 200 }))
+}
+
 #[test]
 fn a_late_reply_between_tolerated_deadlines_starts_the_count_again() {
-    // The first read is answered after its deadline; the reads of other addresses after it
-    // are never answered. With a limit of two, the late answer starts the count again, so
+    // Nothing is answered; the first read's answer comes when the second read is received,
+    // so it lands between the two deadlines. With a limit of two it starts the count again:
     // the second unanswered read leaves the connection open and the third ends it.
-    let peer = answering_gets(vec![Some((Duration::from_millis(200), 111)), None, None]);
+    let peer = counting_gets(|n, _| match n {
+        2 => vec![value_reply("/vd/parameters/1:0:0", 111)],
+        _ => vec![],
+    });
     let connection = open(peer.port, ID, &tolerating(2), &Control::new()).unwrap();
     let operation = connection.create_operation().unwrap();
     let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
@@ -1087,10 +1109,111 @@ fn a_late_reply_between_tolerated_deadlines_starts_the_count_again() {
     let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
     assert_eq!(outcome(&second), timed_out());
     assert_eq!(connection.terminal(), None);
+    assert_eq!(connection.timeouts_in_a_row(), 1);
     let third = submit(&connection, &operation, Request::GetNumeric(address(3)));
     assert_eq!(outcome(&third), timed_out());
     wait_until(|| connection.terminal().is_some());
     assert_eq!(connection.terminal(), Some(RequestCause::ResponseTimeout));
+}
+
+#[test]
+fn an_owed_reply_behind_another_reply_is_dropped_in_arrival_order() {
+    // The first read of address 1 goes unanswered. The read of address 2 is answered with
+    // its own reply, the first read's late answer and a notification, at once: with a budget
+    // of three frames the late answer is the second of them, so it is still owed, and is
+    // dropped. The next read of address 1 gets its own value.
+    let peer = counting_gets(|n, uri| match n {
+        1 => vec![],
+        // Late enough that the next read is queued by then.
+        2 => {
+            thread::sleep(Duration::from_millis(100));
+            vec![
+                value_reply(uri, 5),
+                value_reply("/vd/parameters/1:0:0", 111),
+                notification(),
+            ]
+        }
+        _ => vec![value_reply(uri, 222)],
+    });
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(500),
+        ..tolerating_with(3, Duration::from_secs(5), 3)
+    };
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    // Both queued before the first is answered, so the worker goes from one to the next
+    // with nothing else reading in between.
+    let other = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    let again = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&other), read(5));
+    assert_eq!(outcome(&again), read(222));
+}
+
+#[test]
+fn a_frame_after_the_quiet_does_not_start_the_wait_again() {
+    // The first read's answer never comes; a notification arrives 800 ms after its deadline,
+    // when the 500 ms quiet has already ended the wait. The next read of the address goes out
+    // at once rather than waiting a quiet again from that notification.
+    let peer = counting_gets(|n, uri| match n {
+        1 => {
+            thread::sleep(Duration::from_millis(900));
+            vec![notification()]
+        }
+        _ => vec![value_reply(uri, 222)],
+    });
+    let options = tolerating_with(3, Duration::from_millis(500), 64);
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let started = Instant::now();
+    let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    thread::sleep(Duration::from_millis(950).saturating_sub(started.elapsed()));
+    let asked = Instant::now();
+    let again = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&again), read(222));
+    assert!(
+        asked.elapsed() < Duration::from_millis(250),
+        "the read waited {:?}",
+        asked.elapsed()
+    );
+}
+
+#[test]
+fn cancelling_a_request_that_waits_for_an_owed_reply_stops_it_at_once() {
+    let peer = counting_gets(|n, uri| match n {
+        1 => vec![],
+        _ => vec![value_reply(uri, 7)],
+    });
+    let options = tolerating_with(3, Duration::from_secs(5), 64);
+    let connection = open(peer.port, ID, &options, &Control::new()).unwrap();
+    let first_owner = connection.create_operation().unwrap();
+    let waiting_owner = connection.create_operation().unwrap();
+    let first = submit(&connection, &first_owner, Request::GetNumeric(address(1)));
+    assert_eq!(outcome(&first), timed_out());
+    let waiting = submit(&connection, &waiting_owner, Request::GetNumeric(address(1)));
+    let other = submit(&connection, &first_owner, Request::GetNumeric(address(2)));
+    thread::sleep(Duration::from_millis(100));
+    let cancelled = Instant::now();
+    waiting_owner.cancel();
+    let stopped = outcome(&waiting);
+    assert!(
+        matches!(
+            stopped,
+            Outcome::Failure {
+                failure: RequestFailure::Cancelled { .. },
+                evidence: Evidence::NotSent
+            }
+        ),
+        "{stopped:?}"
+    );
+    assert!(
+        cancelled.elapsed() < Duration::from_millis(500),
+        "the cancel took {:?}",
+        cancelled.elapsed()
+    );
+    assert_eq!(outcome(&other), read(7));
 }
 
 #[test]
@@ -1500,7 +1623,6 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             loss: std::sync::Mutex::new(None),
-            arrivals: Default::default(),
             awaiting_late: std::sync::atomic::AtomicBool::new(false),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
