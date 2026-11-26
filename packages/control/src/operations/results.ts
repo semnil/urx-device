@@ -13,6 +13,8 @@ export interface Reading<V> {
 export interface WritePlan<V> {
   readonly requested: V;
   readonly planned: V;
+  /** For a composite setting: its component writes in order, all `not_sent` in a plan (O11). */
+  readonly steps?: readonly CompositeStep[];
 }
 
 /**
@@ -44,6 +46,15 @@ export interface DryRunPlan<V> {
 /** A dry run's plan with no earlier unsent write (O13): the value it would send, and nothing unverified. */
 export interface VerifiedPlan<V> extends WritePlan<V> {
   readonly unverified: readonly UnverifiedCondition[];
+}
+
+/**
+ * A composite read's failure (O12): the component whose request failed, or
+ * null when the operation was stopped before or between component requests.
+ * No component value is exposed.
+ */
+export interface CompositeReadProgress {
+  readonly failedComponent: string | null;
 }
 
 /** One component write of a composite setting, in planned order (O11). */

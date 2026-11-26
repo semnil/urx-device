@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, previewSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { settingHandlers } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
@@ -87,7 +87,15 @@ describe("knob assignments and bank (F12-K)", () => {
       expect((await failed(readAny(c, "knob.assignment", target)))?.code, JSON.stringify(target)).toBe("invalid_input");
     }
     expect(none.calls).toEqual([]);
-    expect(previewSetting("URX44", "knob.assignment", { bank: 3, knob: "d" }, MONITOR)).toEqual({ requested: MONITOR, planned: MONITOR });
+    expect(previewSetting("URX44", "knob.assignment", { bank: 3, knob: "d" }, MONITOR)).toEqual({
+      requested: MONITOR,
+      planned: MONITOR,
+      steps: [
+        { component: "function", requested: "Monitor", planned: "Monitor", outcome: "not_sent" },
+        { component: "parameter1", requested: "Monitor 2", planned: "Monitor 2", outcome: "not_sent" },
+        { component: "parameter2", requested: "Level", planned: "Level", outcome: "not_sent" },
+      ],
+    });
     for (const [raw, value] of [
       ["0", 1],
       ["3", 4],
@@ -175,5 +183,60 @@ describe("read-only settings expose no write path", () => {
       expect(["plan", "write", "validate", "dryRun"].filter((key) => key in handler), id).toEqual([]);
       expect(typeof handler["read"], id).toBe("function");
     }
+  });
+});
+
+async function failureOf(promise: Promise<unknown>) {
+  return operationFailureOf(await promise.then(() => undefined, (error: unknown) => error));
+}
+
+describe("knob assignment review fixes (PR #32)", () => {
+  const MON = { function: "Monitor", parameter1: "Monitor 1", parameter2: "Level" } as const;
+  const failed = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
+  const text = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+
+  it("name the component whose read failed, and none when stopped before a component request (O12)", async () => {
+    for (const [index, component] of ["function", "parameter1", "parameter2"].entries()) {
+      const records = [...[0, 1, 2].slice(0, index).map(() => text("x")), failed];
+      const t = new FakeTransport().script("getText", ...records);
+      const failure = await failureOf(readSetting(new OperationContext(t, "URX44"), "knob.assignment", { bank: 1, knob: "a" }));
+      expect([failure?.code, failure?.progress], component).toEqual(["device_rejected", { failedComponent: component }]);
+      expect(t.calls.length, component).toBe(index + 1);
+    }
+    const stopped = new FakeTransport();
+    const c = new OperationContext(stopped, "URX44");
+    c.cancel("input_closed");
+    const failure = await failureOf(readSetting(c, "knob.assignment", { bank: 1, knob: "a" }));
+    expect([failure?.code, failure?.progress]).toEqual(["input_closed", { failedComponent: null }]);
+    expect(stopped.calls).toEqual([]);
+  });
+
+  it("keep one plan for preview, dry run and write, whatever the caller changes in its value object", async () => {
+    const value: { function: string; parameter1: string; parameter2: string } = { ...MON };
+    const preview = previewSetting("URX44", "knob.assignment", { bank: 1, knob: "a" }, value as never);
+    const dry = await dryRunSetting(new OperationContext(new FakeTransport(), "URX44"), "knob.assignment", { bank: 1, knob: "a" }, value as never);
+    expect(dry.steps?.map((s) => [s.component, s.planned, s.outcome])).toEqual([
+      ["function", "Monitor", "not_sent"],
+      ["parameter1", "Monitor 1", "not_sent"],
+      ["parameter2", "Level", "not_sent"],
+    ]);
+    // The caller edits its object while the first write is pending.
+    const t = new FakeTransport().script(
+      "setText",
+      {
+        then(resolve: (record: unknown) => void) {
+          Object.assign(value, { function: "Brightness", parameter1: "Screen", parameter2: "" });
+          resolve(accepted);
+        },
+      },
+      accepted,
+      accepted,
+    );
+    const result = await writeSetting(new OperationContext(t, "URX44"), "knob.assignment", { bank: 1, knob: "a" }, value as never);
+    expect(t.calls.map((call) => call.value)).toEqual(["Monitor", "Monitor 1", "Level"]);
+    expect([result.requested, result.planned]).toEqual([MON, MON]);
+    expect(preview.requested).toEqual(MON);
+    expect(dry.planned).toEqual(MON);
+    expect(Object.isFrozen(result.requested)).toBe(true);
   });
 });

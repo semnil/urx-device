@@ -451,7 +451,7 @@ export function dryRunSetting<A extends WriteArgs>(context: OperationContext, ..
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
     if (handler.dryRun === undefined) {
       const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
-      return Promise.resolve({ requested: plan.requested, planned: plan.planned, unverified: [] });
+      return Promise.resolve({ ...plan, unverified: [] });
     }
     return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>);
   });
@@ -472,7 +472,7 @@ export function dryRunSettingAfter<A extends WriteArgs>(
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
     if (handler.dryRun === undefined) {
       const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
-      return Promise.resolve({ requested: plan.requested, planned: plan.planned, unverified: [] });
+      return Promise.resolve({ ...plan, unverified: [] });
     }
     return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>, affected);
   });
