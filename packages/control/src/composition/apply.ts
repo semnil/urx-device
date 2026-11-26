@@ -15,14 +15,16 @@ import type { OperationContext, WriteGuard } from "../operations/context.js";
 import type { OperationCause } from "../operations/failure.js";
 import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "../operations/transport.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
-import { decodeFileSetting, dryRunSetting, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
-import type { WriteOutcome } from "../operations/results.js";
+import { decodeFileSetting, dryRunSettingAfter, readSetting, writeSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
+import type { UnverifiedCondition, WriteOutcome } from "../operations/results.js";
 import type { CurrentPlan, PlannedStep } from "./plan.js";
 
 export interface StepResult extends PlannedStep {
   readonly outcome: WriteOutcome;
   /** The failure's code at the step that failed; null elsewhere. */
   readonly error: string | null;
+  /** In a dry run, the step's prerequisites an earlier unsent step can change (O13); empty otherwise. */
+  readonly unverified: readonly UnverifiedCondition[];
 }
 
 export interface ApplyResult {
@@ -131,7 +133,7 @@ export async function applyCurrent(
   plan: CurrentPlan,
   options: { readonly guard: ConsoleLockGuard; readonly dryRun?: boolean },
 ): Promise<ApplyResult> {
-  const results: StepResult[] = plan.steps.map((step) => ({ ...step, outcome: "not_sent", error: null }));
+  const results: StepResult[] = plan.steps.map((step) => ({ ...step, outcome: "not_sent", error: null, unverified: [] }));
   const failWith = (index: number, error: unknown, outcome: WriteOutcome): ApplyResult => {
     const failure = operationFailureOf(error);
     const step = results[index] as StepResult;
@@ -179,15 +181,18 @@ async function runSteps(
   failWith: (index: number, error: unknown, outcome: WriteOutcome) => ApplyResult,
   dryRun: boolean,
 ): Promise<ApplyResult> {
+  // O13: in a dry run nothing is sent, so every earlier step stays a pending change to what later steps check.
+  const pending = new PendingEffects();
   for (const [index, step] of plan.steps.entries()) {
     const args = [step.setting, step.target, step.requested] as unknown as WriteArgs;
     try {
       if (dryRun) {
-        const planned = await dryRunSetting(context, ...args);
-        results[index] = { ...step, planned: planned.planned, outcome: "not_sent", error: null };
+        const planned = await dryRunSettingAfter(context, pending.affecting(step), ...args);
+        results[index] = { ...step, planned: planned.planned, outcome: "not_sent", error: null, unverified: planned.unverified };
+        pending.add(step);
       } else {
         const written = await writeSetting(context, ...args);
-        results[index] = { ...step, planned: written.planned, outcome: "accepted", error: null };
+        results[index] = { ...step, planned: written.planned, outcome: "accepted", error: null, unverified: [] };
       }
     } catch (error) {
       // The failed step keeps its actual outcome (not sent, uncertain, rejected); later steps stay not sent.
@@ -196,4 +201,60 @@ async function runSteps(
     }
   }
   return { steps: results, error: null };
+}
+
+/**
+ * The prerequisite conditions earlier planned steps can change (O13, K40), by
+ * what they affect: an FX bus's type write changes its type and resets Room
+ * Size; a Room Size write changes the Reverb Time conversion; an EQ Type
+ * write changes the GEQ type; a Limit write changes that side's range, and a
+ * Link write copies the Limit to the other side; a Follow USB write changes
+ * Follow USB. The set only grows; a later step does not clear it.
+ */
+class PendingEffects {
+  readonly #conditions = new Map<string, Set<UnverifiedCondition>>();
+
+  #mark(key: string, ...conditions: UnverifiedCondition[]): void {
+    const set = this.#conditions.get(key) ?? new Set<UnverifiedCondition>();
+    for (const condition of conditions) set.add(condition);
+    this.#conditions.set(key, set);
+  }
+
+  add(step: PlannedStep): void {
+    const target = step.target as { bus?: string; side?: string; parameter?: string };
+    switch (step.setting) {
+      case "bus.fx.type":
+        this.#mark(`fx ${target.bus}`, "fx_type_matches", "revx_room_size");
+        break;
+      case "bus.fx.parameter":
+        if (target.parameter === "room-size") this.#mark(`fx ${target.bus}`, "revx_room_size");
+        break;
+      case "bus.eq.type":
+        this.#mark(`geq ${target.bus}`, "geq_type_selected");
+        break;
+      case "bus.geq.limit":
+        this.#mark(`limit ${target.bus} ${target.side}`, "geq_limit_allows_gain");
+        break;
+      case "bus.geq.link":
+        this.#mark(`limit ${target.bus} left`, "geq_limit_allows_gain");
+        this.#mark(`limit ${target.bus} right`, "geq_limit_allows_gain");
+        break;
+      case "device.follow-usb":
+        this.#mark("device", "follow_usb_off");
+        break;
+    }
+  }
+
+  affecting(step: PlannedStep): ReadonlySet<UnverifiedCondition> {
+    const target = step.target as { bus?: string; side?: string };
+    const keys =
+      step.setting === "bus.fx.parameter"
+        ? [`fx ${target.bus}`]
+        : step.setting.startsWith("bus.geq.")
+          ? [`geq ${target.bus}`, `limit ${target.bus} ${target.side}`]
+          : step.setting === "device.sample-rate"
+            ? ["device"]
+            : [];
+    return new Set(keys.flatMap((key) => [...(this.#conditions.get(key) ?? [])]));
+  }
 }

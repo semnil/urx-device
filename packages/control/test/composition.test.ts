@@ -218,6 +218,38 @@ describe("CURRENT composition (K36, F18)", () => {
     }
   });
 
+  it("dry-run the FX parameters after the file's unsent type write as unverified, not refused (O13)", async () => {
+    // FX 1 holds a Delay now; the file selects REV-X Hall. FX 2 already holds the file's Rev.R3 Hall.
+    class Unit extends FakeTransport {
+      override getNumeric(address: { paramId: number; x: string; y: string }, request: Parameters<FakeTransport["getNumeric"]>[1]): Promise<unknown> {
+        const value = { 895: "0", 766: "48000", 679: "1024", 683: "768" }[address.paramId] ?? "0";
+        this.calls.push({ method: "getNumeric", address: address as never, ticket: request.requestTicket });
+        return Promise.resolve({ kind: "success", value, evidence: { state: "read" } });
+      }
+    }
+    for (const model of models) {
+      const file = synthesize(model);
+      const plan = planCurrent(file, model);
+      const unit = new Unit();
+      const context = new OperationContext(unit, model);
+      const guard = await ConsoleLockGuard.open(context);
+      const result = await applyCurrent(context, file, plan, { guard, dryRun: true });
+      await guard.release();
+      expect(result.error, model).toBeNull();
+      const fx = (bus: string) => result.steps.filter((s) => s.setting === "bus.fx.parameter" && (s.target as { bus: string }).bus === bus);
+      const time = fx("fx-1").find((s) => (s.target as { parameter: string }).parameter === "reverb-time");
+      expect([time?.planned, time?.unverified], model).toEqual([null, ["fx_type_matches", "revx_room_size"]]);
+      expect(fx("fx-1").every((s) => s.unverified.includes("fx_type_matches")), model).toBe(true);
+      // FX 2's type is also written by the file first, so its parameters are unverified as well.
+      expect(fx("fx-2").every((s) => s.unverified.includes("fx_type_matches")), model).toBe(true);
+      // No FX-1 array slot is read in a layout the live selector does not establish.
+      expect(unit.calls.some((c) => c.address.paramId === 681), model).toBe(false);
+      expect(unit.calls.filter((c) => c.method.startsWith("set")), model).toEqual([]);
+      // Steps that no earlier step affects stay verified.
+      expect(result.steps.filter((s) => s.setting === "channel.fader").every((s) => s.unverified.length === 0), model).toBe(true);
+    }
+  });
+
   it("omit the automatically controlled values the file enables (F18-C), and fail whole on a missing value", () => {
     const base = planCurrent(synthesize("URX22"), "URX22");
     const oneKnob = planCurrent(synthesize("URX22", { "42:0": 1 }), "URX22");
