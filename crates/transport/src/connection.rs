@@ -327,17 +327,18 @@ pub struct Operation {
     shared: Weak<Shared>,
 }
 
-/// Why an opening failed: its failure and, when it ended as
-/// `connection_lost`, how the link was lost if that is known (R1-O-A).
+/// Why an opening or a discovery failed: its failure and, when it ended as
+/// `connection_lost`, how the link was lost if that is known (R1-O-A,
+/// R1-D-A).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OpenFailure {
+pub struct LinkFailure {
     pub failure: Failure,
     pub lost_link: Option<LinkLoss>,
 }
 
-impl From<Failure> for OpenFailure {
+impl From<Failure> for LinkFailure {
     fn from(failure: Failure) -> Self {
-        OpenFailure {
+        LinkFailure {
             failure,
             lost_link: None,
         }
@@ -352,7 +353,7 @@ pub fn open(
     expected_id: &str,
     options: &ConnectionOptions,
     control: &Control,
-) -> Result<Connection, OpenFailure> {
+) -> Result<Connection, LinkFailure> {
     open_with(port, expected_id, options, control, None)
 }
 
@@ -364,23 +365,12 @@ pub fn open_with(
     options: &ConnectionOptions,
     control: &Control,
     notifications: Option<NotificationHandler>,
-) -> Result<Connection, OpenFailure> {
+) -> Result<Connection, LinkFailure> {
     let budget = Budget::starting_now(options.connect_deadline, Cause::ConnectTimeout);
     let mut link = Link::connect(port, &budget, Phase::Connect, control)?;
     link.set_phase(Phase::Identity);
-    let firmware = match identify(&mut link, expected_id, options, &budget) {
-        Ok(firmware) => firmware,
-        Err(failure) => {
-            let lost_link = match failure {
-                Failure::Cause {
-                    code: Cause::ConnectionLost,
-                    ..
-                } => link.lost_link(),
-                _ => None,
-            };
-            return Err(OpenFailure { failure, lost_link });
-        }
-    };
+    let firmware = identify(&mut link, expected_id, options, &budget)
+        .map_err(|failure| link.failed(failure))?;
     let (sock, reader) = link.into_parts();
     Connection::start(sock, reader, firmware, options, notifications)
         .map_err(|_| Failure::cause(Cause::InternalError, Phase::Connect).into())

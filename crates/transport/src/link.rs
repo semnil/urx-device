@@ -8,7 +8,7 @@
 //! holds first is reported even when a reply, a close or an oversized frame
 //! arrives after it.
 
-use crate::connection::LinkLoss;
+use crate::connection::{LinkFailure, LinkLoss};
 use crate::frame::{self, FrameReader, ReadError};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use serde_json::Value;
@@ -184,9 +184,17 @@ impl<'a> Link<'a> {
         self.phase = phase;
     }
 
-    /// How the link was lost, if a failure on it ended it as `connection_lost`.
-    pub fn lost_link(&self) -> Option<LinkLoss> {
-        self.lost
+    /// `failure`, with how the link was lost when the failure ended it as
+    /// `connection_lost` and that is known.
+    pub fn failed(&self, failure: Failure) -> LinkFailure {
+        let lost_link = match failure {
+            Failure::Cause {
+                code: Cause::ConnectionLost,
+                ..
+            } => self.lost,
+            _ => None,
+        };
+        LinkFailure { failure, lost_link }
     }
 
     /// Records how the link was lost, unless that is already recorded.

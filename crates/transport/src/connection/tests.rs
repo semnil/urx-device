@@ -1,7 +1,7 @@
 //! The operational connection against a fake unit endpoint.
 
 use super::{
-    open, CloseOutcome, Connection, ConnectionOptions, LinkLoss, OpenFailure, MAX_WAITING_BYTES,
+    open, CloseOutcome, Connection, ConnectionOptions, LinkFailure, LinkLoss, MAX_WAITING_BYTES,
     MAX_WAITING_REQUESTS,
 };
 use crate::discovery::SystemFirmware;
@@ -202,8 +202,8 @@ fn open_refuses_a_unit_that_is_absent_or_not_the_one_requested() {
 }
 
 /// The opening's `connection_lost` failure, and how the link was lost.
-fn lost_while_opening(lost_link: Option<LinkLoss>) -> Result<(), OpenFailure> {
-    Err(OpenFailure {
+fn lost_while_opening(lost_link: Option<LinkLoss>) -> Result<(), LinkFailure> {
+    Err(LinkFailure {
         failure: Failure::Cause {
             code: Cause::ConnectionLost,
             phase: Phase::Identity,

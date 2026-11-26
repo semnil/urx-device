@@ -3,6 +3,7 @@
 //! scripted lines and recording the requests it received.
 
 use super::{discover, DeviceEntry, DiscoveryOptions, SystemFirmware};
+use crate::connection::{LinkFailure, LinkLoss};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use crate::test_peer::{get_reply, line, uri_of, Peer};
 use serde_json::{json, Value};
@@ -78,7 +79,7 @@ fn options(list_port: u16) -> DiscoveryOptions {
 }
 
 fn run(options: &DiscoveryOptions) -> Result<Vec<DeviceEntry>, Failure> {
-    discover(options, &Control::new())
+    discover(options, &Control::new()).map_err(|failed| failed.failure)
 }
 
 fn fails_with(code: Cause) -> Result<Vec<DeviceEntry>, Failure> {
@@ -279,8 +280,8 @@ fn an_unreachable_endpoint_is_a_connection_failure() {
     );
 }
 
-#[test]
-fn a_peer_that_closes_before_answering_is_a_lost_connection() {
+/// A port whose peer reads one request and closes the stream unanswered.
+fn closing_peer() -> u16 {
     let closing = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closing.local_addr().unwrap().port();
     thread::spawn(move || {
@@ -288,8 +289,62 @@ fn a_peer_that_closes_before_answering_is_a_lost_connection() {
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).unwrap();
     });
+    port
+}
+
+#[test]
+fn a_peer_that_closes_before_answering_is_a_lost_connection() {
+    let port = closing_peer();
     let list = center_data(json!({ "list": [{ "model": "URX44V", "vdpport": port }] }));
     assert_eq!(run(&options(list.port)), fails_with(Cause::ConnectionLost));
+}
+
+#[test]
+fn a_discovery_that_loses_a_link_says_how() {
+    let lost = |lost_link| LinkFailure {
+        failure: Failure::Cause {
+            code: Cause::ConnectionLost,
+            phase: Phase::Discovery,
+        },
+        lost_link,
+    };
+    let discovered = |options: &DiscoveryOptions| discover(options, &Control::new());
+
+    // The list endpoint closes the stream before answering.
+    let list = closing_peer();
+    assert_eq!(
+        discovered(&options(list)),
+        Err(lost(Some(LinkLoss::PeerClosed)))
+    );
+
+    // A listed unit closes the stream before answering its check.
+    let port = closing_peer();
+    let listing = center(&[(port, "URX44V")]);
+    assert_eq!(
+        discovered(&options(listing.port)),
+        Err(lost(Some(LinkLoss::PeerClosed)))
+    );
+
+    // A unit reported lost while its firmware is read.
+    let unit = unplugged_while_checked("<device-id-a>", vec![sync_push("lost")]);
+    let listing = center(&[(unit.port, "URX44V")]);
+    assert_eq!(
+        discovered(&metadata(options(listing.port))),
+        Err(lost(Some(LinkLoss::UnitLost)))
+    );
+
+    // A failure that does not end a link as `connection_lost` says nothing.
+    let list = center_data(json!({ "list": "not a list" }));
+    assert_eq!(
+        discovered(&options(list.port)),
+        Err(LinkFailure {
+            failure: Failure::Cause {
+                code: Cause::InvalidResponse,
+                phase: Phase::Discovery,
+            },
+            lost_link: None,
+        })
+    );
 }
 
 #[test]
@@ -360,7 +415,7 @@ fn cancellation_stops_before_starting_and_while_waiting() {
     let control = Control::new();
     control.cancel();
     assert_eq!(
-        discover(&options(empty.port), &control),
+        discover(&options(empty.port), &control).map_err(|failed| failed.failure),
         Err(Failure::Cancelled {
             phase: Phase::Discovery
         })
@@ -377,7 +432,7 @@ fn cancellation_stops_before_starting_and_while_waiting() {
     });
     let started = Instant::now();
     assert_eq!(
-        discover(&options(center.port), &control),
+        discover(&options(center.port), &control).map_err(|failed| failed.failure),
         Err(Failure::Cancelled {
             phase: Phase::Discovery
         })
@@ -506,7 +561,7 @@ fn a_reply_that_keeps_arriving_in_pieces_is_cancellable() {
         }
     });
     assert_eq!(
-        discover(&options(hub.port), &control),
+        discover(&options(hub.port), &control).map_err(|failed| failed.failure),
         Err(Failure::Cancelled {
             phase: Phase::Discovery
         })
