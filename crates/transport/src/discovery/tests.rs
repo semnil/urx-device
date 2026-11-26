@@ -5,7 +5,7 @@
 use super::{discover, DeviceEntry, DiscoveryOptions, SystemFirmware};
 use crate::connection::{LinkFailure, LinkLoss};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
-use crate::test_peer::{get_reply, line, uri_of, Peer};
+use crate::test_peer::{get_reply, is_reset, line, resetting, uri_of, Peer};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -332,6 +332,28 @@ fn a_discovery_that_loses_a_link_says_how() {
         discovered(&metadata(options(listing.port))),
         Err(lost(Some(LinkLoss::UnitLost)))
     );
+
+    // The peer resetting the connection: the list, a candidate's status read, and a
+    // candidate's firmware read.
+    let synchronized = get_reply("/vd/synchronize", online("<device-id-a>"));
+    let reset_at_status = center(&[(resetting(vec![]), "URX44V")]);
+    let reset_at_firmware = center(&[(resetting(vec![synchronized]), "URX44V")]);
+    for (case, options) in [
+        ("the list", options(resetting(vec![]))),
+        ("a status read", options(reset_at_status.port)),
+        ("a firmware read", metadata(options(reset_at_firmware.port))),
+    ] {
+        let failed = discovered(&options).unwrap_err();
+        assert_eq!(
+            failed.failure,
+            Failure::Cause {
+                code: Cause::ConnectionLost,
+                phase: Phase::Discovery,
+            },
+            "{case}"
+        );
+        assert!(is_reset(failed.lost_link), "{case}: {failed:?}");
+    }
 
     // A failure that does not end a link as `connection_lost` says nothing.
     let list = center_data(json!({ "list": "not a list" }));

@@ -1,7 +1,7 @@
 //! A scripted loopback endpoint standing in for Device Center in tests.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -63,6 +63,44 @@ fn answer(stream: TcpStream, pace: Duration, respond: Respond, seen: Arc<Mutex<V
             thread::sleep(pace);
         }
     }
+}
+
+/// A port whose peer answers its first requests with `answers`, one each in
+/// order, then waits for the next request without reading it and closes: with
+/// a request unread, the system resets the connection instead of ending the
+/// stream, so the other side's read fails.
+pub(crate) fn resetting(answers: Vec<Vec<u8>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        for answer in answers {
+            // One request, a byte at a time, so nothing after it is read.
+            let mut byte = [0u8; 1];
+            loop {
+                match stream.read(&mut byte) {
+                    Ok(1) if byte[0] == b'\n' => break,
+                    Ok(1) => {}
+                    _ => return,
+                }
+            }
+            if stream.write_all(&answer).is_err() {
+                return;
+            }
+        }
+        let _ = stream.peek(&mut [0u8; 1]);
+    });
+    port
+}
+
+/// Whether `loss` is the socket error a reset connection reads as.
+pub(crate) fn is_reset(loss: Option<crate::connection::LinkLoss>) -> bool {
+    matches!(
+        loss,
+        Some(crate::connection::LinkLoss::SocketError(
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        ))
+    )
 }
 
 pub(crate) fn line(message: Value) -> Vec<u8> {

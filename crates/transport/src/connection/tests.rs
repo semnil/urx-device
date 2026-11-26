@@ -10,7 +10,7 @@ use crate::lifecycle::{Cause, Control, Failure, Phase};
 use crate::request::{
     Evidence, Outcome, ReadValue, Request, RequestCause, RequestFailure, RequestPhase,
 };
-use crate::test_peer::{get_reply, line, uri_of, Peer};
+use crate::test_peer::{get_reply, is_reset, line, resetting, uri_of, Peer};
 use crate::wire::{NameValue, ParameterAddress};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -247,6 +247,22 @@ fn an_opening_that_loses_its_link_says_how() {
         open(port, ID, &options(), &Control::new()).map(|_| ()),
         lost_while_opening(Some(LinkLoss::PeerClosed))
     );
+    // The peer resetting the connection at each of the opening's reads.
+    for answered in [vec![], vec![get_reply("/vd/synchronize", online(ID))]] {
+        let read = answered.len();
+        let failed = open(resetting(answered), ID, &options(), &Control::new())
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            failed.failure,
+            Failure::Cause {
+                code: Cause::ConnectionLost,
+                phase: Phase::Identity,
+            },
+            "read {read}"
+        );
+        assert!(is_reset(failed.lost_link), "read {read}: {failed:?}");
+    }
 }
 
 #[test]
