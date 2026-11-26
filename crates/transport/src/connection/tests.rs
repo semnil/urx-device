@@ -1601,6 +1601,349 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
     drop(release);
 }
 
+/// Runs `f` with the system refusing threads started from this thread once
+/// `allowed` more have started.
+fn refusing_threads<T>(allowed: usize, f: impl FnOnce() -> T) -> T {
+    super::REFUSE_SPAWN.with(|left| left.set(Some(allowed)));
+    let result = f();
+    super::REFUSE_SPAWN.with(|left| left.set(None));
+    result
+}
+
+/// A peer that answers the opening and nothing else, and reports when the
+/// connection's socket is closed from the other end.
+fn silent_unit() -> (u16, mpsc::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (closed_tx, closed) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut requests = BufReader::new(stream);
+        let mut request = String::new();
+        for reply in [
+            get_reply("/vd/synchronize", online(ID)),
+            get_reply("/vd/device", firmware()),
+        ] {
+            request.clear();
+            requests.read_line(&mut request).unwrap();
+            writer.write_all(&reply).unwrap();
+        }
+        loop {
+            request.clear();
+            match requests.read_line(&mut request) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    (port, closed)
+}
+
+fn could_not_finish() -> CloseOutcome {
+    CloseOutcome::Incomplete(Failure::Cause {
+        code: Cause::InternalError,
+        phase: Phase::Teardown,
+    })
+}
+
+#[test]
+fn a_close_with_no_thread_to_start_completes_waiting_requests_and_returns() {
+    // A read is on the wire and a write waits behind it when the system stops starting
+    // threads. The close completes the waiting write unsent, closes the socket, and
+    // returns that it could not finish, as does a second close; nothing panics.
+    let (port, closed) = silent_unit();
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        ..options()
+    };
+    let connection = open(port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    thread::sleep(Duration::from_millis(20));
+    let waiting = submit(&connection, &operation, Request::SetNumeric(address(2), 5));
+    let closed_with = refusing_threads(0, || connection.close(Duration::from_millis(300)));
+    assert_eq!(closed_with, could_not_finish());
+    assert_eq!(
+        outcome(&waiting),
+        failed(
+            RequestCause::NotConnected,
+            RequestPhase::Admission,
+            Evidence::NotSent
+        )
+    );
+    closed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the socket closed");
+    assert_eq!(
+        connection.close(Duration::from_millis(300)),
+        could_not_finish()
+    );
+}
+
+#[test]
+fn repeated_bursts_keep_no_more_threads_than_they_need() {
+    // Each burst holds up to eight threads, which end after lingering; the connection keeps
+    // no more of their handles or identities than the threads that may still be ending.
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    for round in 0..3 {
+        let answered: Vec<_> = (0..8)
+            .map(|n| submit(&connection, &operation, Request::GetNumeric(address(n))))
+            .collect();
+        for rx in &answered {
+            assert!(
+                matches!(outcome(rx), Outcome::Success { .. }),
+                "round {round}"
+            );
+        }
+        wait_until(|| {
+            let pool = super::lock(&connection.shared.expiry.pool);
+            pool.alive == 0 && !pool.reaping
+        });
+        let pool = super::lock(&connection.shared.expiry.pool);
+        assert!(pool.threads.is_empty(), "round {round}");
+        assert!(
+            pool.retired.len() <= 8,
+            "round {round}: {} retired",
+            pool.retired.len()
+        );
+        assert_eq!(
+            pool.ids.len(),
+            pool.retired.len(),
+            "round {round}: an identity for each thread not yet joined"
+        );
+    }
+}
+
+#[test]
+fn a_completing_thread_no_callback_holds_ends_after_its_linger() {
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    let operation = connection.create_operation().unwrap();
+    let answered = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    assert!(matches!(outcome(&answered), Outcome::Success { .. }));
+    let alive = || super::lock(&connection.shared.expiry.pool).alive;
+    assert_eq!(alive(), 1, "held for the request at its admission");
+    wait_until(|| alive() == 0);
+}
+
+#[test]
+fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_after() {
+    // A read is on the wire; a read, a write, an activation and two releases wait behind it.
+    // Right after the close takes them, the end of the connection stops the completing
+    // threads. Each callback still gets its result once, before the close returns.
+    let (port, _closed) = silent_unit();
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        ..options()
+    };
+    let connection = open(port, ID, &options, &Control::new()).unwrap();
+    let operation = connection.create_operation().unwrap();
+    let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
+    thread::sleep(Duration::from_millis(20));
+    let read = submit(&connection, &operation, Request::GetNumeric(address(2)));
+    let write = submit(&connection, &operation, Request::SetNumeric(address(3), 5));
+    let parameter = |param_id| {
+        crate::subscription::SubscriptionAddress::Parameter(ParameterAddress {
+            param_id,
+            x: 0,
+            y: 0,
+        })
+    };
+    let token = connection.prepare_subscription(&[parameter(4)]).unwrap();
+    let (tx, lifecycle) = mpsc::channel();
+    let (activated, released, again) = (tx.clone(), tx.clone(), tx);
+    token.activate(&operation, move |outcome| {
+        let _ = activated.send(outcome);
+    });
+    token.release(move |outcome| {
+        let _ = released.send(outcome);
+    });
+    token.release(move |outcome| {
+        let _ = again.send(outcome);
+    });
+    let expiry = Arc::clone(&connection.shared.expiry);
+    super::CLOSE_TAKEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            expiry.stop();
+            // Long enough for threads with nothing queued to end.
+            thread::sleep(Duration::from_millis(50));
+        }))
+    });
+    assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    let unsent = failed(
+        RequestCause::NotConnected,
+        RequestPhase::Admission,
+        Evidence::NotSent,
+    );
+    assert_eq!(
+        read.try_recv(),
+        Ok(unsent.clone()),
+        "the read, before the close returned"
+    );
+    assert_eq!(
+        write.try_recv(),
+        Ok(unsent),
+        "the write, before the close returned"
+    );
+    for call in ["activate", "release", "release again"] {
+        let outcome = lifecycle.try_recv().expect(call);
+        assert_eq!(
+            outcome.map_err(|failed| failed.failure),
+            Err(Failure::Cause {
+                code: Cause::NotConnected,
+                phase: Phase::Subscription
+            }),
+            "{call}"
+        );
+    }
+    assert!(lifecycle.try_recv().is_err(), "each once");
+}
+
+#[test]
+fn a_waiting_callback_that_blocks_holds_up_no_close() {
+    // A read is on the wire and a write waits behind it; the close completes the write on
+    // the thread held for it at admission, whose callback does not return. With no thread
+    // to start, the close returns that it could not finish; with threads, it returns at its
+    // budget that the teardown ran out. Either way a later close returns the same.
+    for refused in [true, false] {
+        let (port, _closed) = silent_unit();
+        let options = ConnectionOptions {
+            response_deadline: Duration::from_millis(100),
+            ..options()
+        };
+        let connection = Arc::new(open(port, ID, &options, &Control::new()).unwrap());
+        let operation = connection.create_operation().unwrap();
+        let _on_the_wire = submit(&connection, &operation, Request::GetNumeric(address(1)));
+        thread::sleep(Duration::from_millis(20));
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        connection.submit(
+            &operation,
+            Request::SetNumeric(address(2), 5),
+            move |outcome, _| {
+                let _ = entered_tx.send(outcome);
+                let _ = blocked.recv();
+            },
+        );
+        let (closed_tx, closed_with) = mpsc::channel();
+        let closing = Arc::clone(&connection);
+        thread::spawn(move || {
+            let close = || closing.close(Duration::from_millis(50));
+            let outcome = if refused {
+                refusing_threads(0, close)
+            } else {
+                close()
+            };
+            let _ = closed_tx.send(outcome);
+        });
+        let expected = if refused {
+            could_not_finish()
+        } else {
+            CloseOutcome::Incomplete(Failure::Cause {
+                code: Cause::TeardownTimeout,
+                phase: Phase::Teardown,
+            })
+        };
+        assert_eq!(
+            closed_with.recv_timeout(Duration::from_secs(2)),
+            Ok(expected),
+            "refused: {refused}"
+        );
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(2)).unwrap(),
+            failed(
+                RequestCause::NotConnected,
+                RequestPhase::Admission,
+                Evidence::NotSent
+            )
+        );
+        assert_eq!(
+            connection.close(Duration::from_millis(50)),
+            expected,
+            "refused: {refused}"
+        );
+        drop(release);
+    }
+}
+
+#[test]
+fn a_close_with_nothing_waiting_and_no_thread_to_start_returns() {
+    let (port, closed) = silent_unit();
+    let connection = open(port, ID, &options(), &Control::new()).unwrap();
+    let outcome = refusing_threads(0, || connection.close(Duration::from_millis(300)));
+    assert_eq!(outcome, could_not_finish());
+    closed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the socket closed");
+    assert_eq!(
+        connection.close(Duration::from_millis(300)),
+        could_not_finish()
+    );
+}
+
+#[test]
+fn a_close_from_a_callback_with_no_helper_thread_returns_what_it_could_do() {
+    // A completion callback runs on the connection's own thread, which a close cannot wait
+    // for; with no helper thread to finish on, the close stops what it can and returns.
+    let (port, closed) = silent_unit();
+    let options = ConnectionOptions {
+        response_deadline: Duration::from_millis(100),
+        ..options()
+    };
+    let connection = Arc::new(open(port, ID, &options, &Control::new()).unwrap());
+    let operation = connection.create_operation().unwrap();
+    let (tx, from_callback) = mpsc::channel();
+    let inner = Arc::clone(&connection);
+    connection.submit_adopted(&operation, Request::GetNumeric(address(1)), move |_| {
+        let outcome = refusing_threads(0, || inner.close(Duration::from_millis(300)));
+        let _ = tx.send(outcome);
+    });
+    assert_eq!(
+        from_callback.recv_timeout(Duration::from_secs(5)).unwrap(),
+        could_not_finish()
+    );
+    closed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the socket closed");
+    assert_eq!(
+        connection.close(Duration::from_millis(300)),
+        could_not_finish()
+    );
+}
+
+#[test]
+fn an_opening_with_no_thread_to_start_fails_and_leaves_nothing_running() {
+    // The connect attempt runs on a thread of its own; then the connection starts its
+    // reader and worker. Whichever cannot start, the opening fails as an internal error and
+    // the socket is closed.
+    for allowed in 0..3 {
+        let (port, closed) = silent_unit();
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        super::RUNNING.with(|counted| *counted.borrow_mut() = Some(Arc::clone(&running)));
+        let result = refusing_threads(allowed, || open(port, ID, &options(), &Control::new()));
+        let left = running.load(std::sync::atomic::Ordering::SeqCst);
+        super::RUNNING.with(|counted| *counted.borrow_mut() = None);
+        assert_eq!(
+            result.map(|_| ()).map_err(|failed| failed.failure),
+            Err(Failure::Cause {
+                code: Cause::InternalError,
+                phase: Phase::Connect
+            }),
+            "{allowed} thread(s) allowed"
+        );
+        assert_eq!(left, 0, "{allowed} thread(s) allowed: none still running");
+        if allowed > 0 {
+            closed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the socket closed");
+        }
+    }
+}
+
 mod lifecycle {
     use super::{connect, firmware, online, options, ID, TEARDOWN};
     use crate::connection::{
@@ -3444,6 +3787,239 @@ mod notifications {
     }
 
     #[test]
+    fn an_expired_request_completes_on_its_own_thread_while_a_registration_is_held() {
+        // A registration's reply waits for a notification received before it to be adopted
+        // (K12), and a request waiting behind it expires. Its callback runs on the thread held
+        // for it since its admission, not on the worker carrying the registration: it can
+        // close the connection, even once the system starts no more threads.
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _a = activate(&connection, &[p(1)]);
+        let b = connection.prepare_subscription(&[p(2)]).unwrap();
+        let operation = connection.create_operation().unwrap();
+        let (tx, activated) = mpsc::channel();
+        b.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        let other = connection.create_operation().unwrap();
+        let (tx, waiting) = mpsc::channel();
+        let inner = Arc::clone(&connection);
+        connection.submit(&other, Request::GetNumeric(param(6)), move |outcome, _| {
+            let closed = inner.close(Duration::from_millis(50));
+            let _ = tx.send((outcome, closed));
+        });
+        connection
+            .shared
+            .expiry
+            .spawner
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (outcome, closed) = waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(outcome, unsent_with(RequestCause::SendTimeout));
+        assert_eq!(
+            closed,
+            CloseOutcome::Incomplete(Failure::Cause {
+                code: Cause::InternalError,
+                phase: Phase::Teardown
+            }),
+            "no helper thread to finish the close on"
+        );
+        assert!(activated.recv_timeout(Duration::from_secs(2)).is_ok());
+        super::wait_until(|| connection.shared.expiry.charged() == (0, 0));
+    }
+
+    #[test]
+    fn a_thread_held_for_a_waiting_request_outlasts_its_linger() {
+        // The request waits behind a held result for longer than an idle completing thread
+        // lingers; its thread is still there when it expires.
+        let (port, push) = pushing_unit(Duration::from_millis(100));
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let _ = tx.lock().unwrap().send(batch);
+        });
+        let long = crate::connection::ConnectionOptions {
+            send_deadline: super::super::LINGER + Duration::from_millis(500),
+            ..options()
+        };
+        let connection =
+            Arc::new(open_with(port, ID, &long, &Control::new(), Some(handler)).unwrap());
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let _held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        let other = connection.create_operation().unwrap();
+        let waiting = submit_held(&connection, &other, 6);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap().0,
+            unsent_with(RequestCause::SendTimeout)
+        );
+    }
+
+    /// Holds a read's result for an unadopted notification so that a request
+    /// behind it expires, and runs `expired` as that request's callback, on its
+    /// completing thread. Returns once the hold is over and the link is free.
+    fn expire_on_a_completing_thread(
+        connection: &Arc<Connection>,
+        push: &Sender<Vec<u8>>,
+        batches: &Receiver<NotificationBatch>,
+        expired: impl FnOnce() + Send + 'static,
+    ) {
+        let operation = connection.create_operation().unwrap();
+        let held = submit_held(connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let first = next(batches);
+        let (tx, ran) = mpsc::channel();
+        connection.submit(
+            &operation,
+            Request::GetNumeric(param(6)),
+            move |outcome, _| {
+                expired();
+                let _ = tx.send(outcome);
+            },
+        );
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            unsent_with(RequestCause::SendTimeout)
+        );
+        assert!(connection.adopt_notifications(first.ticket));
+        let (_, adoption) = held.recv_timeout(Duration::from_secs(2)).unwrap();
+        adoption.adopt();
+    }
+
+    // Not on Windows: there a thread-local destructor runs under the process's loader lock,
+    // so one that blocks stops every thread of the test process from starting or ending,
+    // and the other cases' closes with it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_completing_thread_whose_exit_does_not_finish_holds_back_one_other_at_most() {
+        // The expired request's callback leaves a thread-local whose destructor blocks, so
+        // its thread does not finish ending. Bursts and pauses after it keep the threads
+        // still running steady: one waits for it, and the others stay to be reused.
+        struct Blocks(Sender<()>, mpsc::Receiver<()>);
+        impl Drop for Blocks {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+                let _ = self.1.recv_timeout(Duration::from_secs(20));
+            }
+        }
+        thread_local! {
+            static STUCK: std::cell::RefCell<Option<Blocks>> = const { std::cell::RefCell::new(None) };
+        }
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        super::super::RUNNING.with(|counted| *counted.borrow_mut() = Some(Arc::clone(&running)));
+        let (port, push) = pushing_unit(Duration::from_millis(20));
+        // Long enough for a burst of four reads to be sent, short enough for the one behind
+        // the hold to expire.
+        let (connection, batches) = connect_sending(port, Duration::from_secs(1));
+        let connected = running.load(std::sync::atomic::Ordering::SeqCst);
+        let _token = activate(&connection, &[p(1)]);
+        let (release, stuck) = mpsc::channel();
+        let (entered, ending) = mpsc::channel();
+        expire_on_a_completing_thread(&connection, &push, &batches, move || {
+            STUCK.with(|slot| *slot.borrow_mut() = Some(Blocks(entered, stuck)));
+        });
+        ending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the thread that ran the callback is ending, and stuck");
+        // The connection's own threads, the four a burst holds, and the one waiting for the
+        // stuck thread.
+        let bound = connected + 4 + 1;
+        let operation = connection.create_operation().unwrap();
+        let mut after = Vec::new();
+        for _ in 0..4 {
+            let answered: Vec<_> = (0..4)
+                .map(|n| submit_held(&connection, &operation, 10 + n))
+                .collect();
+            for rx in answered {
+                let (outcome, adoption) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(matches!(outcome, Outcome::Success { .. }), "{outcome:?}");
+                adoption.adopt();
+            }
+            thread::sleep(super::super::LINGER * 3);
+            after.push(running.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        super::super::RUNNING.with(|counted| *counted.borrow_mut() = None);
+        assert!(
+            after.iter().all(|&running| running <= bound),
+            "threads still running after each pause: {after:?}, at most {bound}"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn a_close_from_a_completing_threads_exit_does_not_wait_for_itself() {
+        // The expired request's callback leaves a thread-local that closes the connection
+        // from its destructor, which runs as its completing thread ends after lingering.
+        struct Closes(Arc<Connection>, Sender<CloseOutcome>);
+        impl Drop for Closes {
+            fn drop(&mut self) {
+                let _ = self.1.send(self.0.close(Duration::from_millis(220)));
+            }
+        }
+        thread_local! {
+            static CLOSER: std::cell::RefCell<Option<Closes>> = const { std::cell::RefCell::new(None) };
+        }
+        let (port, push) = pushing_unit(Duration::from_millis(20));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let (tx, from_exit) = mpsc::channel();
+        let inner = Arc::clone(&connection);
+        expire_on_a_completing_thread(&connection, &push, &batches, move || {
+            CLOSER.with(|slot| *slot.borrow_mut() = Some(Closes(inner, tx)));
+        });
+        assert_eq!(
+            from_exit.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CloseOutcome::Started
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn a_request_is_refused_when_no_thread_can_be_held_for_it() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect_short(port);
+        let token = connection.prepare_subscription(&[p(1)]).unwrap();
+        connection
+            .shared
+            .expiry
+            .spawner
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let operation = connection.create_operation().unwrap();
+        let refused = submit_held(&connection, &operation, 5);
+        assert_eq!(
+            refused.recv_timeout(Duration::from_secs(1)).unwrap().0,
+            unsent_with(RequestCause::InternalError)
+        );
+        let (tx, lifecycle) = mpsc::channel();
+        let again = tx.clone();
+        token.activate(&operation, move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        token.release(move |outcome| {
+            let _ = again.send(outcome);
+        });
+        for call in ["activate", "release"] {
+            let outcome = lifecycle.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                outcome.map_err(|failed| failed.failure),
+                Err(Failure::Cause {
+                    code: Cause::InternalError,
+                    phase: Phase::Subscription
+                }),
+                "{call}"
+            );
+        }
+    }
+
+    #[test]
     fn a_rejection_held_for_its_cutoff_stays_a_rejection_when_the_link_ends() {
         let (port, push) = pushing_unit_coded(Duration::from_millis(200), |request| {
             if request["vdp"]["uri"] == "/vd/parameters/2:0:0?operation=regist" {
@@ -3482,13 +4058,21 @@ mod notifications {
 
     /// A connection with an 80 ms send deadline whose batches reach the test.
     fn connect_short(port: u16) -> (Arc<Connection>, Receiver<NotificationBatch>) {
+        connect_sending(port, Duration::from_millis(80))
+    }
+
+    /// A connection whose requests may wait `send_deadline` to be sent.
+    fn connect_sending(
+        port: u16,
+        send_deadline: Duration,
+    ) -> (Arc<Connection>, Receiver<NotificationBatch>) {
         let (tx, batches) = mpsc::channel();
         let tx = Mutex::new(tx);
         let handler: NotificationHandler = Arc::new(move |batch| {
             let _ = tx.lock().unwrap().send(batch);
         });
         let short = crate::connection::ConnectionOptions {
-            send_deadline: Duration::from_millis(80),
+            send_deadline,
             ..options()
         };
         let connection = open_with(port, ID, &short, &Control::new(), Some(handler)).unwrap();
@@ -3698,11 +4282,9 @@ mod notifications {
             "the expired ones still count against the queue"
         );
         assert!(
-            crate::connection::lock(&connection.shared.expiry.pool)
-                .threads
-                .len()
-                <= MAX_WAITING_REQUESTS,
-            "one thread at most per charged completion"
+            crate::connection::lock(&connection.shared.expiry.pool).alive
+                <= MAX_WAITING_REQUESTS + 1,
+            "one thread at most per admitted request: the waiting limit and the one held on the wire"
         );
         release.send(()).unwrap();
         *gate.0.lock().unwrap() = true;

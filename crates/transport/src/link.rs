@@ -8,14 +8,13 @@
 //! holds first is reported even when a reply, a close or an oversized frame
 //! arrives after it.
 
-use crate::connection::{LinkFailure, LinkLoss};
+use crate::connection::{LinkFailure, LinkLoss, Spawner};
 use crate::frame::{self, FrameReader, ReadError};
 use crate::lifecycle::{Cause, Control, Failure, Phase};
 use serde_json::Value;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
 use std::time::{Duration, Instant};
 
 /// Longest a blocking socket call runs before the stop conditions are checked
@@ -135,7 +134,8 @@ impl<'a> Link<'a> {
     /// connection attempt runs on its own thread so that cancellation and
     /// expiry are seen while it is pending. The thread starts the attempt only
     /// if the call has not stopped by then, with the budget left at that time;
-    /// an attempt that completes after the call stopped is closed unused.
+    /// an attempt that completes after the call stopped is closed unused. Once
+    /// the attempt has answered, the call waits for its thread.
     pub fn connect(
         port: u16,
         budget: &Budget,
@@ -148,15 +148,22 @@ impl<'a> Link<'a> {
         let (tx, rx) = mpsc::channel();
         let attempt_control = control.clone();
         let end = bound.end;
-        thread::spawn(move || {
-            if let Some(result) = attempt(addr, end, &attempt_control) {
-                let _ = tx.send(result);
-            }
-        });
+        // A thread the system cannot create fails the call rather than the
+        // process.
+        let attempting = Spawner::default()
+            .spawn(move || {
+                if let Some(result) = attempt(addr, end, &attempt_control) {
+                    let _ = tx.send(result);
+                }
+            })
+            .map_err(|_| Failure::cause(Cause::InternalError, phase))?;
         let sock = loop {
             let remaining = stop(control, &bound, phase)?;
             match rx.recv_timeout(remaining.min(POLL)) {
                 Ok(result) => {
+                    // The attempt has answered and is ending: waiting for it
+                    // leaves no thread of this call running once it returns.
+                    let _ = attempting.join();
                     stop(control, &bound, phase)?;
                     break result.map_err(|_| Failure::cause(Cause::ConnectionFailed, phase))?;
                 }
