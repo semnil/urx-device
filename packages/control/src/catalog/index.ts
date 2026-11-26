@@ -196,3 +196,5 @@ export { firmwareStatus, validatedFirmware } from "./firmware.js";
 export type { FirmwareStatus } from "./firmware.js";
 export { MODELS, isModel } from "./models.js";
 export type { Model } from "./models.js";
+export { URXF_MAX_BYTES, UrxfError, parseUrxf, urxfValue } from "./urxf.js";
+export type { UrxfChunk, UrxfFault, UrxfFile, UrxfValues } from "./urxf.js";
