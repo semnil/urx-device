@@ -104,9 +104,10 @@ export interface NameRule {
 
 /**
  * A selector on an unsigned 32-bit value: each token this target takes with
- * its exact raw value, and `none`, where present, as the exact sentinel. `known` lists every
- * token any target of the setting takes: one of them this target lacks is
- * unsupported, anything else invalid. A read takes only the listed raw values.
+ * its exact raw value, and `none`, where present, as the exact sentinel.
+ * `known` lists every token any target of the setting takes: one of them this
+ * target lacks is unsupported, anything else invalid. A read takes only the
+ * listed raw values.
  */
 export interface SelectorRule {
   readonly kind: "selector";
@@ -116,9 +117,9 @@ export interface SelectorRule {
   readonly choices: readonly { readonly token: string; readonly raw: string }[];
   /**
    * The defined limits of each choice and of `none` where the selector has
-   * one, by token, for help. A
-   * definition, not a measurement; nothing reads the rate, link or slot state
-   * to check them. Undefined for a token this target does not take.
+   * one, by token, for help. A definition, not a measurement; nothing reads
+   * the rate, link or slot state to check them. Undefined for a token this
+   * target does not take.
    */
   readonly limits?: { readonly [token: string]: SelectorLimits | undefined };
 }
