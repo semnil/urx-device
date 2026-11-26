@@ -10,7 +10,7 @@
 import { OperationFailureError, operationFailureOf, type OperationCause } from "./failure.js";
 import type { OperationContext, WriteGuard } from "./context.js";
 import { readSetting } from "./registry.js";
-import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "./transport.js";
+import type { ParameterAddress, Transport, TransportNotification, TransportOperation, TransportSubscription } from "./transport.js";
 
 /** The Console Lock address (F20-L-A). */
 export const CONSOLE_LOCK_ADDRESS: ParameterAddress = Object.freeze({ paramId: 895, x: "0", y: "0" });
@@ -18,13 +18,16 @@ export const CONSOLE_LOCK_ADDRESS: ParameterAddress = Object.freeze({ paramId: 8
 const sameAddress = (a: ParameterAddress, b: ParameterAddress) => a.paramId === b.paramId && a.x === b.x && a.y === b.y;
 
 export class ConsoleLockGuard implements WriteGuard {
+  /** The connection the lock subscription is on; every write under the guard uses it. */
+  readonly #transport: Transport;
   readonly #operation: TransportOperation;
   readonly #attached = new Set<OperationContext>();
   #subscription: TransportSubscription | undefined;
   #stop: OperationCause | undefined;
   #released: Promise<void> | undefined;
 
-  private constructor(operation: TransportOperation) {
+  private constructor(transport: Transport, operation: TransportOperation) {
+    this.#transport = transport;
     this.#operation = operation;
   }
 
@@ -41,7 +44,7 @@ export class ConsoleLockGuard implements WriteGuard {
     } catch {
       throw new OperationFailureError({ code: "internal_error", phase: "admission", progress: null });
     }
-    const guard = new ConsoleLockGuard(operation);
+    const guard = new ConsoleLockGuard(context.transport, operation);
     try {
       guard.#subscription = context.transport.prepareSubscription([CONSOLE_LOCK_ADDRESS], operation, (notification) => guard.#deliver(notification));
       await guard.#subscription.activate();
@@ -61,13 +64,15 @@ export class ConsoleLockGuard implements WriteGuard {
    * Begins one write operation under the guard: attaches `context`, then
    * makes its one fresh strict lock read. A locked unit, a latched stop, or
    * a failed read rejects (the context detached), and no setting is sent.
+   * A context on another connection than the guard's is refused before any
+   * request: the lock it observes would not be that connection's.
    * The returned function detaches the context once its operation is done.
    */
   async begin(context: OperationContext): Promise<() => void> {
     const detach = () => {
       this.#attached.delete(context);
     };
-    if (this.#released !== undefined) {
+    if (this.#released !== undefined || context.transport !== this.#transport) {
       throw new OperationFailureError({ code: "internal_error", phase: "preparation", progress: null });
     }
     context.guardWrites(this);

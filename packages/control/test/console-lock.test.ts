@@ -99,6 +99,19 @@ describe("Console Lock write guard (F20-L-A)", () => {
     expect(refused.finished).toBe(1);
   });
 
+  it("refuse an operation on another connection than the guard's before any request", async () => {
+    const a = new FakeTransport().script("getNumeric", read("0"));
+    const guard = await ConsoleLockGuard.open(new OperationContext(a, "URX44"));
+    const b = new FakeTransport().script("getNumeric", read("0")).script("setNumeric", accepted).script("setText", accepted);
+    const other = new OperationContext(b, "URX44");
+    expect((await failureOf(guard.begin(other)))?.code).toBe("internal_error");
+    expect([a.calls, b.calls]).toEqual([[], []]);
+    // The other connection's operation is not attached: a lock on the guard's connection leaves it alone.
+    a.notify({ kind: "numeric", address: lock, value: "1" });
+    expect(other.stopping).toBeUndefined();
+    await guard.release();
+  });
+
   it("leave an operation that is not attached alone: a read-only line still reads after a lock", async () => {
     const t = new FakeTransport().script("getNumeric", read("0"), read("1"));
     const writer = new OperationContext(t, "URX44");
