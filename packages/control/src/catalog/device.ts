@@ -16,7 +16,7 @@ const device = (paramId: number, value: DeviceSettingRule["value"], models?: rea
 });
 
 /** Follow USB (848) must be off: raw 0 allows, 1 refuses. */
-const FOLLOW_USB_OFF: WritePrerequisite = { paramId: 848, y: 0, models: ALL, allowed: ["0"], refused: ["1"] };
+const FOLLOW_USB_OFF: WritePrerequisite = { paramId: 848, y: 0, models: ALL, allowed: ["0"], refused: ["1"], condition: "follow_usb_off" };
 /** The recorder (836, URX44/V) must be stopped: raw 0 allows, 1…5 refuse. */
 const RECORDER_STOPPED: WritePrerequisite = { paramId: 836, y: 0, models: URX44S, allowed: ["0"], refused: ["1", "2", "3", "4", "5"] };
 
@@ -28,8 +28,8 @@ export const DEVICE_RULES = frozen({
   "device.usb-suppression": device(812, { kind: "choice", choices: ["none", "2-channels"] }),
   "device.date-format": device(787, { kind: "choice", choices: ["mm/dd/yyyy", "dd/mm/yyyy", "yyyy/mm/dd"] }, URX44S),
   "device.time-format": device(788, { kind: "choice", choices: ["24h", "12h"] }, URX44S),
-  // The device's own index; no city or UTC offset is implied.
-  "device.time-zone-index": device(831, { kind: "grid", unit: null, min: 0, max: 153, scale: 1 }, URX44S),
+  // The device's own index, an exact integer 0-153 with no rounding; no city or UTC offset is implied.
+  "device.time-zone-index": device(831, { kind: "numeric-set", unit: null, values: Array.from({ length: 154 }, (_, index) => index) }, URX44S),
   "device.hdmi-hdcp": device(767, { kind: "switch" }, ["URX44V"]),
   "device.hdmi-input-channels": device(768, { kind: "choice", choices: ["2-channels", "multi-channels"] }, ["URX44V"]),
   "device.sample-rate": {

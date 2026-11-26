@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { OperationContext } from "../src/operations/context.js";
 import { operationFailureOf } from "../src/operations/failure.js";
-import { dryRunSetting, previewSetting, readSetting, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
+import { dryRunSetting, dryRunSettingAfter, previewSetting, readSetting, settingHandlers, validateSetting, writeSetting, type ReadArgs, type WriteArgs } from "../src/operations/registry.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
@@ -112,7 +112,7 @@ describe("clock (F11-C) and Console Lock read (F20-L)", () => {
 
   it("dry-run the clock with its reads and no write; read the rate and lock strictly", async () => {
     const transport = new FakeTransport().script("getNumeric", read("0"), read("0"));
-    expect(await dryRunSetting(new OperationContext(transport, "URX44"), "device.sample-rate", {}, 176400)).toEqual({ requested: 176400, planned: 176400 });
+    expect(await dryRunSetting(new OperationContext(transport, "URX44"), "device.sample-rate", {}, 176400)).toEqual({ requested: 176400, planned: 176400, unverified: [] });
     expect(transport.calls.map((call) => call.address.paramId)).toEqual([848, 836]);
     expect(() => previewSetting("URX44", "device.sample-rate", {}, 48000)).toThrow(/invalid_input/);
     // Without a device, validation checks the value only: the prerequisites are the operation's reads.
@@ -145,5 +145,68 @@ describe("clock (F11-C) and Console Lock read (F20-L)", () => {
     }
     // Console Lock has no write: a known read-only setting.
     expect((await failureOf(writeAny(new OperationContext(new FakeTransport(), "URX44"), "device.console-lock", {}, false)))?.code).toBe("unsupported_operation");
+  });
+});
+
+describe("device review fixes (PR #31)", () => {
+  it("expose no write path for the Console Lock, through the public handler table included", async () => {
+    const handler = settingHandlers["device.console-lock"] as unknown as Record<string, unknown>;
+    expect(["plan", "write", "validate", "dryRun"].filter((key) => key in handler)).toEqual([]);
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      const t = new FakeTransport().script("getNumeric", read("1"));
+      expect((await readAny(new OperationContext(t, model), "device.console-lock", {})).value).toBe(true);
+      expect(t.calls.length).toBe(1);
+    }
+  });
+
+  it("take the time-zone index as an exact integer 0-153 only", async () => {
+    for (const model of ["URX44", "URX44V"] as const) {
+      for (const value of [0, 1, 138, 153]) {
+        expect(previewSetting(model, "device.time-zone-index", {}, value).planned).toBe(value);
+      }
+      for (const value of [0.5, 138.5, 138.75, 152.75, -1, 154, Number.NaN]) {
+        expect(() => previewSetting(model, "device.time-zone-index", {}, value), `${value}`).toThrow(/invalid_input/);
+        expect(() => validateSetting(model, "device.time-zone-index", {}, value), `${value}`).toThrow(/invalid_input/);
+        const none = new FakeTransport();
+        expect((await failureOf(writeAny(new OperationContext(none, model), "device.time-zone-index", {}, value)))?.code, `${value}`).toBe("invalid_input");
+        expect(none.calls).toEqual([]);
+      }
+      const t = new FakeTransport().script("setNumeric", accepted);
+      await writeAny(new OperationContext(t, model), "device.time-zone-index", {}, 138);
+      expect(t.calls.map(({ value }) => value)).toEqual(["138"]);
+    }
+  });
+
+  it("preview Follow USB without a device on URX22, where it reads nothing first", async () => {
+    for (const value of [true, false]) {
+      expect(previewSetting("URX22", "device.follow-usb", {}, value)).toEqual({ requested: value, planned: value });
+      const none = new FakeTransport();
+      expect(await dryRunSetting(new OperationContext(none, "URX22"), "device.follow-usb", {}, value)).toEqual({ requested: value, planned: value, unverified: [] });
+      expect(none.calls).toEqual([]);
+    }
+    // URX44/V read the recorder first, so their preview needs the device.
+    expect(() => previewSetting("URX44", "device.follow-usb", {}, true)).toThrow(/invalid_input/);
+  });
+
+  it("leave Follow USB unverified for a rate set after an unsent Follow USB write (O13), and nothing else", async () => {
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      const recorder = model === "URX22" ? [] : [read("0")];
+      // Follow USB is on now, but an earlier unsent line changes it: unverified, and the recorder is still checked.
+      const t = new FakeTransport().script("getNumeric", read("1"), ...recorder);
+      const plan = await dryRunSettingAfter(new OperationContext(t, model), new Set(["follow_usb_off"]), "device.sample-rate", {}, 48000);
+      expect(plan, model).toEqual({ requested: 48000, planned: 48000, unverified: ["follow_usb_off"] });
+      expect(t.calls.map((c) => c.address.paramId), model).toEqual(model === "URX22" ? [848] : [848, 836]);
+      // An invalid Follow USB answer is still an error, and a running recorder still refuses.
+      const bad = new FakeTransport().script("getNumeric", read("7"));
+      expect((await failureOf(dryRunSettingAfter(new OperationContext(bad, model), new Set(["follow_usb_off"]), "device.sample-rate", {}, 48000)))?.code).toBe("invalid_response");
+      if (model !== "URX22") {
+        const busy = new FakeTransport().script("getNumeric", read("0"), read("2"));
+        expect((await failureOf(dryRunSettingAfter(new OperationContext(busy, model), new Set(["follow_usb_off"]), "device.sample-rate", {}, 48000)))?.code).toBe("precondition_failed");
+      }
+      // Unaffected, Follow USB on still refuses.
+      const on = new FakeTransport().script("getNumeric", read("1"));
+      expect((await failureOf(dryRunSetting(new OperationContext(on, model), "device.sample-rate", {}, 48000)))?.code).toBe("precondition_failed");
+      expect([...t.calls, ...bad.calls, ...on.calls].filter((c) => c.method.startsWith("set"))).toEqual([]);
+    }
   });
 });

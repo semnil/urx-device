@@ -18,4 +18,10 @@ export const deviceHdmiHdcp = deviceRuleSetting<boolean>(DEVICE_RULES["device.hd
 export const deviceHdmiInputChannels = deviceRuleSetting<HdmiInputChannels>(DEVICE_RULES["device.hdmi-input-channels"]);
 export const deviceSampleRate = deviceRuleSetting<number>(DEVICE_RULES["device.sample-rate"]);
 export const deviceFollowUsb = deviceRuleSetting<boolean>(DEVICE_RULES["device.follow-usb"]);
-export const deviceConsoleLock = deviceRuleSetting<boolean>(DEVICE_RULES["device.console-lock"]);
+/** Read only (F20-L): no plan, write, validation or dry run is exposed. */
+export const deviceConsoleLock = readOnly(deviceRuleSetting<boolean>(DEVICE_RULES["device.console-lock"]));
+
+function readOnly<H extends { plan?: unknown; write?: unknown; validate?: unknown; dryRun?: unknown }>(handler: H) {
+  const { plan: _plan, write: _write, validate: _validate, dryRun: _dryRun, ...rest } = handler;
+  return rest;
+}

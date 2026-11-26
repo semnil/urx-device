@@ -367,6 +367,8 @@ export interface OutputSettingRule {
  * a failed precondition, and any other value is an invalid response.
  */
 export interface WritePrerequisite {
+  /** The O13 condition this check is, where an earlier write can change it; absent where none can. */
+  readonly condition?: "follow_usb_off";
   readonly paramId: number;
   readonly y: number;
   readonly models: readonly string[];
