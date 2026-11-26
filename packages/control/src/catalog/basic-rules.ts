@@ -60,14 +60,16 @@ const channel = (address: ChannelSettingRule["address"], value: ChannelSettingRu
 /** The input-port tokens with their raw values and models (F03-I). */
 const PORTS: SelectorRule = {
   kind: "selector",
-  known: [],
+  // Every port any model takes: one the connected model lacks is unsupported, not invalid.
+  known: Object.keys(INPUT_PORTS),
   choices: Object.entries(INPUT_PORTS).map(([token, port]) => ({ token, raw: port.raw, models: port.models })),
 };
 
 /** Rec Point stages in raw order; fixed stereo has only its two (F03-R). */
 const recPoints = (stages: readonly string[]): SelectorRule => ({
   kind: "selector",
-  known: [],
+  // This channel kind's stages only: a mono-only stage on a fixed stereo channel is an invalid value.
+  known: stages,
   choices: stages.map((stage) => ({ token: stage, raw: `${(REC_POINTS as readonly string[]).indexOf(stage)}` })),
 });
 

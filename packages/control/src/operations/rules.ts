@@ -201,7 +201,8 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
     case "selector": {
       // A choice listing models exists on those models only: elsewhere it reads as invalid and writes as unsupported.
       const choices = rule.choices.filter((choice) => choice.models === undefined || choice.models.includes(model));
-      const known = [...rule.known, ...rule.choices.map((choice) => choice.token)];
+      // The published known list decides unsupported against invalid, as a catalog reader decides it.
+      const known = rule.known;
       return {
         text: false,
         decode: (raw) => (raw === rule.none?.raw ? rule.none.value : choices.find((choice) => choice.raw === raw)?.token),

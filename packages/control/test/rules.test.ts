@@ -1,4 +1,5 @@
 import { settingHandlers } from "../src/operations/registry.js";
+import { type SelectorRule } from "../src/catalog/rules.js";
 import { describe, expect, it } from "vitest";
 import { MONO_CHANNELS, STEREO_CHANNELS } from "../src/catalog/channels.js";
 import { BASIC_RULES } from "../src/catalog/basic-rules.js";
@@ -272,5 +273,46 @@ describe("every read-only setting exposes no write path", () => {
         expect(none.calls, `${model} ${id}`).toEqual([]);
       }
     }
+  });
+});
+
+describe("selector judgments from the published catalog match the operations", () => {
+  /** A catalog reader's verdict: the model's choices plan, another known token is unsupported, anything else invalid. */
+  const judge = (rule: SelectorRule, model: string, token: string) => {
+    const choice = rule.choices.find((each) => each.token === token && (each.models === undefined || each.models.includes(model)));
+    if (choice !== undefined) return `planned ${choice.raw}`;
+    return rule.known.includes(token) ? "unsupported_operation" : "invalid_input";
+  };
+  const operation = (model: string, id: string, target: object, token: string) => {
+    try {
+      previewSetting(model, ...([id, target, token] as unknown as WriteArgs));
+    } catch (error) {
+      return operationFailureOf(error)?.code;
+    }
+    return "planned";
+  };
+
+  it("for the channel input source and Rec Point on every model and channel kind", () => {
+    const source = settingDefinitions["channel.source"].rule.value as SelectorRule;
+    const recPoint = settingDefinitions["channel.rec-point"].rule.value as { rules: { mono: SelectorRule; stereo: SelectorRule } };
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      const mono = MONO_CHANNELS[model][0] as number;
+      const stereo = STEREO_CHANNELS[model][0] as number;
+      for (const token of [...source.known, "usb-daw-13", "Input-1"]) {
+        for (const target of [{ channel: mono }, { channel: stereo, side: "left" }, { channel: stereo, side: "right" }]) {
+          const verdict = judge(source, model, token);
+          expect(operation(model, "channel.source", target, token), `${model} ${JSON.stringify(target)} ${token}`).toBe(verdict.startsWith("planned") ? "planned" : verdict);
+        }
+      }
+      for (const [kind, channel] of [["mono", mono], ["stereo", stereo]] as const) {
+        const rule = recPoint.rules[kind];
+        for (const token of [...recPoint.rules.mono.known, "pre-anything"]) {
+          const verdict = judge(rule, model, token);
+          expect(operation(model, "channel.rec-point", { channel }, token), `${model} ${kind} ${token}`).toBe(verdict.startsWith("planned") ? "planned" : verdict);
+        }
+      }
+    }
+    // A port another model takes is unsupported here, from the catalog alone.
+    expect(judge(source, "URX44", "hdmi-left")).toBe("unsupported_operation");
   });
 });
