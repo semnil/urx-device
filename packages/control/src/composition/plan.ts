@@ -8,7 +8,7 @@ import { settingDefinitions, type SettingDefinitionBase, type SettingId } from "
 import type { Model } from "../catalog/models.js";
 import { urxfValue, type UrxfChunk, type UrxfFile } from "../catalog/urxf.js";
 import { FX_RETURN_RULES } from "../catalog/fx-return.js";
-import type { FxParameterRule, GeqGainRule } from "../catalog/rules.js";
+import type { FxParameterRule } from "../catalog/rules.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
 import { decodeFileSetting, previewSetting, validateSetting, type ReadArgs, type WriteArgs } from "../operations/registry.js";
 import { codecOf } from "../operations/rules.js";
@@ -88,7 +88,7 @@ export function planCurrent(file: UrxfFile, model: Model): CurrentPlan {
         continue;
       }
       for (const target of targetsOf(rule, model)) {
-        const requested = setting === "bus.geq.gain" ? geqGainOf(chunk, target) : value(setting, target);
+        const requested = value(setting, target);
         const native = control(setting, target);
         if (native !== undefined) {
           omit(setting, target, native);
@@ -155,19 +155,6 @@ function deviceControlled(chunk: UrxfChunk, model: Model) {
     }
     return undefined;
   };
-}
-
-/** A Flex12GEQ band gain from the file: raw centi-dB −2400…1500 at its address. */
-function geqGainOf(chunk: UrxfChunk, target: object): number {
-  const { bus, side, band } = target as { bus: string; side: "left" | "right"; band: string };
-  const rule: GeqGainRule = settingDefinitions["bus.geq.gain"].rule;
-  const at = rule.address[bus];
-  if (at === undefined) {
-    return invalid();
-  }
-  const index = rule.bands.indexOf(band);
-  const raw = at.perBand === "x" ? urxfValue(chunk, at.paramId, index, at.y[side]) : urxfValue(chunk, at.paramId + index, 0, at.y[side]);
-  return typeof raw === "number" && Number.isInteger(raw) && raw >= rule.read.min && raw <= rule.read.max ? raw / rule.scale : invalid();
 }
 
 /**
