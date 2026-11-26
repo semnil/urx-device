@@ -561,18 +561,19 @@ async function requireEqType(context: OperationContext, rule: GeqGainRule, at: {
  */
 export function eqTypeGated<V, I = V>(base: ReturnType<typeof handler<V, I>>, gain: GeqGainRule) {
   /**
-   * The caller's target, read once before any request: the type read and the
-   * write then address the same bus and side even if the caller's object
-   * changes meanwhile. Every own key is kept, so the handler's checks still
-   * refuse what they refuse.
+   * The caller's target, checked and read once before any request: its keys
+   * must be `bus` and `side` only (anything else is refused before any other
+   * value is read), and the type read and the write then address the same
+   * bus and side even if the caller's object changes meanwhile.
    */
   const fixed = (target: unknown): unknown => {
-    if (typeof target !== "object" || target === null || Object.getPrototypeOf(target) !== Object.prototype) {
-      return target;
+    const own = targetOf<{ bus?: unknown; side?: unknown }>(target, ["bus", "side"]);
+    const copy: { bus?: unknown; side?: unknown } = {};
+    if (Object.hasOwn(own, "bus")) {
+      copy.bus = own.bus;
     }
-    const copy: Record<PropertyKey, unknown> = {};
-    for (const key of Reflect.ownKeys(target)) {
-      copy[key] = (target as Record<PropertyKey, unknown>)[key];
+    if (Object.hasOwn(own, "side")) {
+      copy.side = own.side;
     }
     return Object.freeze(copy);
   };

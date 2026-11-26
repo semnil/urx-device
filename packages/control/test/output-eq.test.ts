@@ -142,6 +142,26 @@ describe("output EQ switches and Flex12GEQ (F07-G)", () => {
     }
   });
 
+  it("refuse a GEQ write's extra target key before any request, __proto__ included", async () => {
+    for (const [id, base, value] of [
+      ["bus.geq.on", '{"bus":"mix-1","side":"left"', true],
+      ["bus.geq.link", '{"bus":"mix-1"', "off"],
+      ["bus.geq.limit", '{"bus":"mix-1","side":"left"', "plus-minus-12"],
+    ] as const) {
+      for (const extra of ['"__proto__":"x"', '"__proto__":1', '"__proto__":true', '"band":"20"']) {
+        const target: unknown = JSON.parse(`${base},${extra}}`);
+        for (const run of ["write", "dry-run"] as const) {
+          const none = new FakeTransport();
+          const c = new OperationContext(none, "URX44");
+          const args = [id, target, value] as unknown as WriteArgs;
+          const result = run === "write" ? writeSetting(c, ...args) : dryRunSetting(c, ...args);
+          expect((await failureOf(result))?.code, `${id} ${extra} ${run}`).toBe("invalid_input");
+          expect(none.calls, `${id} ${extra} ${run}`).toEqual([]);
+        }
+      }
+    }
+  });
+
   it("read every band's gain at its address, keeping off-grid values", async () => {
     for (const [bus, ids] of Object.entries(BUS)) {
       for (const side of ["left", "right"] as const) {
