@@ -3902,10 +3902,11 @@ mod notifications {
         // The expired request's callback leaves a thread-local whose destructor blocks, so
         // its thread does not finish ending. Bursts and pauses after it keep the threads
         // still running steady: one waits for it, and the others stay to be reused.
-        struct Blocks(mpsc::Receiver<()>);
+        struct Blocks(Sender<()>, mpsc::Receiver<()>);
         impl Drop for Blocks {
             fn drop(&mut self) {
-                let _ = self.0.recv_timeout(Duration::from_secs(20));
+                let _ = self.0.send(());
+                let _ = self.1.recv_timeout(Duration::from_secs(20));
             }
         }
         thread_local! {
@@ -3917,11 +3918,19 @@ mod notifications {
         // Long enough for a burst of four reads to be sent, short enough for the one behind
         // the hold to expire.
         let (connection, batches) = connect_sending(port, Duration::from_secs(1));
+        let connected = running.load(std::sync::atomic::Ordering::SeqCst);
         let _token = activate(&connection, &[p(1)]);
         let (release, stuck) = mpsc::channel();
+        let (entered, ending) = mpsc::channel();
         expire_on_a_completing_thread(&connection, &push, &batches, move || {
-            STUCK.with(|slot| *slot.borrow_mut() = Some(Blocks(stuck)));
+            STUCK.with(|slot| *slot.borrow_mut() = Some(Blocks(entered, stuck)));
         });
+        ending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the thread that ran the callback is ending, and stuck");
+        // The connection's own threads, the four a burst holds, and the one waiting for the
+        // stuck thread.
+        let bound = connected + 4 + 1;
         let operation = connection.create_operation().unwrap();
         let mut after = Vec::new();
         for _ in 0..4 {
@@ -3938,8 +3947,8 @@ mod notifications {
         }
         super::super::RUNNING.with(|counted| *counted.borrow_mut() = None);
         assert!(
-            after[3] <= after[1],
-            "threads still running after each pause: {after:?}"
+            after.iter().all(|&running| running <= bound),
+            "threads still running after each pause: {after:?}, at most {bound}"
         );
         drop(release);
     }
