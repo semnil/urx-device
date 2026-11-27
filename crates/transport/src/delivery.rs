@@ -88,16 +88,20 @@ impl Queue {
     /// Queues `record`, charged `bytes` (its originating frame's length),
     /// unless it would take the records or bytes past their limits.
     pub fn push(&mut self, record: NotificationRecord, bytes: usize) -> Result<(), Overflow> {
-        let (records, charged) = self.retained();
-        if records + 1 > MAX_PENDING_NOTIFICATIONS
-            || charged + bytes > MAX_PENDING_NOTIFICATION_BYTES
-        {
+        if !self.fits(bytes) {
             return Err(Overflow);
         }
         self.pending.push_back((record, bytes));
         self.pending_bytes += bytes;
         self.accepted += 1;
         Ok(())
+    }
+
+    /// Whether one more record charged `bytes` stays within the records and
+    /// bytes limits.
+    pub fn fits(&self, bytes: usize) -> bool {
+        let (records, charged) = self.retained();
+        records < MAX_PENDING_NOTIFICATIONS && charged + bytes <= MAX_PENDING_NOTIFICATION_BYTES
     }
 
     /// Records and charged bytes retained, the batch in delivery included.

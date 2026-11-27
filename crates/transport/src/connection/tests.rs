@@ -1195,6 +1195,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
             notifications: None,
+            at_receipt: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
             sent_registrations: std::sync::atomic::AtomicU64::new(0),
@@ -3913,6 +3914,125 @@ mod notifications {
             connection.terminal(),
             Some(RequestCause::NotificationOverflow)
         );
+    }
+
+    type Seen = Arc<Mutex<Vec<crate::delivery::NotificationRecord>>>;
+
+    /// A connection whose receipt observer keeps every record it is shown —
+    /// panicking instead on a numeric value equal to `fail_on` — and whose
+    /// delivery sends each batch with how many records had been seen by then.
+    fn connect_observed(
+        port: u16,
+        fail_on: Option<i64>,
+    ) -> (Connection, Receiver<(NotificationBatch, usize)>, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let counted = Arc::clone(&seen);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let observed = counted.lock().unwrap().len();
+            let _ = tx.lock().unwrap().send((batch, observed));
+        });
+        let kept = Arc::clone(&seen);
+        let observer: crate::connection::ReceiptObserver = Arc::new(move |record| {
+            if let (Some(fail), Notification::Numeric { value, .. }) = (fail_on, &record.payload) {
+                assert_ne!(*value, fail, "the observer failed");
+            }
+            kept.lock().unwrap().push(record.clone());
+        });
+        let connection = crate::connection::open_observed(
+            port,
+            ID,
+            &options(),
+            &Control::new(),
+            handler,
+            observer,
+        )
+        .unwrap();
+        (connection, batches, seen)
+    }
+
+    fn values(records: &[crate::delivery::NotificationRecord]) -> Vec<i64> {
+        records.iter().map(|record| numeric(record).1).collect()
+    }
+
+    #[test]
+    fn the_receipt_observer_sees_each_queued_record_while_the_delivery_waits() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, batches, seen) = connect_observed(port, None);
+        let a = activate(&connection, &[p(1), p(2)]);
+        push.send(notify_param(1, 1)).unwrap();
+        let (first, observed) = batches.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(values(&first.records), [1]);
+        assert_eq!(observed, 1, "seen before it is delivered");
+        for bytes in [notify_param(9, 0), notify_param(2, 2), notify_param(1, 3)] {
+            push.send(bytes).unwrap();
+        }
+        // The first batch is not acknowledged: nothing more is delivered, and
+        // what arrives meanwhile is seen as it is received.
+        super::wait_until(|| seen.lock().unwrap().len() == 3);
+        assert!(batches.recv_timeout(Duration::from_millis(200)).is_err());
+        let mut delivered = first.records.clone();
+        assert!(connection.adopt_notifications(first.ticket));
+        while delivered.len() < 3 {
+            let (batch, observed) = batches.recv_timeout(Duration::from_secs(5)).unwrap();
+            delivered.extend(batch.records.iter().cloned());
+            assert!(observed >= delivered.len(), "seen before it is delivered");
+            assert!(connection.adopt_notifications(batch.ticket));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            delivered,
+            "exactly the queued records, in receive order: not an unowned address"
+        );
+        assert_eq!(values(&delivered), [1, 2, 3]);
+        assert_eq!(delivered[0].recipients, [a.token()]);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn the_receipt_observer_does_not_see_a_record_past_the_budget() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches, seen) = connect_observed(port, None);
+        let _token = activate(&connection, &[p(1)]);
+        for value in 0..=(MAX_PENDING_NOTIFICATIONS as i64 + 1) {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(
+            connection.terminal(),
+            Some(RequestCause::NotificationOverflow)
+        );
+        assert_eq!(
+            values(&seen.lock().unwrap()),
+            (0..MAX_PENDING_NOTIFICATIONS as i64).collect::<Vec<_>>(),
+            "neither the record past the budget nor any after"
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn a_failed_receipt_observer_ends_the_connection_and_queues_nothing_more() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, batches, seen) = connect_observed(port, Some(2));
+        let _token = activate(&connection, &[p(1)]);
+        for value in 1..=3 {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(connection.terminal(), Some(RequestCause::InternalError));
+        assert_eq!(values(&seen.lock().unwrap()), [1]);
+        let mut delivered = Vec::new();
+        while let Ok((batch, _)) = batches.recv_timeout(Duration::from_millis(300)) {
+            delivered.extend(values(&batch.records));
+            connection.adopt_notifications(batch.ticket);
+        }
+        assert!(
+            delivered.iter().all(|value| *value == 1),
+            "neither the record it failed on nor any after: {delivered:?}"
+        );
+        assert!(connection.create_operation().is_err());
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     }
 
     #[test]
