@@ -92,12 +92,14 @@ export class ConsoleLockGuard implements WriteGuard {
     }
     context.guardWrites(this);
     this.#attached.add(context);
-    // The lock read's own failure, kept apart from the guard's stops.
-    let read: OperationFailure | undefined;
+    // The lock read's failure, kept apart from the guard's stops, with the stop as it stood when the failure
+    // arrived: what happens before the catch below runs is after it.
+    let read: { readonly failure: OperationFailure; readonly stopping: OperationCause | undefined } | undefined;
     try {
       this.#refuseIfStopped();
       const reading = await readSetting(context, "device.console-lock", {}).catch((error: unknown) => {
-        read = operationFailureOf(error);
+        const failure = operationFailureOf(error);
+        read = failure === undefined ? undefined : { failure, stopping: context.stopping };
         throw error;
       });
       if (reading.value) {
@@ -109,9 +111,10 @@ export class ConsoleLockGuard implements WriteGuard {
       // The operation's first stopping cause stays the code, whatever the lock read then returned, and
       // the read's own failure goes beside it.
       const failure = operationFailureOf(error);
-      const stopping = context.stopping;
+      // A read that failed of its own before any stop is the first failure, whatever stopped the operation after it.
+      const stopping = read !== undefined ? read.stopping : context.stopping;
       if (stopping !== undefined && failure !== undefined) {
-        const own = read !== undefined && read.cancelled !== true ? read : undefined;
+        const own = read !== undefined && read.failure.cancelled !== true ? read.failure : undefined;
         if (failure.code !== stopping || own !== undefined) {
           const later = own === undefined ? {} : { later: { code: own.code, phase: own.phase } };
           throw new OperationFailureError({ code: stopping, phase: failure.phase, progress: failure.progress, ...later });

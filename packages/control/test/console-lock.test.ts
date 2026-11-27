@@ -192,6 +192,36 @@ describe("Console Lock write guard (F20-L-A)", () => {
     }
   });
 
+  // The stop as it stood when the lock read's failure arrived decides it: an owner's stop that lands after that, before
+  // the guard has reported, does not take the failure's place.
+  it("decide by the stop as it stood when the lock read's failure arrived", async () => {
+    /** A context whose owner stops it right after the stop is first asked for once armed. */
+    class StoppedWhenAsked extends OperationContext {
+      armed = false;
+      override get stopping() {
+        const stopping = super.stopping;
+        if (this.armed) {
+          this.armed = false;
+          this.cancel("interrupted");
+        }
+        return stopping;
+      }
+    }
+    const late = { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const t = new FakeTransport();
+    let c: StoppedWhenAsked | undefined;
+    t.script("getNumeric", {
+      then(resolve: (record: unknown) => void) {
+        if (c) c.armed = true;
+        resolve(late);
+      },
+    });
+    c = new StoppedWhenAsked(t, "URX44");
+    const guard = await ConsoleLockGuard.open(c);
+    const failure = await failureOf(guard.begin(c));
+    expect([failure?.code, failure?.later, c.stopping]).toEqual(["response_timeout", undefined, "interrupted"]);
+  });
+
   // The registration's cancellation mark survives the guard's own report of it, its release failing or not.
   it("keep a cancelled registration's mark in the opening's failure", async () => {
     for (const release of [undefined, new Error("adapter failure")]) {

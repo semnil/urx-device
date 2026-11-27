@@ -110,6 +110,7 @@ class RateWatch implements WriteGuard {
 class ImportStops {
   readonly #context: OperationContext;
   #failed = false;
+  #closed = false;
   #later: LaterCause | null = null;
 
   constructor(context: OperationContext) {
@@ -129,9 +130,14 @@ class ImportStops {
     this.#failed = true;
   }
 
+  /** The import's result is settled (every write accepted): nothing found after this stopped it. */
+  close(): void {
+    this.#closed = true;
+  }
+
   /** `code` found at `phase`: the cause beside the stop when the import had already stopped and none was found before it. */
   found(code: OperationCause, phase: OperationPhase): void {
-    if (this.stopped && this.#later === null) {
+    if (!this.#closed && this.stopped && this.#later === null) {
       this.#later = { code, phase };
     }
   }
@@ -163,7 +169,9 @@ async function watchRate(context: OperationContext, fileRate: number, stops: Imp
   const failed = (error: unknown): string => {
     const failure = operationFailureOf(error) ?? { code: "internal_error" as const, phase: "preparation" as const, cancelled: undefined };
     if (failure.cancelled !== true) {
+      // Beside an earlier stop; otherwise this failure is the import's stop, from now.
       stops.found(failure.code, failure.phase);
+      stops.fail();
     }
     return context.stopping ?? failure.code;
   };
@@ -265,6 +273,11 @@ async function run(
       stops.fail();
     }
     outcome = rate.error !== null ? { steps: results, error: rate.error } : await runSteps(context, plan, results, failWith, dryRun);
+    // An execution whose every write was accepted is settled here: a stop or a condition found during the
+    // release does not make it a failure, and is not a cause beside one. A dry run settles after the release.
+    if (!dryRun && outcome.error === null) {
+      stops.close();
+    }
   } finally {
     const cleanup = await rate.release();
     if (outcome !== undefined) {

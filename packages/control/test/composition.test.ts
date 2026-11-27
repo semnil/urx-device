@@ -855,6 +855,36 @@ describe("CURRENT composition (K36, F18)", () => {
         "response_timeout",
         { code: "precondition_failed", phase: "preparation" },
       ],
+      // An execution whose every write was accepted is settled before the release: a stop and a rate change during
+      // the release add nothing to it, nor to a release failure.
+      [
+        "every write accepted, a stop and a rate change at the release",
+        ({ t, stop }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
+          releasing(t, () => {
+            stop();
+            t.notify(rateNote("96000"));
+          });
+        },
+        null,
+        null,
+      ],
+      [
+        "every write accepted, a stop and a rate change at the release, release lost",
+        ({ t, stop }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
+          releasing(
+            t,
+            () => {
+              stop();
+              t.notify(rateNote("96000"));
+            },
+            lost,
+          );
+        },
+        "connection_lost",
+        null,
+      ],
       [
         "a write rejected, rate notification at the release",
         ({ t }) => {
@@ -917,6 +947,39 @@ describe("CURRENT composition (K36, F18)", () => {
     for (const [name, build, error, later] of cases) {
       const result = await apply(build);
       expect([result.error, result.later], name).toEqual([error, later]);
+    }
+    // A rate read that fails of its own and a rate change notified some turns of the event loop later: while the rate
+    // subscription still holds, whichever the import met first is the error and the other is beside it, at every
+    // distance, in a dry run and at execution; a change notified after its release is not observed.
+    for (const dryRun of [false, true]) {
+      let observed = 0;
+      for (let turns = 0; turns < 40; turns += 1) {
+        let active = false;
+        const result = await apply(({ t }) => {
+          // Completions in microtasks, so the distances below reach past the read's handling and the release.
+          t.timers = false;
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              let later: Promise<void> = Promise.resolve();
+              for (let i = 0; i < turns; i += 1) later = later.then(() => undefined);
+              void later.then(() => {
+                active = t.subscriptions.some((s) => s.addresses.some((a) => a.paramId === 766) && s.state === "active");
+                t.notify(rateNote("96000"));
+              });
+            }, late),
+          );
+        }, dryRun);
+        const name = `dry run ${dryRun}, ${turns} turns, observed ${active}`;
+        if (active) {
+          observed += 1;
+          expect([result.error, result.later?.code].sort(), name).toEqual(["precondition_failed", "response_timeout"]);
+        } else {
+          expect([result.error, result.later], name).toEqual(["response_timeout", null]);
+        }
+      }
+      expect(observed, `dry run ${dryRun}: distances at which the change was observed`).toBeGreaterThan(0);
     }
     // The observation's own preparation failing, after the owner's stop and without one: the stop stays the error
     // and the failure goes beside it; without a stop the failure is the error. An exception that carries no
