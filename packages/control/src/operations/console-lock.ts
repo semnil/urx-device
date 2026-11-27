@@ -7,7 +7,7 @@
 // then refused at the send boundary and the attached operations cancelled.
 // No polling, unlock, bypass or password access; it reads nothing else.
 
-import { OperationFailureError, operationFailureOf, type OperationCause, type OperationFailure } from "./failure.js";
+import { marksOf, OperationFailureError, operationFailureOf, type OperationCause, type OperationFailure } from "./failure.js";
 import type { OperationContext, WriteGuard } from "./context.js";
 import { readSetting } from "./registry.js";
 import type { ParameterAddress, Transport, TransportNotification, TransportOperation, TransportSubscription } from "./transport.js";
@@ -55,8 +55,13 @@ export class ConsoleLockGuard implements WriteGuard {
         () => null,
         (failure: unknown) => operationFailureOf(failure)?.code ?? "internal_error",
       );
-      const failure = operationFailureOf(error) ?? { code: "internal_error" as const, phase: "admission" as const };
-      throw new OperationFailureError({ code: failure.code, phase: failure.phase, progress: cleanup === null ? null : { cleanup } });
+      const failure = operationFailureOf(error);
+      throw new OperationFailureError({
+        code: failure?.code ?? "internal_error",
+        phase: failure?.phase ?? "admission",
+        progress: cleanup === null ? null : { cleanup },
+        ...marksOf(failure),
+      });
     }
     return guard;
   }

@@ -7,7 +7,7 @@
 import { KNOB_RULES } from "../catalog/integration-panel.js";
 import type { KnobAssignment, KnobAssignmentReading } from "../catalog/settings.js";
 import type { OperationContext } from "./context.js";
-import { OperationFailureError } from "./failure.js";
+import { marksOf, OperationFailureError } from "./failure.js";
 import type { CompositeReadProgress, CompositeStep, Reading, WritePlan, WriteProgress, WriteResult } from "./results.js";
 import { address, modelOf, readTextDecoded, refuse, targetOf, writeText } from "./setting-io.js";
 
@@ -62,6 +62,7 @@ export const knobAssignment = {
           code: error.failure.code,
           phase: error.failure.phase,
           progress: { failedComponent: component.name },
+          ...marksOf(error.failure),
         });
       }
     }
@@ -97,6 +98,7 @@ export const knobAssignment = {
           code: failure.code,
           phase: failure.phase,
           progress: { requested: value, planned: value, outcome: steps[index]?.outcome ?? "uncertain", steps },
+          ...marksOf(error.failure),
         });
       }
     }

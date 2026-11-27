@@ -192,6 +192,25 @@ describe("Console Lock write guard (F20-L-A)", () => {
     }
   });
 
+  // The registration's cancellation mark survives the guard's own report of it, its release failing or not.
+  it("keep a cancelled registration's mark in the opening's failure", async () => {
+    for (const release of [undefined, new Error("adapter failure")]) {
+      for (const [rejection, mark] of [
+        [new OperationFailureError({ code: "interrupted", phase: "send", progress: null, cancelled: true }), true],
+        [new OperationFailureError({ code: "connection_lost", phase: "send", progress: null }), undefined],
+      ] as const) {
+        const t = new FakeTransport();
+        t.activation = rejection;
+        t.releaseFailure = release;
+        const failure = await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44")));
+        expect([failure?.code, failure?.cancelled], `${rejection.failure.code} release ${release === undefined ? "ok" : "fails"}`).toEqual([
+          rejection.failure.code,
+          mark,
+        ]);
+      }
+    }
+  });
+
   it("leave an operation that is not attached alone: a read-only line still reads after a lock", async () => {
     const t = new FakeTransport().script("getNumeric", read("0"), read("1"));
     const writer = new OperationContext(t, "URX44");

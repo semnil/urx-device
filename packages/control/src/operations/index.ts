@@ -3,7 +3,7 @@
 export { CONSOLE_LOCK_ADDRESS, ConsoleLockGuard } from "./console-lock.js";
 export { OperationContext } from "./context.js";
 export type { WriteGuard } from "./context.js";
-export { OperationFailureError, operationFailureOf } from "./failure.js";
+export { marksOf, OperationFailureError, operationFailureOf } from "./failure.js";
 export type { LaterCause, OperationCause, OperationFailure, OperationPhase } from "./failure.js";
 export { validateNameRead, validateNumericRead, validatePost, validateTextRead } from "./native.js";
 export type * from "./native.js";

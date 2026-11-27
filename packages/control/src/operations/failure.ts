@@ -67,6 +67,19 @@ export class OperationFailureError<P = unknown> extends Error {
   }
 }
 
+/**
+ * The marks a failure carries beyond its code, phase and progress (`later`,
+ * `cancelled`), for an operation that reports the same failure with its own
+ * progress: spread into the new failure, they keep a cancellation told apart
+ * from a failure of its own and keep the cause found after the stop.
+ */
+export function marksOf(failure: OperationFailure | undefined): Pick<OperationFailure, "later" | "cancelled"> {
+  return {
+    ...(failure?.later === undefined ? {} : { later: failure.later }),
+    ...(failure?.cancelled === true ? { cancelled: true as const } : {}),
+  };
+}
+
 /** The structured failure of `error`, if it carries one, else undefined. */
 export function operationFailureOf(error: unknown): OperationFailure | undefined {
   return error instanceof OperationFailureError ? error.failure : undefined;
