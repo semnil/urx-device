@@ -51,7 +51,9 @@ export type TransportNotification =
 export interface TransportSubscription {
   /**
    * Registers every address in order; settles once all are accepted. A
-   * rejection or failure rejects after the owned cleanup (K10).
+   * rejection or failure rejects after the owned cleanup (K10), with an
+   * `OperationFailureError`; one the owner's cancellation caused carries
+   * the stopping cause as its code and `cancelled: true`.
    */
   activate(): Promise<void>;
   /** Releases the subscription (K10); repeated calls join one completion. */

@@ -211,6 +211,52 @@ describe("knob assignment review fixes (PR #32)", () => {
     expect(stopped.calls).toEqual([]);
   });
 
+  // A component's failure keeps the cancellation mark through the composite's own progress: a component the stop
+  // cancelled is told apart from one that failed of its own with the stop's code.
+  it("keep a component's cancellation mark in the composite's failure, read and write alike", async () => {
+    const cancelled = { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const lost = { kind: "failure", failure: { kind: "cause", code: "connection_lost", phase: "response" }, evidence: { state: "unconfirmed" } };
+    for (const [record, mark] of [
+      [cancelled, true],
+      [lost, undefined],
+    ] as const) {
+      for (const index of [0, 1, 2]) {
+        // The stop comes while the component's request is out, and its record settles it.
+        let context: OperationContext | undefined;
+        const t = new FakeTransport().script(
+          "getText",
+          ...[0, 1, 2].slice(0, index).map(() => text("x")),
+          {
+            then(resolve: (value: unknown) => void) {
+              context?.cancel("connection_lost");
+              resolve(record);
+            },
+          },
+        );
+        context = new OperationContext(t, "URX44");
+        const read = await failureOf(readSetting(context, "knob.assignment", { bank: 1, knob: "a" }));
+        expect([read?.code, read?.cancelled], `read ${index} ${JSON.stringify(record)}`).toEqual(["connection_lost", mark]);
+        let writer: OperationContext | undefined;
+        const w = new FakeTransport().script(
+          "setText",
+          ...[0, 1, 2].slice(0, index).map(() => accepted),
+          {
+            then(resolve: (value: unknown) => void) {
+              writer?.cancel("connection_lost");
+              resolve({ ...record, evidence: { state: "unconfirmed" } });
+            },
+          },
+        );
+        writer = new OperationContext(w, "URX44");
+        const write = await failureOf(writeSetting(writer, "knob.assignment", { bank: 1, knob: "a" }, MON as never));
+        expect([write?.code, write?.cancelled], `write ${index} ${JSON.stringify(record)}`).toEqual(["connection_lost", mark]);
+        expect((write?.progress as { steps: Array<{ outcome: string }> }).steps.slice(0, index).map((s) => s.outcome)).toEqual(
+          [0, 1, 2].slice(0, index).map(() => "accepted"),
+        );
+      }
+    }
+  });
+
   it("keep one plan for preview, dry run and write, whatever the caller changes in its value object", async () => {
     const value: { function: string; parameter1: string; parameter2: string } = { ...MON };
     const preview = previewSetting("URX44", "knob.assignment", { bank: 1, knob: "a" }, value as never);

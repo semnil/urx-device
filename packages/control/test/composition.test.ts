@@ -14,6 +14,7 @@ import { OperationContext } from "../src/operations/context.js";
 import { OperationFailureError, operationFailureOf } from "../src/operations/failure.js";
 import { settingHandlers, validateSetting, type WriteArgs } from "../src/operations/registry.js";
 import { codecOf } from "../src/operations/rules.js";
+import type { TransportNotification } from "../src/operations/transport.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const models: Model[] = ["URX22", "URX44", "URX44V"];
@@ -653,28 +654,31 @@ describe("CURRENT composition (K36, F18)", () => {
       [rate("32000"), "invalid_response"],
     ] as const) {
       const { result, t } = await apply((t) => t.script("getNumeric", read("0"), after(t, [note], read("48000"))), true);
-      expect([result.error, ...result.steps.map((s) => s.outcome)], JSON.stringify(note)).toEqual([code, "not_sent", "not_sent", "not_sent"]);
+      expect([result.error, result.later, ...result.steps.map((s) => s.outcome)], JSON.stringify(note)).toEqual([code, null, "not_sent", "not_sent", "not_sent"]);
       expect(t.calls.filter((c) => c.method.startsWith("set"))).toEqual([]);
     }
-    // Execution: a rate change, then an invalid lock value, keeps the rate's cause; the reverse keeps the lock's.
-    for (const [notes, code] of [
-      [[rate("96000"), lock("2")], "precondition_failed"],
-      [[lock("2"), rate("96000")], "invalid_response"],
+    // Execution: a rate change, then an invalid lock value, keeps the rate's cause; the reverse keeps the lock's, the
+    // rate change found after it beside it. A lock found after a rate change is the guard's own stop.
+    for (const [notes, code, later] of [
+      [[rate("96000"), lock("2")], "precondition_failed", null],
+      [[lock("2"), rate("96000")], "invalid_response", { code: "precondition_failed", phase: "preparation" }],
     ] as const) {
       const { result } = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", after(t, notes, accepted), accepted, accepted).script("setText", accepted, accepted, accepted));
       // The refused step reports the same first cause.
       expect([result.error, ...result.steps.map((s) => `${s.outcome} ${s.error}`)], JSON.stringify(notes)).toEqual([code, "accepted null", `not_sent ${code}`, "not_sent null"]);
+      expect(result.later, JSON.stringify(notes)).toEqual(later);
     }
     // During the lock read, a lock before an invalid read value: the lock's cause stays, nothing is read or sent after.
     const reading = await apply((t) => t.script("getNumeric", after(t, [lock("1")], read("3"))));
-    expect([reading.result.error, reading.t.calls.length]).toEqual(["precondition_failed", 1]);
-    // During the rate read, an invalid lock value before a mismatched rate: the lock's cause stays.
+    expect([reading.result.error, reading.result.later, reading.t.calls.length]).toEqual(["precondition_failed", { code: "invalid_response", phase: "response" }, 1]);
+    // During the rate read, an invalid lock value before a mismatched rate: the lock's cause stays, the mismatch beside it.
     const early = await apply((t) => t.script("getNumeric", read("0"), after(t, [lock("2")], read("96000"))));
-    expect(early.result.error).toBe("invalid_response");
+    expect([early.result.error, early.result.later]).toEqual(["invalid_response", { code: "precondition_failed", phase: "preparation" }]);
     // A sent write rejected after a lock: the step keeps its rejection, the import the lock.
     const raced = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, after(t, [lock("1")], rejected), accepted).script("setText", accepted, accepted, accepted));
-    expect([raced.result.error, ...raced.result.steps.map((s) => `${s.outcome} ${s.error}`)]).toEqual([
+    expect([raced.result.error, raced.result.later, ...raced.result.steps.map((s) => `${s.outcome} ${s.error}`)]).toEqual([
       "precondition_failed",
+      null,
       "accepted null",
       "rejected device_rejected",
       "not_sent null",
@@ -710,13 +714,418 @@ describe("CURRENT composition (K36, F18)", () => {
       t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
       releasing(t, false);
     });
-    expect([settled.result.error, settled.result.cleanup, ...settled.result.steps.map((s) => s.outcome)]).toEqual([null, null, "accepted", "accepted", "accepted"]);
+    expect([settled.result.error, settled.result.cleanup, settled.result.later, ...settled.result.steps.map((s) => s.outcome)]).toEqual([
+      null,
+      null,
+      null,
+      "accepted",
+      "accepted",
+      "accepted",
+    ]);
     for (const fail of [false, true]) {
       const dry = await apply((t) => {
         t.script("getNumeric", read("0"), read("48000"));
         releasing(t, fail);
       }, true);
-      expect([dry.result.error, dry.result.cleanup], `release fails: ${fail}`).toEqual(["precondition_failed", fail ? "connection_lost" : null]);
+      expect([dry.result.error, dry.result.cleanup, dry.result.later], `release fails: ${fail}`).toEqual(["precondition_failed", fail ? "connection_lost" : null, null]);
+    }
+  });
+
+  // E3, in the order things are found: the first cause found after the import stopped is `later`, whatever
+  // comes after it; what was found before the stop, or before a failure that came after it, is not.
+  it("report beside the import's stop the first cause found after it, in the order found", async () => {
+    const plan = planCurrent(synthesize("URX22"), "URX22");
+    const head = { ...plan, steps: plan.steps.filter((s) => s.planned !== null).slice(0, 3), omissions: [] };
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
+    const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
+    const late = { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const cancelledRead = { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const lockNote = (value: string) => ({ kind: "numeric", address: { paramId: 895, x: "0", y: "0" }, value }) as const;
+    const rateNote = (value: string) => ({ kind: "numeric", address: { paramId: 766, x: "0", y: "0" }, value }) as const;
+    const lost = new OperationFailureError({ code: "connection_lost", phase: "response", progress: null });
+    type Env = { t: FakeTransport; stop: () => void; rateSubscription: (activate: (deliver: (n: TransportNotification) => void) => Promise<void>) => void };
+    const apply = async (build: (env: Env) => void, dryRun = false) => {
+      const t = new FakeTransport();
+      let context: OperationContext | undefined;
+      const stop = () => context?.cancel("interrupted");
+      // The rate observation's subscription, the one prepared after the guard's.
+      const rateSubscription = (activate: (deliver: (n: TransportNotification) => void) => Promise<void>) => {
+        const prepare = t.prepareSubscription.bind(t);
+        t.prepareSubscription = (addresses, operation, deliver) => {
+          const subscription = prepare(addresses, operation, deliver);
+          return { activate: () => activate(deliver), release: () => subscription.release() };
+        };
+      };
+      context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      build({ t, stop, rateSubscription });
+      try {
+        return await applyCurrent(context, head, { guard, dryRun });
+      } finally {
+        await guard.release().catch(() => undefined);
+      }
+    };
+    /** A reply that runs `first` (a stop, notifications) and then settles with `record`. */
+    const then = (first: () => void, record: unknown) => ({
+      then(resolve: (value: unknown) => void) {
+        first();
+        resolve(record);
+      },
+    });
+    const releasing = (t: FakeTransport, first: () => void, failure?: Error) => {
+      t.onRelease = () => {
+        t.onRelease = undefined;
+        first();
+      };
+      t.releaseFailure = failure;
+    };
+    const cases: ReadonlyArray<readonly [string, (env: Env) => void, string | null, unknown]> = [
+      [
+        "stop, rate notification, rate read late",
+        ({ t, stop }) =>
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              stop();
+              t.notify(rateNote("96000"));
+            }, late),
+          ),
+        "interrupted",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "stop, invalid rate notification, rate read late",
+        ({ t, stop }) =>
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              stop();
+              t.notify(rateNote("32000"));
+            }, late),
+          ),
+        "interrupted",
+        { code: "invalid_response", phase: "preparation" },
+      ],
+      [
+        "stop, rate read late, rate notification at the release",
+        ({ t, stop }) => {
+          t.script("getNumeric", read("0"), then(stop, late));
+          releasing(t, () => t.notify(rateNote("96000")));
+        },
+        "interrupted",
+        { code: "response_timeout", phase: "response" },
+      ],
+      [
+        "stop, rate notification during the registration, registration lost",
+        ({ t, stop, rateSubscription }) => {
+          t.script("getNumeric", read("0"));
+          rateSubscription(async (deliver) => {
+            stop();
+            deliver(rateNote("96000"));
+            throw lost;
+          });
+        },
+        "interrupted",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "every write accepted, rate notification at the release, release lost",
+        ({ t }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
+          releasing(t, () => t.notify(rateNote("96000")), lost);
+        },
+        "connection_lost",
+        null,
+      ],
+      [
+        "invalid rate notification, then the rate read mismatched",
+        ({ t }) => t.script("getNumeric", read("0"), then(() => t.notify(rateNote("32000")), read("96000"))),
+        "invalid_response",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "the rate read late with no stop before it, rate notification at the release",
+        ({ t }) => {
+          t.script("getNumeric", read("0"), late);
+          releasing(t, () => t.notify(rateNote("96000")));
+        },
+        "response_timeout",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      // An execution whose every write was accepted is settled before the release: a stop and a rate change during
+      // the release add nothing to it, nor to a release failure.
+      [
+        "every write accepted, a stop and a rate change at the release",
+        ({ t, stop }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
+          releasing(t, () => {
+            stop();
+            t.notify(rateNote("96000"));
+          });
+        },
+        null,
+        null,
+      ],
+      [
+        "every write accepted, a stop and a rate change at the release, release lost",
+        ({ t, stop }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
+          releasing(
+            t,
+            () => {
+              stop();
+              t.notify(rateNote("96000"));
+            },
+            lost,
+          );
+        },
+        "connection_lost",
+        null,
+      ],
+      [
+        "a write rejected, rate notification at the release",
+        ({ t }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, rejected, accepted).script("setText", accepted, accepted, accepted);
+          releasing(t, () => t.notify(rateNote("96000")));
+        },
+        "device_rejected",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      // The same code from another source is still a cause of its own; a cancellation is not.
+      [
+        "invalid lock notification, then the lock read invalid",
+        ({ t }) => t.script("getNumeric", then(() => t.notify(lockNote("2")), read("9"))),
+        "invalid_response",
+        { code: "invalid_response", phase: "response" },
+      ],
+      [
+        "invalid lock notification, then the lock read cancelled",
+        ({ t }) => t.script("getNumeric", then(() => t.notify(lockNote("2")), cancelledRead)),
+        "invalid_response",
+        null,
+      ],
+      [
+        "invalid lock notification during the rate read, then the rate read invalid",
+        ({ t }) => t.script("getNumeric", read("0"), then(() => t.notify(lockNote("2")), read("1"))),
+        "invalid_response",
+        { code: "invalid_response", phase: "response" },
+      ],
+      [
+        "lock notification during the rate read, then the rate read mismatched",
+        ({ t }) => t.script("getNumeric", read("0"), then(() => t.notify(lockNote("1")), read("96000"))),
+        "precondition_failed",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "invalid lock notification during the registration, then the registration invalid",
+        ({ t, rateSubscription }) => {
+          t.script("getNumeric", read("0"));
+          rateSubscription(async () => {
+            t.notify(lockNote("2"));
+            throw new OperationFailureError({ code: "invalid_response", phase: "response", progress: null });
+          });
+        },
+        "invalid_response",
+        { code: "invalid_response", phase: "response" },
+      ],
+      [
+        "invalid lock notification during the registration, then the registration cancelled",
+        ({ t, rateSubscription }) => {
+          t.script("getNumeric", read("0"));
+          rateSubscription(async () => {
+            t.notify(lockNote("2"));
+            throw new OperationFailureError({ code: "invalid_response", phase: "send", progress: null, cancelled: true });
+          });
+        },
+        "invalid_response",
+        null,
+      ],
+    ];
+    for (const [name, build, error, later] of cases) {
+      const result = await apply(build);
+      expect([result.error, result.later], name).toEqual([error, later]);
+    }
+    // A rate read that fails of its own and a rate change notified some turns of the event loop later: while the rate
+    // subscription still holds, whichever the import met first is the error and the other is beside it, at every
+    // distance, in a dry run and at execution; a change notified after its release is not observed.
+    for (const dryRun of [false, true]) {
+      let observed = 0;
+      for (let turns = 0; turns < 40; turns += 1) {
+        let active = false;
+        const result = await apply(({ t }) => {
+          // Completions in microtasks, so the distances below reach past the read's handling and the release.
+          t.timers = false;
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              let later: Promise<void> = Promise.resolve();
+              for (let i = 0; i < turns; i += 1) later = later.then(() => undefined);
+              void later.then(() => {
+                active = t.subscriptions.some((s) => s.addresses.some((a) => a.paramId === 766) && s.state === "active");
+                t.notify(rateNote("96000"));
+              });
+            }, late),
+          );
+        }, dryRun);
+        const name = `dry run ${dryRun}, ${turns} turns, observed ${active}`;
+        if (active) {
+          observed += 1;
+          expect([result.error, result.later?.code].sort(), name).toEqual(["precondition_failed", "response_timeout"]);
+        } else {
+          expect([result.error, result.later], name).toEqual(["response_timeout", null]);
+        }
+      }
+      expect(observed, `dry run ${dryRun}: distances at which the change was observed`).toBeGreaterThan(0);
+    }
+    // The last write accepted, then a stop and a rate change some turns later: a success the import settled has no
+    // cause beside it, and a release that then fails is reported alone; before the success was settled, the stop
+    // is the error and the change beside it.
+    for (const fails of [false, true]) {
+      for (let turns = 0; turns < 40; turns += 1) {
+        const result = await apply(({ t, stop }) => {
+          t.timers = false;
+          const last = then(() => {
+            let later: Promise<void> = Promise.resolve();
+            for (let i = 0; i < turns; i += 1) later = later.then(() => undefined);
+            void later.then(() => {
+              stop();
+              t.notify(rateNote("96000"));
+            });
+          }, accepted);
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, last).script("setText", accepted, accepted, last);
+          if (fails) t.releaseFailure = lost;
+        });
+        const name = `release fails ${fails}, ${turns} turns`;
+        if (result.error === "interrupted") {
+          expect(result.later?.code ?? null, name).not.toBe(null);
+        } else {
+          expect([result.error, result.later], name).toEqual([fails ? "connection_lost" : null, null]);
+        }
+      }
+    }
+    // A rate read the transport cancelled with no stop in the context ends the import; a rate change the
+    // subscription still receives after it is not lost: it is the error or the cause beside it.
+    for (const dryRun of [false, true]) {
+      for (let turns = 0; turns < 40; turns += 1) {
+        let active = false;
+        const result = await apply(({ t }) => {
+          t.timers = false;
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              let later: Promise<void> = Promise.resolve();
+              for (let i = 0; i < turns; i += 1) later = later.then(() => undefined);
+              void later.then(() => {
+                active = t.subscriptions.some((s) => s.addresses.some((a) => a.paramId === 766) && s.state === "active");
+                t.notify(rateNote("96000"));
+              });
+            }, cancelledRead),
+          );
+        }, dryRun);
+        const name = `dry run ${dryRun}, ${turns} turns, observed ${active}`;
+        const found = [result.error, result.later?.code];
+        if (active) {
+          expect(found, name).toContain("precondition_failed");
+        } else {
+          expect([result.error, result.later], name).toEqual(["internal_error", null]);
+        }
+      }
+    }
+    // The observation's own preparation failing, after the owner's stop and without one: the stop stays the error
+    // and the failure goes beside it; without a stop the failure is the error. An exception that carries no
+    // failure is an internal error.
+    for (const [where, thrown, code] of [
+      ["createOperation", new Error("adapter"), "internal_error"],
+      ["prepareSubscription", new Error("adapter"), "internal_error"],
+      ["prepareSubscription", lost, "connection_lost"],
+      ["activate", new Error("adapter"), "internal_error"],
+      ["activate", lost, "connection_lost"],
+    ] as const) {
+      for (const stopped of [true, false]) {
+        const result = await apply(({ t, stop }) => {
+          t.script("getNumeric", stopped ? then(stop, read("0")) : read("0"));
+          if (where === "createOperation") {
+            t.createOperation = () => {
+              throw thrown;
+            };
+          } else if (where === "prepareSubscription") {
+            t.prepareSubscription = () => {
+              throw thrown;
+            };
+          } else {
+            t.activation = thrown;
+          }
+        });
+        const name = `${where} ${thrown.message} after a stop: ${stopped}`;
+        expect([result.error, result.later], name).toEqual(stopped ? ["interrupted", { code, phase: thrown === lost ? "response" : "preparation" }] : [code, null]);
+      }
+    }
+  });
+
+  // E3: the owner's stop (a Ctrl+C) stays the import's error, and what a prerequisite found after it goes beside it:
+  // the lock read's or the rate read's own failure, or a rate change the read or a notification found. Nothing is
+  // read for it, and a read the stop cancelled adds nothing.
+  it("report beside the owner's stop what a prerequisite found after it", async () => {
+    const plan = planCurrent(synthesize("URX22"), "URX22");
+    const head = { ...plan, steps: plan.steps.filter((s) => s.planned !== null).slice(0, 3), omissions: [] };
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const failed = (code: string) => ({ kind: "failure", failure: { kind: "cause", code, phase: "response" }, evidence: { state: "unconfirmed" } });
+    const cancelled = { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const rate = (value: string) => ({ kind: "numeric", address: { paramId: 766, x: "0", y: "0" }, value }) as const;
+    const apply = async (build: (t: FakeTransport, stopped: (record: unknown) => unknown) => void) => {
+      const t = new FakeTransport();
+      let context: OperationContext | undefined;
+      /** A reply that settles with `record` once the owner has stopped the import. */
+      const stopped = (record: unknown) => ({
+        then(resolve: (value: unknown) => void) {
+          context?.cancel("interrupted");
+          resolve(record);
+        },
+      });
+      build(t, stopped);
+      context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      try {
+        return { result: await applyCurrent(context, head, { guard }), t };
+      } finally {
+        await guard.release().catch(() => undefined);
+      }
+    };
+    for (const [name, build, later, reads, handed] of [
+      ["lock read lost", (t, stopped) => t.script("getNumeric", stopped(failed("connection_lost"))), { code: "connection_lost", phase: "response" }, 1, 0],
+      ["lock read cancelled", (t, stopped) => t.script("getNumeric", stopped(cancelled)), null, 1, 0],
+      ["rate read late", (t, stopped) => t.script("getNumeric", read("0"), stopped(failed("response_timeout"))), { code: "response_timeout", phase: "response" }, 2, 0],
+      ["rate read mismatched", (t, stopped) => t.script("getNumeric", read("0"), stopped(read("96000"))), { code: "precondition_failed", phase: "preparation" }, 2, 0],
+      ["rate read cancelled", (t, stopped) => t.script("getNumeric", read("0"), stopped(cancelled)), null, 2, 0],
+      [
+        "rate notified after the stop",
+        (t, stopped) => {
+          // The stop came after the rate read was sent and it read the file's rate, so the steps go on to the
+          // transport, which refuses them unsent for the cancelled operation.
+          const unsent = { kind: "failure", failure: { kind: "cancelled", phase: "admission" }, evidence: { state: "not_sent" } };
+          t.script("getNumeric", read("0"), stopped(read("48000")))
+            .script("setNumeric", unsent, unsent, unsent)
+            .script("setText", unsent, unsent, unsent);
+          t.onRelease = () => {
+            t.onRelease = undefined;
+            t.notify(rate("96000"));
+          };
+        },
+        { code: "precondition_failed", phase: "preparation" },
+        2,
+        1,
+      ],
+    ] as const satisfies ReadonlyArray<readonly [string, (t: FakeTransport, stopped: (record: unknown) => unknown) => void, unknown, number, number]>) {
+      const { result, t } = await apply(build);
+      expect([result.error, result.later, ...result.steps.map((s) => s.outcome)], name).toEqual(["interrupted", later, "not_sent", "not_sent", "not_sent"]);
+      expect(t.calls.filter((c) => c.method === "getNumeric"), name).toHaveLength(reads);
+      // Handed over only where the steps ran, and refused unsent there.
+      expect(t.calls.filter((c) => c.method.startsWith("set")), name).toHaveLength(handed);
     }
   });
 

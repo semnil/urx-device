@@ -27,12 +27,32 @@ export type OperationCause =
 /** Where an operation failed: a request phase, or before any request. */
 export type OperationPhase = NativeRequestPhase | "preparation";
 
+/**
+ * A cause an operation found after it had already stopped for another (E3): the
+ * failure of a request it had sent, or a condition it found. The first
+ * stopping cause stays the failure's code; this is what the caller reports
+ * beside it.
+ */
+export interface LaterCause {
+  readonly code: OperationCause;
+  readonly phase: OperationPhase;
+}
+
 /** The serializable failure payload; it never relies on class identity. */
 export interface OperationFailure<P = unknown> {
   readonly code: OperationCause;
   readonly phase: OperationPhase;
   /** Typed execution evidence, or null when none exists. */
   readonly progress: P | null;
+  /** A cause found after `code` had stopped the operation; absent when there is none. */
+  readonly later?: LaterCause;
+  /**
+   * Set where the failure is the owner's cancellation, reported with its
+   * stopping cause as `code`: nothing failed of its own. `failureOf` sets it
+   * for a cancelled request, and a transport adapter for a subscription
+   * lifecycle its cancellation stopped (`TransportSubscription`).
+   */
+  readonly cancelled?: true;
 }
 
 /** The single failure type of shared operations (K3-B). */
@@ -45,6 +65,19 @@ export class OperationFailureError<P = unknown> extends Error {
     this.name = "OperationFailureError";
     this.failure = failure;
   }
+}
+
+/**
+ * The marks a failure carries beyond its code, phase and progress (`later`,
+ * `cancelled`), for an operation that reports the same failure with its own
+ * progress: spread into the new failure, they keep a cancellation told apart
+ * from a failure of its own and keep the cause found after the stop.
+ */
+export function marksOf(failure: OperationFailure | undefined): Pick<OperationFailure, "later" | "cancelled"> {
+  return {
+    ...(failure?.later === undefined ? {} : { later: failure.later }),
+    ...(failure?.cancelled === true ? { cancelled: true as const } : {}),
+  };
 }
 
 /** The structured failure of `error`, if it carries one, else undefined. */

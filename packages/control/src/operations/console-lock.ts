@@ -7,7 +7,7 @@
 // then refused at the send boundary and the attached operations cancelled.
 // No polling, unlock, bypass or password access; it reads nothing else.
 
-import { OperationFailureError, operationFailureOf, type OperationCause } from "./failure.js";
+import { marksOf, OperationFailureError, operationFailureOf, type OperationCause, type OperationFailure } from "./failure.js";
 import type { OperationContext, WriteGuard } from "./context.js";
 import { readSetting } from "./registry.js";
 import type { ParameterAddress, Transport, TransportNotification, TransportOperation, TransportSubscription } from "./transport.js";
@@ -55,8 +55,13 @@ export class ConsoleLockGuard implements WriteGuard {
         () => null,
         (failure: unknown) => operationFailureOf(failure)?.code ?? "internal_error",
       );
-      const failure = operationFailureOf(error) ?? { code: "internal_error" as const, phase: "admission" as const };
-      throw new OperationFailureError({ code: failure.code, phase: failure.phase, progress: cleanup === null ? null : { cleanup } });
+      const failure = operationFailureOf(error);
+      throw new OperationFailureError({
+        code: failure?.code ?? "internal_error",
+        phase: failure?.phase ?? "admission",
+        progress: cleanup === null ? null : { cleanup },
+        ...marksOf(failure),
+      });
     }
     return guard;
   }
@@ -70,7 +75,10 @@ export class ConsoleLockGuard implements WriteGuard {
    * Begins one write operation under the guard: attaches `context`, then
    * makes its one fresh strict lock read. A locked unit, a latched stop, or
    * a failed read rejects (the context detached), and no setting is sent;
-   * a stop latched before the rejection is its cause.
+   * a stop latched before the rejection is its cause. Where the operation
+   * had already stopped and the sent lock read then failed of its own, that
+   * failure is the failure's `later` (E3), whatever its code; a read the stop
+   * cancelled has none, and a lock the guard found is its own `stop`.
    * A context on another connection than the guard's is refused before any
    * request: the lock it observes would not be that connection's.
    * The returned function detaches the context once its operation is done.
@@ -84,19 +92,33 @@ export class ConsoleLockGuard implements WriteGuard {
     }
     context.guardWrites(this);
     this.#attached.add(context);
+    // The lock read's failure, kept apart from the guard's stops, with the stop as it stood when the failure
+    // arrived: what happens before the catch below runs is after it.
+    let read: { readonly failure: OperationFailure; readonly stopping: OperationCause | undefined } | undefined;
     try {
       this.#refuseIfStopped();
-      const reading = await readSetting(context, "device.console-lock", {});
+      const reading = await readSetting(context, "device.console-lock", {}).catch((error: unknown) => {
+        const failure = operationFailureOf(error);
+        read = failure === undefined ? undefined : { failure, stopping: context.stopping };
+        throw error;
+      });
       if (reading.value) {
         this.#latch("precondition_failed");
       }
       this.#refuseIfStopped();
     } catch (error) {
       detach();
-      // The operation's first stopping cause stays, whatever the lock read then returned.
+      // The operation's first stopping cause stays the code, whatever the lock read then returned, and
+      // the read's own failure goes beside it.
       const failure = operationFailureOf(error);
-      if (context.stopping !== undefined && failure !== undefined && failure.code !== context.stopping) {
-        throw new OperationFailureError({ code: context.stopping, phase: failure.phase, progress: failure.progress });
+      // A read that failed of its own before any stop is the first failure, whatever stopped the operation after it.
+      const stopping = read !== undefined ? read.stopping : context.stopping;
+      if (stopping !== undefined && failure !== undefined) {
+        const own = read !== undefined && read.failure.cancelled !== true ? read.failure : undefined;
+        if (failure.code !== stopping || own !== undefined) {
+          const later = own === undefined ? {} : { later: { code: own.code, phase: own.phase } };
+          throw new OperationFailureError({ code: stopping, phase: failure.phase, progress: failure.progress, ...later });
+        }
       }
       throw error;
     }

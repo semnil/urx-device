@@ -130,10 +130,19 @@ describe("Console Lock write guard (F20-L-A)", () => {
     expect((await failureOf(guard.release()))?.code).toBe("internal_error");
   });
 
-  it("keep a stop latched during the lock read as the cause, whatever the read returns", async () => {
-    for (const [note, reply, code] of [
-      ["1", read("3"), "precondition_failed"],
-      ["2", { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } }, "invalid_response"],
+  it("keep a stop latched during the lock read as the cause, whatever the read returns, its own failure beside it", async () => {
+    for (const [note, reply, code, later] of [
+      ["1", read("3"), "precondition_failed", { code: "invalid_response", phase: "response" }],
+      [
+        "2",
+        { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } },
+        "invalid_response",
+        { code: "response_timeout", phase: "response" },
+      ],
+      // The read's own invalid value, the same code as the stop's from another source.
+      ["2", read("9"), "invalid_response", { code: "invalid_response", phase: "response" }],
+      // A read the stop cancelled adds nothing.
+      ["2", { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } }, "invalid_response", undefined],
     ] as const) {
       const t = new FakeTransport();
       t.script("getNumeric", {
@@ -144,8 +153,91 @@ describe("Console Lock write guard (F20-L-A)", () => {
       });
       const c = new OperationContext(t, "URX44");
       const guard = await ConsoleLockGuard.open(c);
-      expect((await failureOf(guard.begin(c)))?.code, note).toBe(code);
+      const failure = await failureOf(guard.begin(c));
+      expect([failure?.code, failure?.later], note).toEqual([code, later]);
       expect(t.calls.filter((call) => call.method.startsWith("set"))).toEqual([]);
+    }
+  });
+
+  // The owner's stop (a Ctrl+C) stays the cause; the lock read it had already sent reports its own failure beside
+  // it, with one read and nothing more: a read the stop cancelled has nothing to add, and a lock the read found is
+  // the guard's own stop.
+  it("report the sent lock read's own failure beside an owner's stop, and nothing for its cancellation", async () => {
+    const failed = (code: string) => ({ kind: "failure", failure: { kind: "cause", code, phase: "response" }, evidence: { state: "unconfirmed" } });
+    const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
+    const cancelled = { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } };
+    for (const [reply, phase, later, stop] of [
+      [failed("connection_lost"), "response", { code: "connection_lost", phase: "response" }, undefined],
+      [rejected, "response", { code: "device_rejected", phase: "response" }, undefined],
+      [failed("response_timeout"), "response", { code: "response_timeout", phase: "response" }, undefined],
+      [read("7"), "response", { code: "invalid_response", phase: "response" }, undefined],
+      [cancelled, "response", undefined, undefined],
+      // Locked: refused at the guard's own check, with its stop.
+      [read("1"), "preparation", undefined, "precondition_failed"],
+    ] as const) {
+      const t = new FakeTransport();
+      let c: OperationContext | undefined;
+      t.script("getNumeric", {
+        then(resolve: (record: unknown) => void) {
+          c?.cancel("interrupted");
+          resolve(reply);
+        },
+      });
+      c = new OperationContext(t, "URX44");
+      const guard = await ConsoleLockGuard.open(c);
+      const failure = await failureOf(guard.begin(c));
+      expect([failure?.code, failure?.phase, failure?.later], JSON.stringify(reply)).toEqual(["interrupted", phase, later]);
+      expect(t.calls.filter((call) => call.method === "getNumeric")).toHaveLength(1);
+      expect(guard.stop, JSON.stringify(reply)).toBe(stop);
+    }
+  });
+
+  // The stop as it stood when the lock read's failure arrived decides it: an owner's stop that lands after that, before
+  // the guard has reported, does not take the failure's place.
+  it("decide by the stop as it stood when the lock read's failure arrived", async () => {
+    /** A context whose owner stops it right after the stop is first asked for once armed. */
+    class StoppedWhenAsked extends OperationContext {
+      armed = false;
+      override get stopping() {
+        const stopping = super.stopping;
+        if (this.armed) {
+          this.armed = false;
+          this.cancel("interrupted");
+        }
+        return stopping;
+      }
+    }
+    const late = { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const t = new FakeTransport();
+    let c: StoppedWhenAsked | undefined;
+    t.script("getNumeric", {
+      then(resolve: (record: unknown) => void) {
+        if (c) c.armed = true;
+        resolve(late);
+      },
+    });
+    c = new StoppedWhenAsked(t, "URX44");
+    const guard = await ConsoleLockGuard.open(c);
+    const failure = await failureOf(guard.begin(c));
+    expect([failure?.code, failure?.later, c.stopping]).toEqual(["response_timeout", undefined, "interrupted"]);
+  });
+
+  // The registration's cancellation mark survives the guard's own report of it, its release failing or not.
+  it("keep a cancelled registration's mark in the opening's failure", async () => {
+    for (const release of [undefined, new Error("adapter failure")]) {
+      for (const [rejection, mark] of [
+        [new OperationFailureError({ code: "interrupted", phase: "send", progress: null, cancelled: true }), true],
+        [new OperationFailureError({ code: "connection_lost", phase: "send", progress: null }), undefined],
+      ] as const) {
+        const t = new FakeTransport();
+        t.activation = rejection;
+        t.releaseFailure = release;
+        const failure = await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44")));
+        expect([failure?.code, failure?.cancelled], `${rejection.failure.code} release ${release === undefined ? "ok" : "fails"}`).toEqual([
+          rejection.failure.code,
+          mark,
+        ]);
+      }
     }
   });
 

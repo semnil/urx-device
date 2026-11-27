@@ -6,7 +6,7 @@ import type { I64Text } from "../catalog/i64.js";
 import type { ChannelName } from "../catalog/settings.js";
 import { isModel, type Model } from "../catalog/models.js";
 import type { OperationContext, Received } from "./context.js";
-import { OperationFailureError, type OperationCause } from "./failure.js";
+import { marksOf, OperationFailureError, type OperationCause } from "./failure.js";
 import type { NativeFailure, NativePostResult, NativeReadResult, PostEvidence } from "./native.js";
 import type { Reading, WriteOutcome, WritePlan, WriteProgress, WriteResult } from "./results.js";
 import type { ParameterAddress } from "./transport.js";
@@ -153,6 +153,7 @@ async function writeWith<V>(
       code: failure?.code ?? "internal_error",
       phase: failure?.phase ?? "delivery",
       progress: { ...plan, outcome },
+      ...marksOf(failure),
     });
   }
   if (record.kind === "success") {
