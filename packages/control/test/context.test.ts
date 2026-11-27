@@ -97,7 +97,7 @@ describe("operation context", () => {
     expect(transport.undelivered).toEqual(["t0"]);
   });
 
-  it("reports a cancellation with the owner's stopping cause, or internal_error without one", async () => {
+  it("reports a cancellation with the owner's stopping cause, or internal_error without one, marked cancelled", async () => {
     const record = {
       kind: "failure",
       failure: { kind: "cancelled", phase: "admission" },
@@ -114,6 +114,7 @@ describe("operation context", () => {
       code: "input_closed",
       phase: "admission",
       progress: { steps: 1 },
+      cancelled: true,
     });
     const rejected = {
       kind: "failure",

@@ -136,12 +136,15 @@ export class OperationContext {
 
   /**
    * The operation failure a failed record reports: its own cause, or for a
-   * cancellation the owner's stopping cause (`internal_error` without one).
+   * cancellation the owner's stopping cause (`internal_error` without one),
+   * marked `cancelled`.
    */
   failureOf<P>(record: NativeFailure<unknown>, progress: P | null): OperationFailureError<P> {
     const { failure } = record;
-    const code = failure.kind === "cause" ? failure.code : (this.#stopping ?? "internal_error");
-    return new OperationFailureError({ code, phase: failure.phase, progress });
+    if (failure.kind === "cause") {
+      return new OperationFailureError({ code: failure.code, phase: failure.phase, progress });
+    }
+    return new OperationFailureError({ code: this.#stopping ?? "internal_error", phase: failure.phase, progress, cancelled: true });
   }
 
   /**

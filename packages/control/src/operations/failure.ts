@@ -46,6 +46,13 @@ export interface OperationFailure<P = unknown> {
   readonly progress: P | null;
   /** A cause found after `code` had stopped the operation; absent when there is none. */
   readonly later?: LaterCause;
+  /**
+   * Set where the failure is the owner's cancellation, reported with its
+   * stopping cause as `code`: nothing failed of its own. `failureOf` sets it
+   * for a cancelled request, and a transport adapter for a subscription
+   * lifecycle its cancellation stopped (`TransportSubscription`).
+   */
+  readonly cancelled?: true;
 }
 
 /** The single failure type of shared operations (K3-B). */

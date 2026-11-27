@@ -139,6 +139,10 @@ describe("Console Lock write guard (F20-L-A)", () => {
         "invalid_response",
         { code: "response_timeout", phase: "response" },
       ],
+      // The read's own invalid value, the same code as the stop's from another source.
+      ["2", read("9"), "invalid_response", { code: "invalid_response", phase: "response" }],
+      // A read the stop cancelled adds nothing.
+      ["2", { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } }, "invalid_response", undefined],
     ] as const) {
       const t = new FakeTransport();
       t.script("getNumeric", {
