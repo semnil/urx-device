@@ -269,9 +269,7 @@ async function run(
   const rate = await watchRate(context, plan.fileRate, stops);
   let outcome: Outcome | undefined;
   try {
-    if (rate.error !== null) {
-      stops.fail();
-    }
+    // A failed observation has already stopped the import: its own failure marked it, a condition cancelled it.
     outcome = rate.error !== null ? { steps: results, error: rate.error } : await runSteps(context, plan, results, failWith, dryRun);
     // An execution whose every write was accepted is settled here: a stop or a condition found during the
     // release does not make it a failure, and is not a cause beside one. A dry run settles after the release.
