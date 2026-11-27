@@ -1,8 +1,8 @@
 //! The operational connection against a fake unit endpoint.
 
 use super::{
-    open, CloseOutcome, Connection, ConnectionOptions, LinkFailure, LinkLoss, MAX_WAITING_BYTES,
-    MAX_WAITING_REQUESTS,
+    open, CloseOutcome, Connection, ConnectionOptions, LinkFailure, LinkLoss, SentFrames,
+    MAX_WAITING_BYTES, MAX_WAITING_REQUESTS,
 };
 use crate::discovery::SystemFirmware;
 use crate::frame;
@@ -1199,6 +1199,8 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
             sent_registrations: std::sync::atomic::AtomicU64::new(0),
             sent_unregistrations: std::sync::atomic::AtomicU64::new(0),
+            sent_gets: std::sync::atomic::AtomicU64::new(0),
+            sent_sets: std::sync::atomic::AtomicU64::new(0),
             response_gate: std::sync::Mutex::new(None),
         }),
         written: Vec::new(),
@@ -2257,6 +2259,78 @@ fn an_opening_with_no_thread_to_start_fails_and_leaves_nothing_running() {
     }
 }
 
+// A parameter read or write counts in `sent_frames` once it is written whole,
+// before its answer: each kind of request adds one to its own count while the
+// unit holds its answer, and the answer, a refusal included, changes nothing.
+// A request refused before it was sent does not count, and nor do the
+// opening's own reads.
+#[test]
+fn a_request_counts_once_it_is_written_whole_whatever_its_answer() {
+    let (answer, held) = mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let peer = unit(move |request| {
+        let uri = request["vdp"]["uri"].as_str().unwrap();
+        let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(5));
+        if uri == "/vd/parameters/2:0:0?operation=value" {
+            return vec![post_reply(uri, json!({ "response_code": 400 }))];
+        }
+        plain(request)
+    });
+    let connection = connect(&peer);
+    assert_eq!(
+        connection.sent_frames(),
+        SentFrames::default(),
+        "the opening's reads are not counted"
+    );
+    let operation = connection.create_operation().unwrap();
+    let counts = |frames: SentFrames| (frames.gets, frames.sets);
+    for (sent, request, added) in [
+        (1, Request::GetNumeric(address(1)), (1, 0)),
+        (2, Request::SetNumeric(address(2), 1), (0, 1)),
+        (3, Request::SetText(address(3), "Vox".into()), (0, 1)),
+        (4, Request::GetText(address(4)), (1, 0)),
+        (5, Request::GetName(address(5)), (1, 0)),
+    ] {
+        let before = counts(connection.sent_frames());
+        let name = format!("{request:?}");
+        let pending = submit(&connection, &operation, request);
+        wait_until(|| parameter_uris(&peer).len() == sent);
+        let expected = (before.0 + added.0, before.1 + added.1);
+        assert_eq!(
+            counts(connection.sent_frames()),
+            expected,
+            "{name}: the unit holds the answer"
+        );
+        answer.send(()).unwrap();
+        outcome(&pending);
+        assert_eq!(
+            counts(connection.sent_frames()),
+            expected,
+            "{name}: answered"
+        );
+    }
+    let refused = connection.create_operation().unwrap();
+    refused.cancel();
+    assert_eq!(
+        outcome(&submit(
+            &connection,
+            &refused,
+            Request::SetNumeric(address(6), 1)
+        )),
+        cancelled()
+    );
+    assert_eq!(parameter_uris(&peer).len(), 5);
+    assert_eq!(
+        connection.sent_frames(),
+        SentFrames {
+            registrations: 0,
+            unregistrations: 0,
+            gets: 3,
+            sets: 2,
+        }
+    );
+}
+
 mod lifecycle {
     use super::{connect, firmware, online, options, ID, TEARDOWN};
     use crate::connection::{
@@ -2331,11 +2405,18 @@ mod lifecycle {
                 .filter(|uri| uri.ends_with(&format!("operation={operation}")))
                 .count() as u64
         };
+        let parameters: Vec<String> = peer
+            .uris()
+            .into_iter()
+            .filter(|uri| uri.starts_with("/vd/parameters"))
+            .collect();
         assert_eq!(
             connection.sent_frames(),
             SentFrames {
                 registrations: of("regist"),
                 unregistrations: of("unregist"),
+                gets: parameters.iter().filter(|uri| !uri.contains('?')).count() as u64,
+                sets: of("value"),
             },
             "{posted:?}"
         );
