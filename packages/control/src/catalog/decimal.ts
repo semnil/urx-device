@@ -203,23 +203,46 @@ export function canonicalRequest<V>(value: V): V {
   return Object.freeze({ decimal }) as V;
 }
 
-/** Whether `a`'s decimal expansion ends: its reduced denominator has no prime factor but 2 and 5. */
-function terminates(a: Exact): boolean {
-  let rest = a.d;
-  while (rest % 2n === 0n) {
-    rest /= 2n;
-  }
-  while (rest % 5n === 0n) {
-    rest /= 5n;
-  }
-  return rest === 1n;
+/** The number of binary digits of a positive integer. */
+function bits(value: bigint): number {
+  return value.toString(2).length;
 }
 
-/** The number nearest to `a`. */
+/**
+ * The number nearest to `a`, a tie going to the even significand, rounded
+ * once from the exact value: 53 significant bits, fewer below the normal
+ * range, and an infinity only where the nearest is beyond the largest
+ * finite number.
+ */
 export function toNumber(a: Exact): number {
-  // A finite expansion converts exactly; otherwise the quotient of the two
-  // integers, each exact as a number at the sizes a grid or a stop has.
-  return terminates(a) ? Number(formatExact(a)) : Number(a.n) / Number(a.d);
+  if (a.n === 0n) {
+    return 0;
+  }
+  const negative = a.n < 0n;
+  const n = negative ? -a.n : a.n;
+  const d = a.d;
+  // The exponent e with 2^e <= n / d < 2^(e + 1).
+  let e = bits(n) - bits(d);
+  if (e >= 0 ? n < d << BigInt(e) : n << BigInt(-e) < d) {
+    e -= 1;
+  }
+  if (e > 1023) {
+    return negative ? -Infinity : Infinity;
+  }
+  // The weight of the last bit kept: 52 below the leading one, or the
+  // smallest subnormal's.
+  const low = Math.max(e - 52, -1074);
+  const [num, den] = low >= 0 ? [n, d << BigInt(low)] : [n << BigInt(-low), d];
+  let q = num / den;
+  const twice = 2n * (num % den);
+  if (twice > den || (twice === den && (q & 1n) === 1n)) {
+    q += 1n;
+  }
+  // q has at most 54 bits and the power of two is one a number holds, so
+  // both convert exactly; their product is the rounded value or, past the
+  // largest, infinity.
+  const magnitude = Number(q) * 2 ** low;
+  return negative ? -magnitude : magnitude;
 }
 
 /** `a` in a request's own form: canonical decimal text, or the number nearest to it. */

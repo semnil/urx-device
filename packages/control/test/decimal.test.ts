@@ -234,6 +234,10 @@ describe("planOnGrid on numbers", () => {
     expect(planOnGrid(0.25, 0, 1, 2), "a midpoint goes to the lower value").toBe(0);
     expect(planOnGrid(1, 0, 1, 3)).toBe(1);
     expect(planOnGrid(0.25, 0, 1, 100)).toBe(0.25);
+    // The grid value chosen exactly, converted once to the number nearest to it.
+    expect(planOnGrid(0.03, 0, 1, 24000 / 1001)).toBe(0.041708333333333326);
+    expect(planOnGrid(-0.11, -1, 0, 24000 / 1001)).toBe(-0.125125);
+    expect(planOnGrid(1e308, 0, Infinity, 9e-309)).toBe(1.1111111111111112e308);
     for (const unitsPerOne of [0, -1, Infinity, Number.NaN]) {
       expect(planOnGrid(0.5, 0, 1, unitsPerOne), String(unitsPerOne)).toBeUndefined();
     }
