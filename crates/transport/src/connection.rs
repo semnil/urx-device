@@ -258,6 +258,11 @@ enum Event {
     Wake,
     Frame(Received),
     ReadFailed(RequestCause),
+    /// The reader stopped queueing notifications — an overflow, or a failed
+    /// receipt observer — and goes on reading: the connection ends with the
+    /// cause, and the reply to the request on the wire is still awaited
+    /// within its deadline and kept as evidence.
+    QueueingStopped(RequestCause),
 }
 
 /// One JSON frame as the reader received it.
@@ -410,7 +415,8 @@ pub fn open_with(
 /// budget (K6), nor any after an overflow. It must return promptly and must
 /// not call into the connection: the reader receives nothing, replies
 /// included, until it returns. If it panics, nothing more is queued and the
-/// connection ends with `internal_error`, as when the delivery callback fails.
+/// connection ends with `internal_error`; as after an overflow, the reply to
+/// the request on the wire is still awaited and kept as evidence.
 pub fn open_observed(
     port: u16,
     expected_id: &str,
@@ -1795,7 +1801,7 @@ fn read_until_stopped(
                                 _ => RequestCause::InternalError,
                             };
                             record(cause);
-                            let _ = events.send(Event::ReadFailed(cause));
+                            let _ = events.send(Event::QueueingStopped(cause));
                             continue;
                         }
                     }
@@ -2035,7 +2041,7 @@ fn serve(
                     note_loss(&shared, LinkLoss::UnitLost);
                     RequestCause::ConnectionLost
                 }),
-                Ok(Event::ReadFailed(cause)) => Some(cause),
+                Ok(Event::ReadFailed(cause) | Event::QueueingStopped(cause)) => Some(cause),
                 Err(_) => return,
             },
         };
@@ -2923,8 +2929,9 @@ fn exchange(
             true,
         ))
     };
-    // An overflow ends the connection but not this request: its reply is
-    // still awaited within its deadline and kept as evidence.
+    // A stop of the queueing (an overflow, or a failed receipt observer) ends
+    // the connection but not this request: its reply is still awaited within
+    // its deadline and kept as evidence.
     let mut ending = None;
     loop {
         let remaining = response_end.saturating_duration_since(Instant::now());
@@ -2949,8 +2956,8 @@ fn exchange(
                 }
             }
             Ok(Event::Wake) => {}
-            Ok(Event::ReadFailed(RequestCause::NotificationOverflow)) => {
-                ending = Some(RequestCause::NotificationOverflow);
+            Ok(Event::QueueingStopped(cause)) => {
+                ending.get_or_insert(cause);
             }
             Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
             Err(RecvTimeoutError::Timeout) => return unconfirmed(ending.unwrap_or(timeout)),

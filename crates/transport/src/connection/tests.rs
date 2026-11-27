@@ -4035,6 +4035,66 @@ mod notifications {
         assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     }
 
+    // A failed observer stops the queueing as an overflow does, and the reader
+    // goes on reading: the reply to the request on the wire is kept.
+    #[test]
+    fn a_reply_after_a_failed_receipt_observer_is_kept_and_the_connection_ends_with_it() {
+        let accept: fn(&Value) -> i64 = |_| 200;
+        let refuse: fn(&Value) -> i64 = |request| {
+            if uri_of(request).ends_with("operation=value") {
+                403
+            } else {
+                200
+            }
+        };
+        for (code, request, evidence) in [
+            (
+                accept,
+                Request::GetNumeric(param(5)),
+                crate::request::Evidence::Read,
+            ),
+            (
+                accept,
+                Request::SetNumeric(param(5), 3),
+                crate::request::Evidence::Accepted,
+            ),
+            (
+                refuse,
+                Request::SetNumeric(param(5), 3),
+                crate::request::Evidence::Rejected(403),
+            ),
+        ] {
+            let (port, push) = pushing_unit_coded(Duration::from_millis(300), code);
+            let (connection, _batches, _seen) = connect_observed(port, Some(-1));
+            let _token = activate(&connection, &[p(1)]);
+            let operation = connection.create_operation().unwrap();
+            let (tx, done) = mpsc::channel();
+            connection.submit_adopted(&operation, request.clone(), move |outcome| {
+                let _ = tx.send(outcome);
+            });
+            thread::sleep(Duration::from_millis(50));
+            push.send(notify_param(1, -1)).unwrap();
+            let outcome = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            match evidence {
+                crate::request::Evidence::Rejected(_) => assert!(
+                    matches!(&outcome, Outcome::Failure { evidence: found, .. } if *found == evidence),
+                    "{request:?}: {outcome:?}"
+                ),
+                _ => assert_eq!(
+                    outcome,
+                    Outcome::failed(
+                        RequestCause::InternalError,
+                        crate::request::RequestPhase::Delivery,
+                        evidence
+                    ),
+                    "{request:?}: the reply within its deadline is the evidence; its delivery fails"
+                ),
+            }
+            assert_eq!(connection.terminal(), Some(RequestCause::InternalError));
+            assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        }
+    }
+
     #[test]
     fn requests_waiting_at_an_overflow_end_with_it_on_close_or_cancel() {
         for close in [true, false] {
