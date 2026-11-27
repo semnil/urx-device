@@ -403,8 +403,14 @@ export type DecimalWriteArgs = {
   [K in DecimalWritableId]: [id: IdsWritingDecimal<Target<K>>, target: Target<K>, value: DecimalValue];
 }[DecimalWritableId];
 
-/** What a write of the arguments `A` plans and reports: decimal text for a decimal-text value, else the ID's write type. */
-type Planned<A extends WriteArgs | DecimalWriteArgs> = A[2] extends DecimalValue ? DecimalValue : Input<A[0]>;
+/**
+ * What a write of the arguments `A` plans and reports: decimal text for a
+ * decimal-text value, else the ID's write type, and both where the value's
+ * type admits both.
+ */
+type Planned<A extends WriteArgs | DecimalWriteArgs> = PlannedFor<A[2], A[0]>;
+// Distributed over the value's type: each form it admits answers in its own form.
+type PlannedFor<V, K extends SettingId> = V extends DecimalValue ? DecimalValue : Input<K>;
 
 /**
  * Reads `id` for `target`. An ID outside the catalog, reachable only from

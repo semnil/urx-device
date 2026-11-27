@@ -200,6 +200,13 @@ describe("numeric writes given as decimal text (W2)", () => {
       const forwarded = (...[model, ...args]: Parameters<typeof previewSetting>) => previewSetting(model, ...args);
       void forwarded("URX44", "channel.pan", { channel: 1 }, decimal("0.5"));
       void forwarded("URX44", ...(["channel.pan", { channel: 1 }, 0.5] as WriteArgs));
+      // A value that may be either form plans as either form.
+      const either = (value: number | DecimalValue) => previewSetting("URX44", "channel.pan", { channel: 1 }, value);
+      const both: { planned: number | DecimalValue } = either(2);
+      void both;
+      // @ts-expect-error a value that may be decimal text may plan as decimal text
+      const onlyNumber: { planned: number } = either(2);
+      void onlyNumber;
     };
     void check;
   });
