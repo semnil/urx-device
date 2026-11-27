@@ -2259,18 +2259,18 @@ fn an_opening_with_no_thread_to_start_fails_and_leaves_nothing_running() {
     }
 }
 
-// A parameter read or write counts in `sent_frames` once it is written whole:
-// its answer still awaited, a refusal and a success alike. A request refused
-// before it was sent does not, and nor do the opening's own reads.
+// A parameter read or write counts in `sent_frames` once it is written whole,
+// before its answer: each kind of request adds one to its own count while the
+// unit holds its answer, and the answer, a refusal included, changes nothing.
+// A request refused before it was sent does not count, and nor do the
+// opening's own reads.
 #[test]
 fn a_request_counts_once_it_is_written_whole_whatever_its_answer() {
     let (answer, held) = mpsc::channel::<()>();
     let held = std::sync::Mutex::new(held);
     let peer = unit(move |request| {
         let uri = request["vdp"]["uri"].as_str().unwrap();
-        if uri == "/vd/parameters/1:0:0" {
-            let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(5));
-        }
+        let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(5));
         if uri == "/vd/parameters/2:0:0?operation=value" {
             return vec![post_reply(uri, json!({ "response_code": 400 }))];
         }
@@ -2283,22 +2283,31 @@ fn a_request_counts_once_it_is_written_whole_whatever_its_answer() {
         "the opening's reads are not counted"
     );
     let operation = connection.create_operation().unwrap();
-    let pending = submit(&connection, &operation, Request::GetNumeric(address(1)));
-    wait_until(|| parameter_uris(&peer).len() == 1);
-    assert_eq!(
-        connection.sent_frames().gets,
-        1,
-        "the get the unit has, its answer held"
-    );
-    answer.send(()).unwrap();
-    outcome(&pending);
-    for request in [
-        Request::SetNumeric(address(2), 1),
-        Request::SetText(address(3), "Vox".into()),
-        Request::GetText(address(4)),
-        Request::GetName(address(5)),
+    let counts = |frames: SentFrames| (frames.gets, frames.sets);
+    for (sent, request, added) in [
+        (1, Request::GetNumeric(address(1)), (1, 0)),
+        (2, Request::SetNumeric(address(2), 1), (0, 1)),
+        (3, Request::SetText(address(3), "Vox".into()), (0, 1)),
+        (4, Request::GetText(address(4)), (1, 0)),
+        (5, Request::GetName(address(5)), (1, 0)),
     ] {
-        outcome(&submit(&connection, &operation, request));
+        let before = counts(connection.sent_frames());
+        let name = format!("{request:?}");
+        let pending = submit(&connection, &operation, request);
+        wait_until(|| parameter_uris(&peer).len() == sent);
+        let expected = (before.0 + added.0, before.1 + added.1);
+        assert_eq!(
+            counts(connection.sent_frames()),
+            expected,
+            "{name}: the unit holds the answer"
+        );
+        answer.send(()).unwrap();
+        outcome(&pending);
+        assert_eq!(
+            counts(connection.sent_frames()),
+            expected,
+            "{name}: answered"
+        );
     }
     let refused = connection.create_operation().unwrap();
     refused.cancel();
