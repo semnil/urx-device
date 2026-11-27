@@ -97,6 +97,13 @@ describe("operation context", () => {
     expect(transport.undelivered).toEqual(["t0"]);
   });
 
+  // An adapter's own caller can cancel a transport operation it holds with no cause to give.
+  it("lets a caller cancel the transport's operation without a cause", () => {
+    const transport = new FakeTransport();
+    transport.createOperation().cancel();
+    expect(transport.cancelCauses).toEqual([undefined]);
+  });
+
   it("reports a cancellation with the owner's stopping cause, or internal_error without one, marked cancelled", async () => {
     const record = {
       kind: "failure",

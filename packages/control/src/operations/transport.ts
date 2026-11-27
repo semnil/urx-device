@@ -24,9 +24,9 @@ export interface TransportOperation {
    * Idempotent: stops unsent work; sent evidence settles under its deadlines.
    * `cause` is the owner's stopping cause; the first one given stays, and it
    * is the code a failure this cancellation causes reports
-   * (`TransportSubscription.activate`).
+   * (`TransportSubscription.activate`). A caller with no cause may omit it.
    */
-  cancel(cause: OperationCause): void;
+  cancel(cause?: OperationCause): void;
   /** Releases the owner once its requests are consumed; no remote I/O. */
   finish(): void;
 }

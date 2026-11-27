@@ -27,8 +27,8 @@ export class FakeTransport implements Transport {
   readonly undelivered: string[] = [];
   #nextTicket = 0;
   cancelled = 0;
-  /** The cause each `cancel` was given, in order. */
-  readonly cancelCauses: OperationCause[] = [];
+  /** The cause each `cancel` was given, in order: `undefined` for none. */
+  readonly cancelCauses: (OperationCause | undefined)[] = [];
   finished = 0;
   readonly #scripts = new Map<Method, unknown[]>();
 
