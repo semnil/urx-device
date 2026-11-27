@@ -3,6 +3,7 @@
 // handles sockets, discovery or native handles.
 
 import type { I64Text } from "../catalog/i64.js";
+import type { OperationCause } from "./failure.js";
 import type {
   NativeNameReadResult,
   NativeNumericReadResult,
@@ -19,8 +20,13 @@ export interface ParameterAddress {
 
 /** A local owner of one logical operation's requests (K37). */
 export interface TransportOperation {
-  /** Idempotent: stops unsent work; sent evidence settles under its deadlines. */
-  cancel(): void;
+  /**
+   * Idempotent: stops unsent work; sent evidence settles under its deadlines.
+   * `cause` is the owner's stopping cause; the first one given stays, and it
+   * is the code a failure this cancellation causes reports
+   * (`TransportSubscription.activate`).
+   */
+  cancel(cause: OperationCause): void;
   /** Releases the owner once its requests are consumed; no remote I/O. */
   finish(): void;
 }
@@ -52,8 +58,10 @@ export interface TransportSubscription {
   /**
    * Registers every address in order; settles once all are accepted. A
    * rejection or failure rejects after the owned cleanup (K10), with an
-   * `OperationFailureError`; one the owner's cancellation caused carries
-   * the stopping cause as its code and `cancelled: true`.
+   * `OperationFailureError`. One the owner's cancellation caused carries the
+   * first cause given to its operation's `cancel` as its code, and
+   * `cancelled: true`; `internal_error` only when no cause was given. A
+   * registration's own failure keeps its cause and carries no such mark.
    */
   activate(): Promise<void>;
   /** Releases the subscription (K10); repeated calls join one completion. */

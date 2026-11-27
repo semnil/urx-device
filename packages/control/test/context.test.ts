@@ -110,6 +110,10 @@ describe("operation context", () => {
     context.cancel("interrupted");
     expect(context.stopping).toBe("input_closed");
     expect(transport.cancelled).toBe(2);
+    expect(transport.cancelCauses, "the transport is given the first cause each time").toEqual([
+      "input_closed",
+      "input_closed",
+    ]);
     expect(context.failureOf(record, { steps: 1 }).failure).toEqual({
       code: "input_closed",
       phase: "admission",

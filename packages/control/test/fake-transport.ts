@@ -2,6 +2,7 @@
 // resolves with the next scripted record for it and records the call.
 
 import type { I64Text } from "../src/catalog/i64.js";
+import type { OperationCause } from "../src/operations/failure.js";
 import type {
   ParameterAddress,
   Transport,
@@ -26,6 +27,8 @@ export class FakeTransport implements Transport {
   readonly undelivered: string[] = [];
   #nextTicket = 0;
   cancelled = 0;
+  /** The cause each `cancel` was given, in order. */
+  readonly cancelCauses: OperationCause[] = [];
   finished = 0;
   readonly #scripts = new Map<Method, unknown[]>();
 
@@ -37,8 +40,9 @@ export class FakeTransport implements Transport {
 
   createOperation(): TransportOperation {
     return {
-      cancel: () => {
+      cancel: (cause) => {
         this.cancelled += 1;
+        this.cancelCauses.push(cause);
       },
       finish: () => {
         this.finished += 1;

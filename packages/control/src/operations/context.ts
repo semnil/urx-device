@@ -86,11 +86,12 @@ export class OperationContext {
   /**
    * Stops the operation for `cause`, recorded before native cancellation so
    * a cancelled request reports the owner's actual cause (K34). The first
-   * cause stays.
+   * cause stays, and it is the one the transport's operation is given, so a
+   * failure the adapter reports for the cancellation names it too.
    */
   cancel(cause: OperationCause): void {
     this.#stopping ??= cause;
-    this.#operation.cancel();
+    this.#operation.cancel(this.#stopping);
   }
 
   /**
