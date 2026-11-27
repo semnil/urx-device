@@ -1195,7 +1195,6 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
             notifications: None,
-            at_receipt: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
             sent_registrations: std::sync::atomic::AtomicU64::new(0),
@@ -4092,6 +4091,42 @@ mod notifications {
             }
             assert_eq!(connection.terminal(), Some(RequestCause::InternalError));
             assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        }
+    }
+
+    // The reader thread holds the observer, so whatever the observer holds is
+    // let go once the connection is closed, whether it failed or not.
+    #[test]
+    fn the_transport_lets_go_of_the_receipt_observer_once_closed() {
+        for fail in [false, true] {
+            let (port, push) = pushing_unit(Duration::ZERO);
+            let (held, gone) = mpsc::channel::<()>();
+            let held = Mutex::new(held);
+            let handler: NotificationHandler = Arc::new(|_| {});
+            let observer: crate::connection::ReceiptObserver = Arc::new(move |_| {
+                let _held = &held;
+                assert!(!fail, "the observer failed");
+            });
+            let connection = crate::connection::open_observed(
+                port,
+                ID,
+                &options(),
+                &Control::new(),
+                handler,
+                observer,
+            )
+            .unwrap();
+            let _token = activate(&connection, &[p(1)]);
+            if fail {
+                push.send(notify_param(1, 1)).unwrap();
+                super::wait_until(|| connection.terminal().is_some());
+            }
+            assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+            assert_eq!(
+                gone.recv_timeout(Duration::from_secs(1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+                "failed: {fail}; the connection is still held here"
+            );
         }
     }
 

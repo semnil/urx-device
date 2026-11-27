@@ -223,8 +223,6 @@ struct Shared {
     expiry: Arc<Expiry>,
     /// Notifications waiting for the application (K6), when it takes them.
     notifications: Option<Mutex<Queue>>,
-    /// Shown each record as it is queued, when the application asked (`open_observed`).
-    at_receipt: Option<ReceiptObserver>,
     /// Signalled when a batch can be formed or delivery must stop.
     deliverable: Condvar,
     delivery_stop: AtomicBool,
@@ -416,7 +414,9 @@ pub fn open_with(
 /// not call into the connection: the reader receives nothing, replies
 /// included, until it returns. If it panics, nothing more is queued and the
 /// connection ends with `internal_error`; as after an overflow, the reply to
-/// the request on the wire is still awaited and kept as evidence.
+/// the request on the wire is still awaited and kept as evidence. The reader
+/// thread holds it and drops it once that thread ends, by the time the
+/// connection is closed.
 pub fn open_observed(
     port: u16,
     expected_id: &str,
@@ -526,7 +526,6 @@ impl Connection {
             notifications: notifications
                 .as_ref()
                 .map(|_| Mutex::new(Queue::new(generation))),
-            at_receipt: notifications.as_ref().and(at_receipt),
             deliverable: Condvar::new(),
             delivery_stop: AtomicBool::new(false),
             sent_registrations: AtomicU64::new(0),
@@ -538,6 +537,9 @@ impl Connection {
         });
         let (events, inbox) = mpsc::channel();
         let reader_stop = Arc::new(AtomicBool::new(false));
+        // Held by the reader thread, which shows it each record it queues, so
+        // the transport lets go of it once that thread ends.
+        let at_receipt = at_receipt.filter(|_| notifications.is_some());
         // A thread that cannot be started fails the opening; the ones already
         // started are stopped and waited for first, so nothing is left running.
         let abandon = |started: Vec<JoinHandle<()>>| {
@@ -570,7 +572,8 @@ impl Connection {
             let events = events.clone();
             let stop = Arc::clone(&reader_stop);
             let shared = Arc::clone(&shared);
-            match spawner.spawn(move || read_frames(sock, reader, events, stop, shared)) {
+            match spawner.spawn(move || read_frames(sock, reader, events, stop, shared, at_receipt))
+            {
                 Ok(thread) => thread,
                 Err(error) => {
                     abandon(delivery_thread.into_iter().collect());
@@ -1641,10 +1644,15 @@ enum Routed {
 }
 
 /// Decides, at receipt, which tokens a notification frame is for, and
-/// queues it for them within the budget (K6), showing it to the receipt
-/// observer first. Once `accepting` is false (after an overflow or a failed
+/// queues it for them within the budget (K6), showing it to `at_receipt`
+/// first. Once `accepting` is false (after an overflow or a failed
 /// observer), notifications are no longer queued.
-fn route(shared: &Shared, received: &Received, accepting: bool) -> Routed {
+fn route(
+    shared: &Shared,
+    received: &Received,
+    accepting: bool,
+    at_receipt: Option<&ReceiptObserver>,
+) -> Routed {
     let Some(payload) = Inbound::new(received.message.clone()).notification() else {
         return Routed::NotNotification;
     };
@@ -1673,7 +1681,7 @@ fn route(shared: &Shared, received: &Received, accepting: bool) -> Routed {
         received_at_ms: received.received_at_ms,
         payload,
     };
-    if let Some(observe) = &shared.at_receipt {
+    if let Some(observe) = at_receipt {
         // Only this thread queues, and nothing else adds to what the queue
         // retains, so a record that fits now still fits once it is seen.
         if !lock(queue).fits(received.len) {
@@ -1723,15 +1731,18 @@ fn deliver_notifications(shared: &Shared, handler: &NotificationHandler, events:
     }
 }
 
-/// Receives frames until told to stop or the link fails.
+/// Receives frames until told to stop or the link fails, showing each
+/// queued notification to `at_receipt`, which it drops on the way out.
 fn read_frames(
     sock: TcpStream,
     reader: FrameReader,
     events: Sender<Event>,
     stop: Arc<AtomicBool>,
     shared: Arc<Shared>,
+    at_receipt: Option<ReceiptObserver>,
 ) {
-    read_until_stopped(sock, reader, &events, &stop, &shared);
+    read_until_stopped(sock, reader, &events, &stop, &shared, at_receipt.as_ref());
+    drop(at_receipt);
     // Whatever the reader met is reported by now, or never will be.
     lock(&shared.ops).reading = false;
     shared.ops_changed.notify_all();
@@ -1744,6 +1755,7 @@ fn read_until_stopped(
     events: &Sender<Event>,
     stop: &AtomicBool,
     shared: &Arc<Shared>,
+    at_receipt: Option<&ReceiptObserver>,
 ) {
     let shared = Arc::clone(shared);
     let record = |cause| {
@@ -1790,7 +1802,7 @@ fn read_until_stopped(
                         cutoff: 0,
                     };
                     // Recipients and budget are decided here, at receipt.
-                    match route(&shared, &received, queueing) {
+                    match route(&shared, &received, queueing, at_receipt) {
                         Routed::NotNotification => {}
                         Routed::Queued | Routed::Dropped => continue,
                         // Only while queueing: once not, `route` drops every notification.
