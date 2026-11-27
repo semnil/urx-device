@@ -97,6 +97,13 @@ describe("operation context", () => {
     expect(transport.undelivered).toEqual(["t0"]);
   });
 
+  // An adapter's own caller can cancel a transport operation it holds with no cause to give.
+  it("lets a caller cancel the transport's operation without a cause", () => {
+    const transport = new FakeTransport();
+    transport.createOperation().cancel();
+    expect(transport.cancelCauses).toEqual([undefined]);
+  });
+
   it("reports a cancellation with the owner's stopping cause, or internal_error without one, marked cancelled", async () => {
     const record = {
       kind: "failure",
@@ -110,6 +117,10 @@ describe("operation context", () => {
     context.cancel("interrupted");
     expect(context.stopping).toBe("input_closed");
     expect(transport.cancelled).toBe(2);
+    expect(transport.cancelCauses, "the transport is given the first cause each time").toEqual([
+      "input_closed",
+      "input_closed",
+    ]);
     expect(context.failureOf(record, { steps: 1 }).failure).toEqual({
       code: "input_closed",
       phase: "admission",
