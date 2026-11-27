@@ -981,6 +981,61 @@ describe("CURRENT composition (K36, F18)", () => {
       }
       expect(observed, `dry run ${dryRun}: distances at which the change was observed`).toBeGreaterThan(0);
     }
+    // The last write accepted, then a stop and a rate change some turns later: a success the import settled has no
+    // cause beside it, and a release that then fails is reported alone; before the success was settled, the stop
+    // is the error and the change beside it.
+    for (const fails of [false, true]) {
+      for (let turns = 0; turns < 40; turns += 1) {
+        const result = await apply(({ t, stop }) => {
+          t.timers = false;
+          const last = then(() => {
+            let later: Promise<void> = Promise.resolve();
+            for (let i = 0; i < turns; i += 1) later = later.then(() => undefined);
+            void later.then(() => {
+              stop();
+              t.notify(rateNote("96000"));
+            });
+          }, accepted);
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, last).script("setText", accepted, accepted, last);
+          if (fails) t.releaseFailure = lost;
+        });
+        const name = `release fails ${fails}, ${turns} turns`;
+        if (result.error === "interrupted") {
+          expect(result.later?.code ?? null, name).not.toBe(null);
+        } else {
+          expect([result.error, result.later], name).toEqual([fails ? "connection_lost" : null, null]);
+        }
+      }
+    }
+    // A rate read the transport cancelled with no stop in the context ends the import; a rate change the
+    // subscription still receives after it is not lost: it is the error or the cause beside it.
+    for (const dryRun of [false, true]) {
+      for (let turns = 0; turns < 40; turns += 1) {
+        let active = false;
+        const result = await apply(({ t }) => {
+          t.timers = false;
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              let later: Promise<void> = Promise.resolve();
+              for (let i = 0; i < turns; i += 1) later = later.then(() => undefined);
+              void later.then(() => {
+                active = t.subscriptions.some((s) => s.addresses.some((a) => a.paramId === 766) && s.state === "active");
+                t.notify(rateNote("96000"));
+              });
+            }, cancelledRead),
+          );
+        }, dryRun);
+        const name = `dry run ${dryRun}, ${turns} turns, observed ${active}`;
+        const found = [result.error, result.later?.code];
+        if (active) {
+          expect(found, name).toContain("precondition_failed");
+        } else {
+          expect([result.error, result.later], name).toEqual(["internal_error", null]);
+        }
+      }
+    }
     // The observation's own preparation failing, after the owner's stop and without one: the stop stays the error
     // and the failure goes beside it; without a stop the failure is the error. An exception that carries no
     // failure is an internal error.
