@@ -4130,6 +4130,134 @@ mod notifications {
         }
     }
 
+    /// A unit that answers the handshake and every POST, and hangs up once
+    /// the returned sender is dropped.
+    fn hanging_up_unit() -> (u16, Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (hang_up, told) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let closer = stream.try_clone().unwrap();
+            thread::spawn(move || {
+                let _ = told.recv();
+                let _ = closer.shutdown(std::net::Shutdown::Both);
+            });
+            for request in BufReader::new(stream).lines() {
+                let Ok(request) = request else { return };
+                let request: Value = serde_json::from_str(&request).unwrap();
+                let uri = uri_of(&request).to_string();
+                let reply = match uri.as_str() {
+                    "/vd/synchronize" => get_reply("/vd/synchronize", online(ID)),
+                    "/vd/device" => get_reply("/vd/device", firmware()),
+                    _ => line(
+                        json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": 200 } } }),
+                    ),
+                };
+                if writer.write_all(&reply).is_err() {
+                    return;
+                }
+            }
+        });
+        (port, hang_up)
+    }
+
+    /// Runs `then` when dropped: what a receipt observer holds, reporting when
+    /// the reader lets go of it.
+    struct OnDrop<F: FnMut()>(F);
+
+    impl<F: FnMut()> Drop for OnDrop<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
+    // The observer is let go only once the reader has said it stopped
+    // reading, so a close that drop starts finds the reader's end reported.
+    #[test]
+    fn the_reader_reports_its_end_before_it_lets_go_of_the_receipt_observer() {
+        let (port, _hang_up) = hanging_up_unit();
+        let slot: Arc<OnceLock<Weak<Connection>>> = Arc::new(OnceLock::new());
+        let (tx, reading) = mpsc::channel();
+        let probe = {
+            let slot = Arc::clone(&slot);
+            let tx = Mutex::new(tx);
+            OnDrop(move || {
+                let connection = slot.get().and_then(Weak::upgrade);
+                let read = connection.map(|c| crate::connection::lock(&c.shared.ops).reading);
+                let _ = tx.lock().unwrap().send(read);
+            })
+        };
+        let observer: crate::connection::ReceiptObserver = Arc::new(move |_| {
+            let _ = &probe;
+        });
+        let handler: NotificationHandler = Arc::new(|_| {});
+        let connection = Arc::new(
+            crate::connection::open_observed(
+                port,
+                ID,
+                &options(),
+                &Control::new(),
+                handler,
+                observer,
+            )
+            .unwrap(),
+        );
+        slot.set(Arc::downgrade(&connection)).unwrap();
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        assert_eq!(
+            reading.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some(false),
+            "the reader's end was reported when the observer was let go"
+        );
+    }
+
+    /// What a receipt observer holds: the connection, dropped first, then
+    /// `_then`, which reports once that drop, and the close it starts, return.
+    struct Holding<F: FnMut()> {
+        connection: Mutex<Option<Arc<Connection>>>,
+        _then: OnDrop<F>,
+    }
+
+    // The observer can hold the last reference to the connection: the reader
+    // then drops it as it ends, and the close that starts finishes on a
+    // helper rather than waiting for the reader itself.
+    #[test]
+    fn a_connection_the_receipt_observer_holds_last_closes_at_once_when_the_unit_hangs_up() {
+        let (port, hang_up) = hanging_up_unit();
+        let (tx, returned) = mpsc::channel::<()>();
+        let tx = Mutex::new(tx);
+        let holding = Arc::new(Holding {
+            connection: Mutex::new(None),
+            _then: OnDrop(move || {
+                let _ = tx.lock().unwrap().send(());
+            }),
+        });
+        let held = Arc::clone(&holding);
+        let observer: crate::connection::ReceiptObserver = Arc::new(move |_| {
+            let _ = &held;
+        });
+        let handler: NotificationHandler = Arc::new(|_| {});
+        let connection = crate::connection::open_observed(
+            port,
+            ID,
+            &options(),
+            &Control::new(),
+            handler,
+            observer,
+        )
+        .unwrap();
+        *holding.connection.lock().unwrap() = Some(Arc::new(connection));
+        drop(holding);
+        drop(hang_up);
+        assert_eq!(
+            returned.recv_timeout(Duration::from_secs(1)),
+            Ok(()),
+            "the drop returned within a second, not at the end of the teardown budget"
+        );
+    }
+
     #[test]
     fn requests_waiting_at_an_overflow_end_with_it_on_close_or_cancel() {
         for close in [true, false] {

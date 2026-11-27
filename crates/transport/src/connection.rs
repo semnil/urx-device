@@ -296,6 +296,7 @@ pub struct Connection {
     /// Kept apart from the handles, which a close takes.
     worker_id: ThreadId,
     delivery_id: Option<ThreadId>,
+    reader_id: ThreadId,
     reader: Mutex<Option<JoinHandle<()>>>,
     close: Arc<CloseCell>,
 }
@@ -596,6 +597,7 @@ impl Connection {
         Ok(Connection {
             generation,
             delivery_id: delivery_thread.as_ref().map(|handle| handle.thread().id()),
+            reader_id: reader_thread.thread().id(),
             delivery: Mutex::new(delivery_thread),
             firmware,
             shared,
@@ -903,8 +905,10 @@ impl Connection {
             end,
         };
         if self.on_own_thread() {
-            // A completion or delivery callback cannot wait for the thread it
-            // runs on; a helper finishes the close within the same budget.
+            // A completion or delivery callback, or the reader dropping a
+            // receipt observer that held the last reference, cannot wait for
+            // the thread it runs on; a helper finishes the close within the
+            // same budget.
             let cell = Arc::clone(&self.close);
             let slot = Arc::new(Mutex::new(Some(rest)));
             let taken = Arc::clone(&slot);
@@ -930,19 +934,21 @@ impl Connection {
     }
 
     /// Whether this thread is one the close waits for: the worker, the
-    /// notification delivery thread, a completing thread, or the thread
-    /// running the close.
+    /// notification delivery thread, the reader, a completing thread, or the
+    /// thread running the close.
     fn must_not_wait(&self) -> bool {
         let me = thread::current().id();
         self.on_own_thread() || lock(&self.close.exempt).contains(&me)
     }
 
-    /// Whether this is the worker, the notification delivery thread or a
-    /// completing thread (an expired request's, or what a close took).
+    /// Whether this is the worker, the notification delivery thread, the
+    /// reader or a completing thread (an expired request's, or what a close
+    /// took).
     fn on_own_thread(&self) -> bool {
         let me = thread::current().id();
         self.worker_id == me
             || self.delivery_id == Some(me)
+            || self.reader_id == me
             || lock(&self.shared.expiry.pool).ids.contains(&me)
     }
 }
@@ -1742,10 +1748,12 @@ fn read_frames(
     at_receipt: Option<ReceiptObserver>,
 ) {
     read_until_stopped(sock, reader, &events, &stop, &shared, at_receipt.as_ref());
-    drop(at_receipt);
     // Whatever the reader met is reported by now, or never will be.
     lock(&shared.ops).reading = false;
     shared.ops_changed.notify_all();
+    // Last: the observer can hold the last reference to the connection, and
+    // the close its drop starts waits for what the reader's end lets go.
+    drop(at_receipt);
 }
 
 /// The reader's loop (`read_frames`).
