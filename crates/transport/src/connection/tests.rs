@@ -1136,10 +1136,23 @@ struct Scripted {
     writes: usize,
     /// Whether the reader could record an end while a write was running.
     recordable_during_write: bool,
+    /// The error the socket holds pending.
+    pending: Option<std::io::ErrorKind>,
+    /// Refuse the write timeout, as a reset socket does.
+    refuse_timeout: bool,
+    /// Fail each write: with this error, or as a closed stream (`Some(None)`).
+    fail_write: Option<Option<std::io::ErrorKind>>,
 }
 
 impl super::Outgoing for Scripted {
+    fn pending_error(&self) -> Option<std::io::ErrorKind> {
+        self.pending
+    }
+
     fn set_write_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+        if self.refuse_timeout {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         if self.end_before_write == Some(self.writes) {
             self.shared
                 .link_end()
@@ -1149,6 +1162,11 @@ impl super::Outgoing for Scripted {
     }
 
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.fail_write {
+            Some(Some(kind)) => return Err(kind.into()),
+            Some(None) => return Ok(0),
+            None => {}
+        }
         if self.shared.link_end.try_lock().is_ok() {
             self.recordable_during_write = true;
         }
@@ -1170,6 +1188,9 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             loss: std::sync::Mutex::new(None),
+            // No reader runs beside a scripted write.
+            ops: std::sync::Mutex::new(super::SocketOps::default()),
+            ops_changed: std::sync::Condvar::new(),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
@@ -1184,6 +1205,186 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
         end_before_write,
         writes: 0,
         recordable_during_write: false,
+        pending: None,
+        refuse_timeout: false,
+        fail_write: None,
+    }
+}
+
+// How a lost connection was lost is decided with both sides' accounts in: a
+// side that met only a symptom waits for the other's operation in progress —
+// the writer for the reader's next read, the reader for a write — and a reset
+// either met is the loss, whichever side met it and in whatever order.
+#[test]
+fn a_loss_is_settled_with_both_sides_accounts() {
+    use super::{begin_op, end_op, settle_loss, Side, SocketOps};
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset, InvalidInput};
+    let reset = LinkLoss::SocketError(ConnectionReset);
+    let fresh = |reading: bool| {
+        let shared = Arc::clone(&scripted(None).shared);
+        *super::lock(&shared.ops) = SocketOps {
+            reading,
+            ..SocketOps::default()
+        };
+        shared
+    };
+    let later = |shared: &Arc<super::Shared>, side: Side, met: Option<std::io::ErrorKind>| {
+        let shared = Arc::clone(shared);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            end_op(&shared, side, met);
+        })
+    };
+
+    // The writer met a refused timeout while the reader's read was meeting the reset.
+    let shared = fresh(true);
+    begin_op(&shared, Side::Reader);
+    let reader = later(&shared, Side::Reader, Some(ConnectionReset));
+    assert_eq!(
+        settle_loss(&shared, Side::Writer, LinkLoss::SocketError(InvalidInput)),
+        reset
+    );
+    reader.join().unwrap();
+
+    // The reader reads on and meets nothing: the writer's own stands. The
+    // reader reads the way the real one does, one read after another, so
+    // the writer's wait for its next read ends whichever thread runs first.
+    let shared = fresh(true);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (shared, done) = (Arc::clone(&shared), Arc::clone(&done));
+        thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                begin_op(&shared, Side::Reader);
+                thread::sleep(Duration::from_millis(5));
+                end_op(&shared, Side::Reader, None);
+            }
+        })
+    };
+    let pipe = LinkLoss::SocketError(BrokenPipe);
+    assert_eq!(settle_loss(&shared, Side::Writer, pipe), pipe);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    reader.join().unwrap();
+
+    // No reader reads: the writer's own, at once.
+    assert_eq!(settle_loss(&fresh(false), Side::Writer, pipe), pipe);
+
+    // The reader met the stream's end while a write was meeting the reset.
+    let shared = fresh(true);
+    begin_op(&shared, Side::Writer);
+    let writer = later(&shared, Side::Writer, Some(ConnectionReset));
+    assert_eq!(
+        settle_loss(&shared, Side::Reader, LinkLoss::PeerClosed),
+        reset
+    );
+    writer.join().unwrap();
+
+    // No write in progress: the reader's own, at once.
+    assert_eq!(
+        settle_loss(&fresh(true), Side::Reader, LinkLoss::PeerClosed),
+        LinkLoss::PeerClosed
+    );
+
+    // A reset already met by either side is the loss.
+    let shared = fresh(true);
+    begin_op(&shared, Side::Writer);
+    end_op(&shared, Side::Writer, Some(ConnectionReset));
+    assert_eq!(
+        settle_loss(&shared, Side::Reader, LinkLoss::PeerClosed),
+        reset
+    );
+}
+
+// A write whose timeout the socket refuses reports the reset the socket holds,
+// if it holds one, so the loss is the reset whatever the reader did meanwhile;
+// with nothing pending the refusal itself is the loss.
+#[test]
+fn a_refused_write_timeout_gives_way_to_the_reset_the_socket_holds() {
+    let frame = vec![b'x'; 30];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for (pending, expected) in [
+        (
+            Some(std::io::ErrorKind::ConnectionReset),
+            std::io::ErrorKind::ConnectionReset,
+        ),
+        (None, std::io::ErrorKind::InvalidInput),
+    ] {
+        let mut sock = scripted(None);
+        sock.pending = pending;
+        sock.refuse_timeout = true;
+        let shared = Arc::clone(&sock.shared);
+        assert!(
+            super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only, None).is_err()
+        );
+        assert_eq!(
+            *super::lock(&shared.loss),
+            Some(LinkLoss::SocketError(expected)),
+            "{pending:?}"
+        );
+        assert!(sock.written.is_empty());
+    }
+    // Likewise a write that fails, and one that writes nothing.
+    let reset = LinkLoss::SocketError(std::io::ErrorKind::ConnectionReset);
+    for (fail, pending, expected) in [
+        (
+            Some(std::io::ErrorKind::BrokenPipe),
+            Some(std::io::ErrorKind::ConnectionReset),
+            reset,
+        ),
+        (
+            Some(std::io::ErrorKind::BrokenPipe),
+            None,
+            LinkLoss::SocketError(std::io::ErrorKind::BrokenPipe),
+        ),
+        (None, Some(std::io::ErrorKind::ConnectionReset), reset),
+        (None, None, LinkLoss::PeerClosed),
+    ] {
+        let mut sock = scripted(None);
+        sock.pending = pending;
+        sock.fail_write = Some(fail);
+        let shared = Arc::clone(&sock.shared);
+        assert!(
+            super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only, None).is_err()
+        );
+        assert_eq!(
+            *super::lock(&shared.loss),
+            Some(expected),
+            "{fail:?} {pending:?}"
+        );
+    }
+}
+
+// A peer that resets the operational connection: the requests in flight and
+// after it fail as `connection_lost`, and the loss reads as the reset from the
+// first failure through the close, however the reader and the worker meet it.
+#[test]
+fn a_reset_after_the_opening_is_known_as_the_reset() {
+    for round in 0..20 {
+        let peer = resetting(vec![
+            get_reply("/vd/synchronize", online(ID)),
+            get_reply("/vd/device", firmware()),
+        ]);
+        let connection = open(peer, ID, &options(), &Control::new()).expect("open");
+        let operation = connection.create_operation().unwrap();
+        let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+        let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+        for rx in [first, second] {
+            assert!(
+                matches!(outcome(&rx), Outcome::Failure { .. }),
+                "round {round}: a request on a reset link fails"
+            );
+            assert!(
+                is_reset(connection.lost_link()),
+                "round {round}: {:?}",
+                connection.lost_link()
+            );
+        }
+        connection.close(TEARDOWN);
+        assert!(
+            is_reset(connection.lost_link()),
+            "round {round} after the close: {:?}",
+            connection.lost_link()
+        );
     }
 }
 
@@ -1408,6 +1609,10 @@ fn a_write_not_yet_started_when_closing_begins_is_never_sent() {
     let shared = Arc::clone(&sock.shared);
     struct CloseAfterFirst(Scripted);
     impl super::Outgoing for CloseAfterFirst {
+        fn pending_error(&self) -> Option<std::io::ErrorKind> {
+            None
+        }
+
         fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
             self.0.set_write_timeout(timeout)
         }
