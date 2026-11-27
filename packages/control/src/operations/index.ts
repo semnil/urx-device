@@ -8,7 +8,7 @@ export type { OperationCause, OperationFailure, OperationPhase } from "./failure
 export { validateNameRead, validateNumericRead, validatePost, validateTextRead } from "./native.js";
 export type * from "./native.js";
 export { decodeFileSetting, dryRunSetting, dryRunSettingAfter, previewSetting, readSetting, settingHandlers, validateSetting, writeSetting } from "./registry.js";
-export type { ReadHandler, SettingHandlers, WriteHandler } from "./registry.js";
+export type { DecimalWriteArgs, ReadHandler, SettingHandlers, WriteHandler } from "./registry.js";
 export type * from "./results.js";
 export type * from "./transport.js";
 export { validateDeviceList, validateDiscovery, validateLifecycle } from "./lifecycle.js";

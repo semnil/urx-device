@@ -23,6 +23,8 @@ export {
 } from "./channels.js";
 export type { ChannelIndex, ChannelKind } from "./channels.js";
 export { decodeInteger, planOnGrid } from "./codecs.js";
+export { decimalValue, isDecimalValue } from "./decimal.js";
+export type { DecimalValue } from "./decimal.js";
 export { INPUT_PORTS, SOURCE_PARAMS, portOfRaw } from "./ports.js";
 export { BASIC_RULES } from "./basic-rules.js";
 export { DUCKER_RULES } from "./ducker.js";

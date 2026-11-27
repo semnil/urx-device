@@ -157,6 +157,7 @@ import {
 import { integrationActive, integrationPostFaderSource, knobBank, panelSendsTarget } from "./integration-panel.js";
 import { knobAssignment } from "./knob.js";
 import { recorderCardPresent, recorderSource, recorderState, recorderTrackCount, sceneCurrent, sceneCursor } from "./scene-recorder.js";
+import { canonicalRequest, type DecimalValue } from "../catalog/decimal.js";
 import type { DryRunPlan, Reading, UnverifiedCondition, VerifiedPlan, WritePlan, WriteResult } from "./results.js";
 
 type Target<K extends SettingId> = SettingTypes[K]["target"];
@@ -387,6 +388,30 @@ export type WriteArgs = {
   [K in WritableSettingId]: [id: IdsWriting<Target<K>, Input<K>>, target: Target<K>, value: Input<K>];
 }[WritableSettingId];
 
+/** The writable IDs whose write can be a number: each also takes its value as decimal text. */
+type DecimalWritableId = { [K in WritableSettingId]: number extends Input<K> ? K : never }[WritableSettingId];
+
+/** The decimal-text writes of target type `T`. */
+type IdsWritingDecimal<T> = { [K in DecimalWritableId]: Same<Target<K>, T> extends true ? K : never }[DecimalWritableId];
+
+/**
+ * The (id, target, value) triples of a numeric write given as decimal text
+ * (W2, C6): range checked and rounded on its exact value, its plan's
+ * requested and planned values canonical decimal text.
+ */
+export type DecimalWriteArgs = {
+  [K in DecimalWritableId]: [id: IdsWritingDecimal<Target<K>>, target: Target<K>, value: DecimalValue];
+}[DecimalWritableId];
+
+/**
+ * What a write of the arguments `A` plans and reports: decimal text for a
+ * decimal-text value, else the ID's write type, and both where the value's
+ * type admits both.
+ */
+type Planned<A extends WriteArgs | DecimalWriteArgs> = PlannedFor<A[2], A[0]>;
+// Distributed over the value's type: each form it admits answers in its own form.
+type PlannedFor<V, K extends SettingId> = V extends DecimalValue ? DecimalValue : Input<K>;
+
 /**
  * Reads `id` for `target`. An ID outside the catalog, reachable only from
  * untyped input, is `invalid_input` without traffic.
@@ -420,20 +445,20 @@ function writeHandler<K extends WritableSettingId>(id: K, model: string, target:
 }
 
 /** Writes `value` to `id` for `target`: its single selected request. */
-export function writeSetting<A extends WriteArgs>(
+export function writeSetting<A extends WriteArgs | DecimalWriteArgs>(
   context: OperationContext,
   ...[id, target, value]: A
-): Promise<WriteResult<Input<A[0]>>> {
+): Promise<WriteResult<Planned<A>>> {
   return settled(() => {
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
-    return handler.write(context, target as Target<A[0]>, value as Input<A[0]>);
+    return handler.write(context, target as Target<A[0]>, canonicalRequest(value) as Input<A[0]>) as Promise<WriteResult<Planned<A>>>;
   });
 }
 
 /** The plan a write of `value` would send, through the same validation; no traffic. */
-export function previewSetting<A extends WriteArgs>(model: string, ...[id, target, value]: A): WritePlan<Input<A[0]>> {
+export function previewSetting<A extends WriteArgs | DecimalWriteArgs>(model: string, ...[id, target, value]: A): WritePlan<Planned<A>> {
   const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
-  return handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
+  return handler.plan(model, target as Target<A[0]>, canonicalRequest(value) as Input<A[0]>) as WritePlan<Planned<A>>;
 }
 
 /**
@@ -443,12 +468,13 @@ export function previewSetting<A extends WriteArgs>(model: string, ...[id, targe
  * checks what it can without it; its remaining checks run with the
  * operation's prerequisite reads.
  */
-export function validateSetting<A extends WriteArgs>(model: string, ...[id, target, value]: A): void {
+export function validateSetting<A extends WriteArgs | DecimalWriteArgs>(model: string, ...[id, target, value]: A): void {
   const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
+  const own = canonicalRequest(value) as Input<A[0]>;
   if (handler.validate === undefined) {
-    handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
+    handler.plan(model, target as Target<A[0]>, own);
   } else {
-    handler.validate(model, target as Target<A[0]>, value as Input<A[0]>);
+    handler.validate(model, target as Target<A[0]>, own);
   }
 }
 
@@ -457,14 +483,18 @@ export function validateSetting<A extends WriteArgs>(model: string, ...[id, targ
  * prerequisite reads (O13): no setting write is sent. A setting whose plan
  * needs no device state reads nothing and plans as `previewSetting` does.
  */
-export function dryRunSetting<A extends WriteArgs>(context: OperationContext, ...[id, target, value]: A): Promise<VerifiedPlan<Input<A[0]>>> {
+export function dryRunSetting<A extends WriteArgs | DecimalWriteArgs>(
+  context: OperationContext,
+  ...[id, target, value]: A
+): Promise<VerifiedPlan<Planned<A>>> {
   return settled(() => {
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    const own = canonicalRequest(value) as Input<A[0]>;
     if (handler.dryRun === undefined) {
-      const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
-      return Promise.resolve({ ...plan, unverified: [] });
+      const plan = handler.plan(context.model, target as Target<A[0]>, own);
+      return Promise.resolve({ ...plan, unverified: [] }) as Promise<VerifiedPlan<Planned<A>>>;
     }
-    return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>);
+    return handler.dryRun(context, target as Target<A[0]>, own) as Promise<VerifiedPlan<Planned<A>>>;
   });
 }
 
@@ -474,18 +504,19 @@ export function dryRunSetting<A extends WriteArgs>(context: OperationContext, ..
  * reported unverified rather than refused; every other prerequisite, and
  * every read failure or invalid response, is handled as in `dryRunSetting`.
  */
-export function dryRunSettingAfter<A extends WriteArgs>(
+export function dryRunSettingAfter<A extends WriteArgs | DecimalWriteArgs>(
   context: OperationContext,
   affected: ReadonlySet<UnverifiedCondition>,
   ...[id, target, value]: A
-): Promise<DryRunPlan<Input<A[0]>>> {
+): Promise<DryRunPlan<Planned<A>>> {
   return settled(() => {
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    const own = canonicalRequest(value) as Input<A[0]>;
     if (handler.dryRun === undefined) {
-      const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
-      return Promise.resolve({ ...plan, unverified: [] });
+      const plan = handler.plan(context.model, target as Target<A[0]>, own);
+      return Promise.resolve({ ...plan, unverified: [] }) as Promise<DryRunPlan<Planned<A>>>;
     }
-    return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>, affected);
+    return handler.dryRun(context, target as Target<A[0]>, own, affected) as Promise<DryRunPlan<Planned<A>>>;
   });
 }
 

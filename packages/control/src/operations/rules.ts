@@ -4,7 +4,20 @@
 
 import { channelIndex } from "../catalog/channels.js";
 import { NAME_MAX_CODE_POINTS } from "../catalog/channels.js";
-import { decodeInteger, decodeSwitch, encodeSwitch, nearestStopIndex, planOnGrid } from "../catalog/codecs.js";
+import { decodeInteger, decodeSwitch, encodeSwitch, nearestStopIndexExact, planOnGridExact } from "../catalog/codecs.js";
+import {
+  add,
+  compare,
+  constant,
+  divide,
+  integer,
+  integerOf,
+  multiply,
+  canonicalRequest,
+  numericRequest,
+  present,
+  type Exact,
+} from "../catalog/decimal.js";
 import type { I64Text } from "../catalog/i64.js";
 import type {
   BusSettingRule,
@@ -84,10 +97,22 @@ export function writableName(name: unknown, maxCodePoints: number = NAME_MAX_COD
   });
 }
 
+/**
+ * Raw text of a planned value on a wire of `scale` raw units per public unit,
+ * plus `offset`. A planned grid value or stop is a whole number of raw units.
+ */
+function rawOf(planned: Exact, scale: number, offset = 0): I64Text {
+  const raw = integerOf(add(multiply(planned, constant(scale)), integer(BigInt(offset))));
+  if (raw === undefined) {
+    throw new RangeError("a planned value is not a whole number of raw units");
+  }
+  return `${raw}`;
+}
+
 function gridCodec(rule: GridRule): Codec {
   const offset = rule.offset ?? 0;
   // Write steps per public unit: the step, or the wire resolution.
-  const perUnit = rule.step === undefined ? rule.scale : 1 / rule.step;
+  const perUnit = rule.step === undefined ? constant(rule.scale) : divide(integer(1n), constant(rule.step));
   return {
     text: false,
     decode: (raw) => {
@@ -95,8 +120,11 @@ function gridCodec(rule: GridRule): Codec {
       return value === undefined ? undefined : (value - offset) / rule.scale;
     },
     plan: (value) => {
-      const planned = typeof value === "number" ? planOnGrid(value, rule.min, rule.max, perUnit) : undefined;
-      return planned === undefined ? undefined : { planned, raw: `${Math.round(planned * rule.scale) + offset}` };
+      const request = numericRequest(value);
+      const planned = request === undefined ? undefined : planOnGridExact(request.exact, constant(rule.min), constant(rule.max), perUnit);
+      return request === undefined || planned === undefined
+        ? undefined
+        : { planned: present(planned, request.decimal), raw: rawOf(planned, rule.scale, offset) };
     },
   };
 }
@@ -118,14 +146,16 @@ function stopsCodec(rule: StopsRule): Codec {
       return value === undefined ? undefined : value / rule.scale;
     },
     plan: (value) => {
-      const min = rule.write?.min ?? first / rule.scale;
-      const max = rule.write?.max ?? last / rule.scale;
-      if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+      const request = numericRequest(value);
+      const scale = constant(rule.scale);
+      const min = rule.write === undefined ? divide(constant(first), scale) : constant(rule.write.min);
+      const max = rule.write === undefined ? divide(constant(last), scale) : constant(rule.write.max);
+      if (request === undefined || compare(request.exact, min) < 0 || compare(request.exact, max) > 0) {
         return undefined;
       }
-      const index = nearestStopIndex(rule.stops, rule.scale, value);
+      const index = nearestStopIndexExact(rule.stops, rule.scale, request.exact);
       const stop = rule.stops[index] as number;
-      return { planned: stop / rule.scale, raw: `${ordinal === undefined ? stop : index + ordinal}` };
+      return { planned: present(divide(constant(stop), scale), request.decimal), raw: `${ordinal === undefined ? stop : index + ordinal}` };
     },
   };
 }
@@ -141,10 +171,13 @@ function textIndexCodec(rule: TextIndexRule): Codec {
       return value >= rule.min && value <= rule.max ? value : undefined;
     },
     // Selectors: fractions are refused, not rounded.
-    plan: (value) =>
-      typeof value === "number" && Number.isInteger(value) && value >= rule.min && value <= rule.max
-        ? { planned: value, raw: `${value}`.padStart(rule.digits, "0") }
-        : undefined,
+    plan: (value) => {
+      const request = numericRequest(value);
+      const index = request === undefined ? undefined : integerOf(request.exact);
+      return request === undefined || index === undefined || index < BigInt(rule.min) || index > BigInt(rule.max)
+        ? undefined
+        : { planned: present(request.exact, request.decimal), raw: `${index}`.padStart(rule.digits, "0") };
+    },
   };
 }
 
@@ -198,7 +231,11 @@ export function codecOf(rule: ValueRule, model = ""): Codec {
           return value !== undefined && rule.values.includes(value) ? value : undefined;
         },
         // Exact membership: no rounding to the nearest member.
-        plan: (value) => (typeof value === "number" && rule.values.includes(value) ? { planned: value, raw: `${value}` } : undefined),
+        plan: (value) => {
+          const request = numericRequest(value);
+          const member = request === undefined ? undefined : rule.values.find((each) => compare(constant(each), request.exact) === 0);
+          return request === undefined || member === undefined ? undefined : { planned: present(request.exact, request.decimal), raw: `${member}` };
+        },
       };
     case "selector": {
       // A choice listing models exists on those models only: elsewhere it reads as invalid and writes as unsupported.
@@ -302,7 +339,9 @@ function writesOn(gate: WriteGate, model: string): boolean {
 }
 
 function handler<V, I = V>(resolve: (model: string, target: unknown, write: boolean) => { at: ParameterAddress; codec: Codec }) {
-  const planned = (model: string, target: unknown, requested: I) => {
+  const planned = (model: string, target: unknown, given: I) => {
+    // Read once: the check, the plan and the report all come from this copy.
+    const requested = canonicalRequest(given);
     const { at, codec } = resolve(model, target, true);
     const result = codec.plan(requested);
     if (result === "unsupported") {
@@ -545,7 +584,13 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
   const staticCheck = (field: { value: ValueRule | ContextStopsRule }, effect: string, value: unknown) => {
     if (field.value.kind === "context-stops") {
       const envelope = field.value.envelope[effect];
-      if (typeof value !== "number" || !Number.isFinite(value) || envelope === undefined || value < envelope.min || value > envelope.max) {
+      const request = numericRequest(value);
+      if (
+        request === undefined ||
+        envelope === undefined ||
+        compare(request.exact, constant(envelope.min)) < 0 ||
+        compare(request.exact, constant(envelope.max)) > 0
+      ) {
         return refuse("invalid_input");
       }
       return undefined;
@@ -631,27 +676,31 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
      * `dryRun` performs those reads.
      */
     plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      requested = canonicalRequest(requested);
       const resolved = resolve(model, target);
       staticCheck(resolved.field, resolved.effect, requested);
       return refuse("invalid_input");
     },
     /** The static checks alone: bus, effect, parameter and value or its type-wide envelope. */
     validate(model: string, target: unknown, requested: V): void {
+      requested = canonicalRequest(requested);
       const resolved = resolve(model, target);
       staticCheck(resolved.field, resolved.effect, requested);
     },
     dryRun: dryRunOf<V>(async (context, target, requested, affected) => {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target);
       staticCheck(resolved.field, resolved.effect, requested);
       const unverified: UnverifiedCondition[] = [];
       const codec = await prepare(context, resolved, affected, unverified);
-      return { requested, planned: codec === null ? null : (plannedWith(codec, requested).planned as V), unverified };
+      return { requested: canonicalRequest(requested), planned: codec === null ? null : (plannedWith(codec, requested).planned as V), unverified };
     }),
     async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target);
       staticCheck(resolved.field, resolved.effect, requested);
       const result = plannedWith((await prepare(context, resolved)) as Codec, requested);
-      return writeRaw(context, leaf(resolved), result.raw as I64Text, { requested, planned: result.planned as V });
+      return writeRaw(context, leaf(resolved), result.raw as I64Text, { requested: canonicalRequest(requested), planned: result.planned as V });
     },
   };
 }
@@ -806,8 +855,12 @@ export function geqGainSetting(rule: GeqGainRule) {
     return { at, side, leaf };
   };
   const union = { min: Math.min(...rule.limits.map((limit) => limit.min)), max: Math.max(...rule.limits.map((limit) => limit.max)) };
-  const staticCheck = (value: unknown) =>
-    typeof value === "number" && Number.isFinite(value) && value >= union.min && value <= union.max ? value : refuse("invalid_input");
+  const staticCheck = (value: unknown) => {
+    const request = numericRequest(value);
+    return request !== undefined && compare(request.exact, constant(union.min)) >= 0 && compare(request.exact, constant(union.max)) <= 0
+      ? request
+      : refuse("invalid_input");
+  };
   /** The EQ Type and Limit reads; the side's current range, or null where an unsent write can change it (O13). */
   const prepare = async (
     context: OperationContext,
@@ -827,9 +880,11 @@ export function geqGainSetting(rule: GeqGainRule) {
     }
     return rule.limits[index] as { min: number; max: number };
   };
-  const planWithin = (range: { min: number; max: number }, value: number) => {
-    const planned = planOnGrid(value, range.min, range.max, 1 / rule.step);
-    return planned === undefined ? refuse("invalid_input") : { planned, raw: `${Math.round(planned * rule.scale)}` as I64Text };
+  const planWithin = (range: { min: number; max: number }, request: { exact: Exact; decimal: boolean }) => {
+    const planned = planOnGridExact(request.exact, constant(range.min), constant(range.max), divide(integer(1n), constant(rule.step)));
+    return planned === undefined
+      ? refuse("invalid_input")
+      : { planned: present(planned, request.decimal) as number, raw: rawOf(planned, rule.scale) };
   };
   /** A stored gain: an integer in the read range over the scale, off-grid values kept. */
   const decodeGain = (raw: string) => {
@@ -848,28 +903,32 @@ export function geqGainSetting(rule: GeqGainRule) {
     },
     /** No static plan: the range depends on the live Limit (`dryRun` reads it). */
     plan(model: string, target: unknown, requested: number): WritePlan<number> {
+      requested = canonicalRequest(requested);
       resolve(model, target, true);
       staticCheck(requested);
       return refuse("invalid_input");
     },
     /** The static checks alone: the target and the union of every Limit's range. */
     validate(model: string, target: unknown, requested: number): void {
+      requested = canonicalRequest(requested);
       resolve(model, target, true);
       staticCheck(requested);
     },
     dryRun: dryRunOf<number>(async (context, target, requested, affected) => {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target, true);
       const value = staticCheck(requested);
       const unverified: UnverifiedCondition[] = [];
       const range = await prepare(context, resolved, affected, unverified);
-      return { requested, planned: range === null ? null : planWithin(range, value).planned, unverified };
+      return { requested: canonicalRequest(requested), planned: range === null ? null : planWithin(range, value).planned, unverified };
     }),
     async write(context: OperationContext, target: unknown, requested: number): Promise<WriteResult<number>> {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target, true);
       // Static checks before any read.
       const value = staticCheck(requested);
       const { planned, raw } = planWithin((await prepare(context, resolved)) as { min: number; max: number }, value);
-      return writeRaw(context, resolved.leaf, raw, { requested, planned });
+      return writeRaw(context, resolved.leaf, raw, { requested: canonicalRequest(requested), planned });
     },
   };
 }
@@ -986,23 +1045,27 @@ export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
     ...base,
     /** A connection-free plan where `model` has no applicable prerequisite; refused where the plan needs device state. */
     plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      requested = canonicalRequest(requested);
       const { planned: p } = planned(model, target, requested);
-      return applicable(model).length === 0 ? { requested, planned: p } : refuse("invalid_input");
+      return applicable(model).length === 0 ? { requested: canonicalRequest(requested), planned: p } : refuse("invalid_input");
     },
     /** The static checks alone: model, target and value; the prerequisites are read by the operation. */
     validate(model: string, target: unknown, requested: V): void {
+      requested = canonicalRequest(requested);
       planned(model, target, requested);
     },
     dryRun: dryRunOf<V>(async (context, target, requested, affected) => {
+      requested = canonicalRequest(requested);
       const { planned: p } = planned(context.model, target, requested);
       const unverified: UnverifiedCondition[] = [];
       await prepare(context, affected, unverified);
-      return { requested, planned: p, unverified };
+      return { requested: canonicalRequest(requested), planned: p, unverified };
     }),
     async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      requested = canonicalRequest(requested);
       const { at, raw, planned: p } = planned(context.model, target, requested);
       await prepare(context);
-      return writeRaw(context, at, raw, { requested, planned: p });
+      return writeRaw(context, at, raw, { requested: canonicalRequest(requested), planned: p });
     },
   };
 }
