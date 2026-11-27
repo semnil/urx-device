@@ -172,6 +172,16 @@ describe("numeric writes given as decimal text (W2)", () => {
         reads: () => reads,
       };
     };
+    // Invalid at the first read stays invalid, whatever a later read would say.
+    const invalid = changing("1e3", "3");
+    expect(() => previewAny("URX44", "channel.pan", { channel: 1 }, invalid.value)).toThrow(/invalid_input/);
+    expect(invalid.reads()).toBe(1);
+    const nothing = new FakeTransport();
+    const late = changing("1e3", "0.927");
+    expect(
+      (await failureOf(writeAny(new OperationContext(nothing, "URX44"), "bus.fx.parameter", { bus: "fx-1", effect: "rev-x-hall", parameter: "reverb-time" }, late.value)))?.code,
+    ).toBe("invalid_input");
+    expect([late.reads(), nothing.calls]).toEqual([1, []]);
     const pan = changing("3", "0.5");
     expect(previewAny("URX44", "channel.pan", { channel: 1 }, pan.value)).toEqual({ requested: { decimal: "3" }, planned: { decimal: "3" } });
     expect(pan.reads()).toBe(1);

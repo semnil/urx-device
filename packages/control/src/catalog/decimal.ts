@@ -188,14 +188,19 @@ export function decimalValue(text: string): DecimalValue | undefined {
 }
 
 /**
- * A requested value as one operation works from it: a decimal write value
- * read once into a frozen canonical copy, so nothing the caller does to its
- * own object later reaches the check, the plan, the write or the report;
- * anything else as given.
+ * A requested value as one operation works from it. An object with its own
+ * `decimal` has it read once, valid or not, into a frozen copy — canonical
+ * text when it is C6 text, what was read otherwise — so nothing the caller
+ * does to its own object later reaches the check, the plan, the write or
+ * the report. Anything else is as given.
  */
 export function canonicalRequest<V>(value: V): V {
-  const text = decimalTextOf(value);
-  return text === undefined ? value : (Object.freeze({ decimal: formatExact(parseDecimal(text) as Exact) }) as V);
+  if (typeof value !== "object" || value === null || !Object.hasOwn(value, "decimal")) {
+    return value;
+  }
+  const read: unknown = (value as unknown as { decimal: unknown }).decimal;
+  const decimal = typeof read === "string" && C6.test(read) ? formatExact(parseDecimal(read) as Exact) : read;
+  return Object.freeze({ decimal }) as V;
 }
 
 /** Whether `a`'s decimal expansion ends: its reduced denominator has no prime factor but 2 and 5. */
