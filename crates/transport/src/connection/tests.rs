@@ -2240,6 +2240,31 @@ mod lifecycle {
         counted_as_received(&connection, &peer);
     }
 
+    // The count a write makes is made under the end gate it writes under, and
+    // the two figures are read under it too: a read waits for a write in
+    // progress, and never sees one figure moved and the other not yet.
+    #[test]
+    fn the_sent_frames_are_read_under_the_gate_a_write_counts_under() {
+        let peer = accepting();
+        let connection = std::sync::Arc::new(connect(&peer));
+        let gate = connection.shared.link_end();
+        let (tx, rx) = mpsc::channel();
+        let reader = {
+            let connection = std::sync::Arc::clone(&connection);
+            thread::spawn(move || tx.send(connection.sent_frames()).unwrap())
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the read waits while the gate is held"
+        );
+        drop(gate);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            SentFrames::default()
+        );
+        reader.join().unwrap();
+    }
+
     #[test]
     fn releasing_a_token_never_activated_sends_nothing() {
         let peer = accepting();

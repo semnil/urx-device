@@ -571,6 +571,10 @@ impl Connection {
     /// release or a close sent, whether it then succeeded or failed. A frame
     /// cut short is not counted, and nor is one that never started.
     pub fn sent_frames(&self) -> SentFrames {
+        // Under the gate every write holds while it counts its frame: the two
+        // figures are read at one moment, and a frame written whole before
+        // this call is in them.
+        let _gate = self.shared.link_end();
         SentFrames {
             registrations: self.shared.sent_registrations.load(Ordering::SeqCst),
             unregistrations: self.shared.sent_unregistrations.load(Ordering::SeqCst),
@@ -2769,8 +2773,8 @@ impl Outgoing for TcpStream {
 
 /// Writes `frame` by `end`, starting no write once the reader has recorded
 /// the link's end. On failure, the cause and how many bytes went out. A
-/// frame written whole adds one to `sent`, if given; one cut short or never
-/// started adds nothing.
+/// frame written whole adds one to `sent`, if given, under the end gate its
+/// last write held; one cut short or never started adds nothing.
 fn write_frame<O: Outgoing>(
     sock: &mut O,
     shared: &Shared,
@@ -2815,6 +2819,13 @@ fn write_frame<O: Outgoing>(
             }
         }
         let outcome = sock.write(&frame[written..]);
+        // Counted before the gate is let go: `sent_frames` reads under it, so
+        // a frame the peer has whole is never missing from a count read after.
+        if let (Some(sent), Ok(n)) = (sent, &outcome) {
+            if *n > 0 && written + n == frame.len() {
+                sent.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         drop(link_end);
         match outcome {
             Ok(0) => {
@@ -2832,9 +2843,6 @@ fn write_frame<O: Outgoing>(
                 return failed(RequestCause::ConnectionLost);
             }
         }
-    }
-    if let Some(sent) = sent {
-        sent.fetch_add(1, Ordering::SeqCst);
     }
     Ok(())
 }
