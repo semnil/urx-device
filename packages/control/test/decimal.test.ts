@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { planOnGrid } from "../src/catalog/codecs.js";
 import { decimalValue, isDecimalValue, type DecimalValue } from "../src/catalog/decimal.js";
 import { ATTACK_STOPS_RAW } from "../src/catalog/dynamics-stops.js";
 import { OperationContext } from "../src/operations/context.js";
@@ -212,3 +213,20 @@ describe("numeric writes given as decimal text (W2)", () => {
   });
 });
 
+describe("planOnGrid on numbers", () => {
+  it("leaves an infinite bound's side open and plans a step with no finite decimal expansion", () => {
+    expect(planOnGrid(1.005, 0, Infinity, 100)).toBe(1);
+    expect(planOnGrid(-1.005, -Infinity, 0, 100)).toBe(-1.01);
+    expect(planOnGrid(-1, 0, Infinity, 100)).toBeUndefined();
+    expect(planOnGrid(2, -Infinity, 1, 100)).toBeUndefined();
+    expect(planOnGrid(0.5, 0, 1, 3)).toBe(1 / 3);
+    expect(planOnGrid(-0.5, -1, 0, 3)).toBe(-2 / 3);
+    expect(planOnGrid(0.25, 0, 1, 2), "a midpoint goes to the lower value").toBe(0);
+    expect(planOnGrid(1, 0, 1, 3)).toBe(1);
+    expect(planOnGrid(0.25, 0, 1, 100)).toBe(0.25);
+    for (const unitsPerOne of [0, -1, Infinity, Number.NaN]) {
+      expect(planOnGrid(0.5, 0, 1, unitsPerOne), String(unitsPerOne)).toBeUndefined();
+    }
+    expect(planOnGrid(Number.NaN, 0, 1, 100)).toBeUndefined();
+  });
+});

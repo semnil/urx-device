@@ -2,7 +2,7 @@
 // actual raw value without rounding or clamping; writes validate, then
 // quantize, then encode exactly.
 
-import { compare, constant, divide, exactOfNumber, integer, multiply, nearestUnits, present, type Exact } from "./decimal.js";
+import { compare, constant, divide, exactOfNumber, integer, multiply, nearestUnits, toNumber, type Exact } from "./decimal.js";
 import { formatI64, parseI64, type I64Text } from "./i64.js";
 
 /**
@@ -58,12 +58,28 @@ export function planOnGridExact(requested: Exact, min: Exact, max: Exact, unitsP
 
 /**
  * `planOnGridExact` for a number, read as the decimal it prints as: finite
- * and within [min, max] before rounding, or undefined.
+ * and within [min, max] before rounding, or undefined. A bound may be
+ * infinite, leaving that side open, and the grid's step need have no finite
+ * decimal expansion: the planned value is the number nearest to the grid
+ * value chosen exactly. `unitsPerOne` is a positive finite number.
  */
 export function planOnGrid(requested: number, min: number, max: number, unitsPerOne: number): number | undefined {
   const exact = exactOfNumber(requested);
-  const planned = exact === undefined ? undefined : planOnGridExact(exact, constant(min), constant(max), constant(unitsPerOne));
-  return planned === undefined ? undefined : (present(planned, false) as number);
+  if (exact === undefined || below(exact, min) || above(exact, max) || !(unitsPerOne > 0) || !Number.isFinite(unitsPerOne)) {
+    return undefined;
+  }
+  const perUnit = constant(unitsPerOne);
+  return toNumber(divide(integer(nearestUnits(exact, perUnit)), perUnit));
+}
+
+/** Whether `value` lies below the number `bound`; nothing lies below negative infinity. */
+function below(value: Exact, bound: number): boolean {
+  return bound === Infinity || (Number.isFinite(bound) && compare(value, constant(bound)) < 0);
+}
+
+/** Whether `value` lies above the number `bound`; nothing lies above infinity. */
+function above(value: Exact, bound: number): boolean {
+  return bound === -Infinity || (Number.isFinite(bound) && compare(value, constant(bound)) > 0);
 }
 
 /** The integer of raw text within [min, max], or undefined. */

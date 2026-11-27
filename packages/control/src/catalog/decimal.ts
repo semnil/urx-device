@@ -198,10 +198,28 @@ export function canonicalRequest<V>(value: V): V {
   return text === undefined ? value : (Object.freeze({ decimal: formatExact(parseDecimal(text) as Exact) }) as V);
 }
 
+/** Whether `a`'s decimal expansion ends: its reduced denominator has no prime factor but 2 and 5. */
+function terminates(a: Exact): boolean {
+  let rest = a.d;
+  while (rest % 2n === 0n) {
+    rest /= 2n;
+  }
+  while (rest % 5n === 0n) {
+    rest /= 5n;
+  }
+  return rest === 1n;
+}
+
+/** The number nearest to `a`. */
+export function toNumber(a: Exact): number {
+  // A finite expansion converts exactly; otherwise the quotient of the two
+  // integers, each exact as a number at the sizes a grid or a stop has.
+  return terminates(a) ? Number(formatExact(a)) : Number(a.n) / Number(a.d);
+}
+
 /** `a` in a request's own form: canonical decimal text, or the number nearest to it. */
 export function present(a: Exact, decimal: boolean): number | DecimalValue {
-  const text = formatExact(a);
-  return decimal ? Object.freeze({ decimal: text }) : Number(text);
+  return decimal ? Object.freeze({ decimal: formatExact(a) }) : toNumber(a);
 }
 
 export { HALF, ONE };
