@@ -60,11 +60,13 @@ const RATE_ADDRESS: ParameterAddress = Object.freeze({ paramId: 766, x: "0", y: 
 class RateWatch implements WriteGuard {
   readonly #context: OperationContext;
   readonly #fileRate: number;
+  readonly #stops: ImportStops;
   #stop: OperationCause | undefined;
 
-  constructor(context: OperationContext, fileRate: number) {
+  constructor(context: OperationContext, fileRate: number, stops: ImportStops) {
     this.#context = context;
     this.#fileRate = fileRate;
+    this.#stops = stops;
   }
 
   get stop(): OperationCause | undefined {
@@ -87,10 +89,50 @@ class RateWatch implements WriteGuard {
     }
   }
 
+  /** The first condition stops the import; each one found after the import stopped is a cause beside the stop. */
   latch(cause: OperationCause): void {
+    const stopped = this.#stops.stopped;
     if (this.#stop === undefined) {
       this.#stop = cause;
       this.#context.cancel(cause);
+    }
+    if (stopped) {
+      this.#stops.found(cause, "preparation");
+    }
+  }
+}
+
+/**
+ * The import's stops in the order they are found (E3): whether it has stopped
+ * — its owner or a guard cancelled it, or a failure ended it — and the first
+ * cause found after that, a prerequisite's own failure or a rate condition.
+ */
+class ImportStops {
+  readonly #context: OperationContext;
+  #failed = false;
+  #later: LaterCause | null = null;
+
+  constructor(context: OperationContext) {
+    this.#context = context;
+  }
+
+  get stopped(): boolean {
+    return this.#failed || this.#context.stopping !== undefined;
+  }
+
+  get later(): LaterCause | null {
+    return this.#later;
+  }
+
+  /** A failure ended the import. */
+  fail(): void {
+    this.#failed = true;
+  }
+
+  /** `code` found at `phase`: the cause beside the stop when the import had already stopped and none was found before it. */
+  found(code: OperationCause, phase: OperationPhase): void {
+    if (this.stopped && this.#later === null) {
+      this.#later = { code, phase };
     }
   }
 }
@@ -100,39 +142,36 @@ const sameAddress = (a: ParameterAddress, b: ParameterAddress) => a.paramId === 
 /** The device sample rate's codec, shared with its read (F11-C). */
 const RATE_CODEC = codecOf(DEVICE_RULES["device.sample-rate"].value);
 
-/**
- * An observation's outcome: its first failure, the registration's or the
- * read's own failure where it came after an earlier stop, the condition its
- * watch holds, and the release that reports its own failure.
- */
+/** An observation's outcome: its first failure, and the release that reports its own failure. */
 interface RateObservation {
   readonly error: string | null;
-  readonly later: LaterCause | null;
-  readonly stop: () => OperationCause | undefined;
   readonly release: () => Promise<string | null>;
-}
-
-/** `code` found at `phase`, where the operation had already stopped for another cause. */
-function besideStop(context: OperationContext, code: OperationCause, phase: OperationPhase): LaterCause | null {
-  return context.stopping !== undefined && context.stopping !== code ? { code, phase } : null;
 }
 
 /**
  * Registers the rate observation, then makes the one rate read (L3, L5):
  * a mismatch is a failed precondition before any write. The clock is never
  * written from the file. A failure is the operation's first stopping cause
- * where one stopped it, and the registration's or the read's own failure
- * after that stop goes beside it. The observation's release is always
+ * where one stopped it; a failure of the observation's own (an admission, a
+ * registration or the read that was not the stop's cancellation) found after
+ * that stop goes to `stops` beside it. The observation's release is always
  * returned, and reports its own failure instead of replacing an earlier one.
  */
-async function watchRate(context: OperationContext, fileRate: number): Promise<RateObservation> {
-  const watch = new RateWatch(context, fileRate);
-  const stop = () => watch.stop;
+async function watchRate(context: OperationContext, fileRate: number, stops: ImportStops): Promise<RateObservation> {
+  const watch = new RateWatch(context, fileRate, stops);
+  // A failure of the observation's own; an exception that carries no failure is an internal error.
+  const failed = (error: unknown): string => {
+    const failure = operationFailureOf(error) ?? { code: "internal_error" as const, phase: "preparation" as const, cancelled: undefined };
+    if (failure.cancelled !== true) {
+      stops.found(failure.code, failure.phase);
+    }
+    return context.stopping ?? failure.code;
+  };
   let operation: TransportOperation;
   try {
     operation = context.transport.createOperation();
-  } catch {
-    return { error: "internal_error", later: null, stop, release: async () => null };
+  } catch (error) {
+    return { error: failed(error), release: async () => null };
   }
   let subscription: TransportSubscription | undefined;
   // The subscription's release failure first, then the owner's; neither replaces the result.
@@ -158,12 +197,9 @@ async function watchRate(context: OperationContext, fileRate: number): Promise<R
     if (device.value !== fileRate) {
       watch.latch("precondition_failed");
     }
-    // A condition the read found after an earlier stop is the watch's, which `run` reports.
-    return { error: watch.stop === undefined ? null : (context.stopping ?? watch.stop), later: null, stop, release };
+    return { error: watch.stop === undefined ? null : (context.stopping ?? watch.stop), release };
   } catch (error) {
-    const failure = operationFailureOf(error);
-    const later = failure === undefined ? null : besideStop(context, failure.code, failure.phase);
-    return { error: context.stopping ?? failure?.code ?? "internal_error", later, stop, release };
+    return { error: failed(error), release };
   }
 }
 
@@ -182,7 +218,9 @@ export async function applyCurrent(
   options: { readonly guard: ConsoleLockGuard; readonly dryRun?: boolean },
 ): Promise<ApplyResult> {
   const results: StepResult[] = plan.steps.map((step) => ({ ...step, outcome: "not_sent", error: null, unverified: [] }));
+  const stops = new ImportStops(context);
   const failWith = (index: number, error: unknown, outcome: WriteOutcome): Outcome => {
+    stops.fail();
     const failure = operationFailureOf(error);
     const step = results[index] as StepResult;
     // The operation's own planned value, where it settled one before failing (a live-prerequisite step included).
@@ -203,7 +241,7 @@ export async function applyCurrent(
     return { steps: results, error: failure?.code ?? "internal_error", cleanup: null, later: failure?.later ?? null };
   }
   try {
-    return await run(context, plan, results, failWith, options.dryRun === true);
+    return await run(context, plan, results, failWith, stops, options.dryRun === true);
   } finally {
     detach();
   }
@@ -217,11 +255,15 @@ async function run(
   plan: CurrentPlan,
   results: StepResult[],
   failWith: (index: number, error: unknown, outcome: WriteOutcome) => Outcome,
+  stops: ImportStops,
   dryRun: boolean,
 ): Promise<ApplyResult> {
-  const rate = await watchRate(context, plan.fileRate);
+  const rate = await watchRate(context, plan.fileRate, stops);
   let outcome: Outcome | undefined;
   try {
+    if (rate.error !== null) {
+      stops.fail();
+    }
     outcome = rate.error !== null ? { steps: results, error: rate.error } : await runSteps(context, plan, results, failWith, dryRun);
   } finally {
     const cleanup = await rate.release();
@@ -229,13 +271,7 @@ async function run(
       // E3, in processing order: the first failure or stop; for a dry run, whose result is settled only
       // now, a stop recorded during the release; then a release failure.
       const stop = dryRun ? (context.stopping ?? null) : null;
-      const error = outcome.error ?? stop ?? cleanup;
-      // The rate condition the read or a notification latched after the import had stopped for
-      // another cause, where the registration and the read failed for nothing of their own.
-      const watched = rate.stop();
-      const later =
-        rate.later ?? (error !== null && watched !== undefined && watched !== error ? { code: watched, phase: "preparation" as const } : null);
-      outcome = { ...outcome, error, cleanup, later } as ApplyResult;
+      outcome = { ...outcome, error: outcome.error ?? stop ?? cleanup, cleanup, later: stops.later } as ApplyResult;
     }
   }
   return outcome as ApplyResult;

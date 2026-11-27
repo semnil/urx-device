@@ -14,6 +14,7 @@ import { OperationContext } from "../src/operations/context.js";
 import { OperationFailureError, operationFailureOf } from "../src/operations/failure.js";
 import { settingHandlers, validateSetting, type WriteArgs } from "../src/operations/registry.js";
 import { codecOf } from "../src/operations/rules.js";
+import type { TransportNotification } from "../src/operations/transport.js";
 import { FakeTransport } from "./fake-transport.js";
 
 const models: Model[] = ["URX22", "URX44", "URX44V"];
@@ -727,6 +728,224 @@ describe("CURRENT composition (K36, F18)", () => {
         releasing(t, fail);
       }, true);
       expect([dry.result.error, dry.result.cleanup, dry.result.later], `release fails: ${fail}`).toEqual(["precondition_failed", fail ? "connection_lost" : null, null]);
+    }
+  });
+
+  // E3, in the order things are found: the first cause found after the import stopped is `later`, whatever
+  // comes after it; what was found before the stop, or before a failure that came after it, is not.
+  it("report beside the import's stop the first cause found after it, in the order found", async () => {
+    const plan = planCurrent(synthesize("URX22"), "URX22");
+    const head = { ...plan, steps: plan.steps.filter((s) => s.planned !== null).slice(0, 3), omissions: [] };
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const accepted = { kind: "success", value: null, evidence: { state: "accepted" } };
+    const rejected = { kind: "failure", failure: { kind: "cause", code: "device_rejected", phase: "response" }, evidence: { state: "rejected", responseCode: "9" } };
+    const late = { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const cancelledRead = { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const lockNote = (value: string) => ({ kind: "numeric", address: { paramId: 895, x: "0", y: "0" }, value }) as const;
+    const rateNote = (value: string) => ({ kind: "numeric", address: { paramId: 766, x: "0", y: "0" }, value }) as const;
+    const lost = new OperationFailureError({ code: "connection_lost", phase: "response", progress: null });
+    type Env = { t: FakeTransport; stop: () => void; rateSubscription: (activate: (deliver: (n: TransportNotification) => void) => Promise<void>) => void };
+    const apply = async (build: (env: Env) => void, dryRun = false) => {
+      const t = new FakeTransport();
+      let context: OperationContext | undefined;
+      const stop = () => context?.cancel("interrupted");
+      // The rate observation's subscription, the one prepared after the guard's.
+      const rateSubscription = (activate: (deliver: (n: TransportNotification) => void) => Promise<void>) => {
+        const prepare = t.prepareSubscription.bind(t);
+        t.prepareSubscription = (addresses, operation, deliver) => {
+          const subscription = prepare(addresses, operation, deliver);
+          return { activate: () => activate(deliver), release: () => subscription.release() };
+        };
+      };
+      context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      build({ t, stop, rateSubscription });
+      try {
+        return await applyCurrent(context, head, { guard, dryRun });
+      } finally {
+        await guard.release().catch(() => undefined);
+      }
+    };
+    /** A reply that runs `first` (a stop, notifications) and then settles with `record`. */
+    const then = (first: () => void, record: unknown) => ({
+      then(resolve: (value: unknown) => void) {
+        first();
+        resolve(record);
+      },
+    });
+    const releasing = (t: FakeTransport, first: () => void, failure?: Error) => {
+      t.onRelease = () => {
+        t.onRelease = undefined;
+        first();
+      };
+      t.releaseFailure = failure;
+    };
+    const cases: ReadonlyArray<readonly [string, (env: Env) => void, string | null, unknown]> = [
+      [
+        "stop, rate notification, rate read late",
+        ({ t, stop }) =>
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              stop();
+              t.notify(rateNote("96000"));
+            }, late),
+          ),
+        "interrupted",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "stop, invalid rate notification, rate read late",
+        ({ t, stop }) =>
+          t.script(
+            "getNumeric",
+            read("0"),
+            then(() => {
+              stop();
+              t.notify(rateNote("32000"));
+            }, late),
+          ),
+        "interrupted",
+        { code: "invalid_response", phase: "preparation" },
+      ],
+      [
+        "stop, rate read late, rate notification at the release",
+        ({ t, stop }) => {
+          t.script("getNumeric", read("0"), then(stop, late));
+          releasing(t, () => t.notify(rateNote("96000")));
+        },
+        "interrupted",
+        { code: "response_timeout", phase: "response" },
+      ],
+      [
+        "stop, rate notification during the registration, registration lost",
+        ({ t, stop, rateSubscription }) => {
+          t.script("getNumeric", read("0"));
+          rateSubscription(async (deliver) => {
+            stop();
+            deliver(rateNote("96000"));
+            throw lost;
+          });
+        },
+        "interrupted",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "every write accepted, rate notification at the release, release lost",
+        ({ t }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
+          releasing(t, () => t.notify(rateNote("96000")), lost);
+        },
+        "connection_lost",
+        null,
+      ],
+      [
+        "invalid rate notification, then the rate read mismatched",
+        ({ t }) => t.script("getNumeric", read("0"), then(() => t.notify(rateNote("32000")), read("96000"))),
+        "invalid_response",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "the rate read late with no stop before it, rate notification at the release",
+        ({ t }) => {
+          t.script("getNumeric", read("0"), late);
+          releasing(t, () => t.notify(rateNote("96000")));
+        },
+        "response_timeout",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "a write rejected, rate notification at the release",
+        ({ t }) => {
+          t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, rejected, accepted).script("setText", accepted, accepted, accepted);
+          releasing(t, () => t.notify(rateNote("96000")));
+        },
+        "device_rejected",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      // The same code from another source is still a cause of its own; a cancellation is not.
+      [
+        "invalid lock notification, then the lock read invalid",
+        ({ t }) => t.script("getNumeric", then(() => t.notify(lockNote("2")), read("9"))),
+        "invalid_response",
+        { code: "invalid_response", phase: "response" },
+      ],
+      [
+        "invalid lock notification, then the lock read cancelled",
+        ({ t }) => t.script("getNumeric", then(() => t.notify(lockNote("2")), cancelledRead)),
+        "invalid_response",
+        null,
+      ],
+      [
+        "invalid lock notification during the rate read, then the rate read invalid",
+        ({ t }) => t.script("getNumeric", read("0"), then(() => t.notify(lockNote("2")), read("1"))),
+        "invalid_response",
+        { code: "invalid_response", phase: "response" },
+      ],
+      [
+        "lock notification during the rate read, then the rate read mismatched",
+        ({ t }) => t.script("getNumeric", read("0"), then(() => t.notify(lockNote("1")), read("96000"))),
+        "precondition_failed",
+        { code: "precondition_failed", phase: "preparation" },
+      ],
+      [
+        "invalid lock notification during the registration, then the registration invalid",
+        ({ t, rateSubscription }) => {
+          t.script("getNumeric", read("0"));
+          rateSubscription(async () => {
+            t.notify(lockNote("2"));
+            throw new OperationFailureError({ code: "invalid_response", phase: "response", progress: null });
+          });
+        },
+        "invalid_response",
+        { code: "invalid_response", phase: "response" },
+      ],
+      [
+        "invalid lock notification during the registration, then the registration cancelled",
+        ({ t, rateSubscription }) => {
+          t.script("getNumeric", read("0"));
+          rateSubscription(async () => {
+            t.notify(lockNote("2"));
+            throw new OperationFailureError({ code: "invalid_response", phase: "send", progress: null, cancelled: true });
+          });
+        },
+        "invalid_response",
+        null,
+      ],
+    ];
+    for (const [name, build, error, later] of cases) {
+      const result = await apply(build);
+      expect([result.error, result.later], name).toEqual([error, later]);
+    }
+    // The observation's own preparation failing, after the owner's stop and without one: the stop stays the error
+    // and the failure goes beside it; without a stop the failure is the error. An exception that carries no
+    // failure is an internal error.
+    for (const [where, thrown, code] of [
+      ["createOperation", new Error("adapter"), "internal_error"],
+      ["prepareSubscription", new Error("adapter"), "internal_error"],
+      ["prepareSubscription", lost, "connection_lost"],
+      ["activate", new Error("adapter"), "internal_error"],
+      ["activate", lost, "connection_lost"],
+    ] as const) {
+      for (const stopped of [true, false]) {
+        const result = await apply(({ t, stop }) => {
+          t.script("getNumeric", stopped ? then(stop, read("0")) : read("0"));
+          if (where === "createOperation") {
+            t.createOperation = () => {
+              throw thrown;
+            };
+          } else if (where === "prepareSubscription") {
+            t.prepareSubscription = () => {
+              throw thrown;
+            };
+          } else {
+            t.activation = thrown;
+          }
+        });
+        const name = `${where} ${thrown.message} after a stop: ${stopped}`;
+        expect([result.error, result.later], name).toEqual(stopped ? ["interrupted", { code, phase: thrown === lost ? "response" : "preparation" }] : [code, null]);
+      }
     }
   });
 
