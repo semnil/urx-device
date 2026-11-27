@@ -226,9 +226,12 @@ struct Shared {
     /// Signalled when a batch can be formed or delivery must stop.
     deliverable: Condvar,
     delivery_stop: AtomicBool,
-    /// The registration and unregistration frames written whole (R1-C-A).
+    /// The registration and unregistration frames written whole (R1-C-A),
+    /// and the parameter reads and writes.
     sent_registrations: AtomicU64,
     sent_unregistrations: AtomicU64,
+    sent_gets: AtomicU64,
+    sent_sets: AtomicU64,
     /// Holds the next sent request's response deadline from starting until
     /// signalled, for a case that closes while that request is on the wire.
     #[cfg(test)]
@@ -305,12 +308,16 @@ impl CloseCell {
     }
 }
 
-/// The registration and unregistration frames a connection has written
-/// whole (`Connection::sent_frames`).
+/// The frames a connection has written whole, by kind
+/// (`Connection::sent_frames`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SentFrames {
     pub registrations: u64,
     pub unregistrations: u64,
+    /// Parameter reads: a numeric, text or name get.
+    pub gets: u64,
+    /// Parameter writes: a numeric or text set.
+    pub sets: u64,
 }
 
 /// How a close ended.
@@ -473,6 +480,8 @@ impl Connection {
             delivery_stop: AtomicBool::new(false),
             sent_registrations: AtomicU64::new(0),
             sent_unregistrations: AtomicU64::new(0),
+            sent_gets: AtomicU64::new(0),
+            sent_sets: AtomicU64::new(0),
             #[cfg(test)]
             response_gate: Mutex::new(None),
         });
@@ -577,18 +586,22 @@ impl Connection {
         *lock(&self.shared.loss)
     }
 
-    /// The registration and unregistration frames this connection has
-    /// written whole, since it opened (R1-C-A): what a registration, a
-    /// release or a close sent, whether it then succeeded or failed. A frame
-    /// cut short is not counted, and nor is one that never started.
+    /// The registration, unregistration, parameter read and parameter write
+    /// frames this connection has written whole, since it opened (R1-C-A):
+    /// what a registration, a release, a close or a request sent, whether it
+    /// then succeeded or failed, its answer still awaited included. A frame
+    /// cut short is not counted, and nor is one that never started (a request
+    /// refused before it was sent). The opening's own reads are not counted.
     pub fn sent_frames(&self) -> SentFrames {
-        // Under the gate every write holds while it counts its frame: the two
+        // Under the gate every write holds while it counts its frame: the
         // figures are read at one moment, and a frame written whole before
         // this call is in them.
         let _gate = self.shared.link_end();
         SentFrames {
             registrations: self.shared.sent_registrations.load(Ordering::SeqCst),
             unregistrations: self.shared.sent_unregistrations.load(Ordering::SeqCst),
+            gets: self.shared.sent_gets.load(Ordering::SeqCst),
+            sets: self.shared.sent_sets.load(Ordering::SeqCst),
         }
     }
 
@@ -2585,13 +2598,17 @@ fn execute(
             None
         }
     };
+    let sent = match request {
+        Request::GetNumeric(_) | Request::GetText(_) | Request::GetName(_) => &shared.sent_gets,
+        Request::SetNumeric(..) | Request::SetText(..) => &shared.sent_sets,
+    };
     let outbound = Outbound {
         frame,
         key,
         send_end,
         cap: None,
         unstarted: &unstarted,
-        sent: None,
+        sent: Some(sent),
     };
     match exchange(sock, inbox, shared, options, outbound) {
         Ok(reply) => {
