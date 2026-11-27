@@ -3915,6 +3915,349 @@ mod notifications {
         );
     }
 
+    type Seen = Arc<Mutex<Vec<crate::delivery::NotificationRecord>>>;
+
+    /// A connection whose receipt observer keeps every record it is shown —
+    /// panicking instead on a numeric value equal to `fail_on` — and whose
+    /// delivery sends each batch with how many records had been seen by then.
+    fn connect_observed(
+        port: u16,
+        fail_on: Option<i64>,
+    ) -> (Connection, Receiver<(NotificationBatch, usize)>, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let (tx, batches) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let counted = Arc::clone(&seen);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            let observed = counted.lock().unwrap().len();
+            let _ = tx.lock().unwrap().send((batch, observed));
+        });
+        let kept = Arc::clone(&seen);
+        let observer: crate::connection::ReceiptObserver = Arc::new(move |record| {
+            if let (Some(fail), Notification::Numeric { value, .. }) = (fail_on, &record.payload) {
+                assert_ne!(*value, fail, "the observer failed");
+            }
+            kept.lock().unwrap().push(record.clone());
+        });
+        let connection = crate::connection::open_observed(
+            port,
+            ID,
+            &options(),
+            &Control::new(),
+            handler,
+            observer,
+        )
+        .unwrap();
+        (connection, batches, seen)
+    }
+
+    fn values(records: &[crate::delivery::NotificationRecord]) -> Vec<i64> {
+        records.iter().map(|record| numeric(record).1).collect()
+    }
+
+    #[test]
+    fn the_receipt_observer_sees_each_queued_record_while_the_delivery_waits() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, batches, seen) = connect_observed(port, None);
+        let a = activate(&connection, &[p(1), p(2)]);
+        push.send(notify_param(1, 1)).unwrap();
+        let (first, observed) = batches.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(values(&first.records), [1]);
+        assert_eq!(observed, 1, "seen before it is delivered");
+        for bytes in [notify_param(9, 0), notify_param(2, 2), notify_param(1, 3)] {
+            push.send(bytes).unwrap();
+        }
+        // The first batch is not acknowledged: nothing more is delivered, and
+        // what arrives meanwhile is seen as it is received.
+        super::wait_until(|| seen.lock().unwrap().len() == 3);
+        assert!(batches.recv_timeout(Duration::from_millis(200)).is_err());
+        let mut delivered = first.records.clone();
+        assert!(connection.adopt_notifications(first.ticket));
+        while delivered.len() < 3 {
+            let (batch, observed) = batches.recv_timeout(Duration::from_secs(5)).unwrap();
+            delivered.extend(batch.records.iter().cloned());
+            assert!(observed >= delivered.len(), "seen before it is delivered");
+            assert!(connection.adopt_notifications(batch.ticket));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            delivered,
+            "exactly the queued records, in receive order: not an unowned address"
+        );
+        assert_eq!(values(&delivered), [1, 2, 3]);
+        assert_eq!(delivered[0].recipients, [a.token()]);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn the_receipt_observer_does_not_see_a_record_past_the_budget() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches, seen) = connect_observed(port, None);
+        let _token = activate(&connection, &[p(1)]);
+        for value in 0..=(MAX_PENDING_NOTIFICATIONS as i64 + 1) {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(
+            connection.terminal(),
+            Some(RequestCause::NotificationOverflow)
+        );
+        assert_eq!(
+            values(&seen.lock().unwrap()),
+            (0..MAX_PENDING_NOTIFICATIONS as i64).collect::<Vec<_>>(),
+            "neither the record past the budget nor any after"
+        );
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    #[test]
+    fn a_failed_receipt_observer_ends_the_connection_and_queues_nothing_more() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let (connection, batches, seen) = connect_observed(port, Some(2));
+        let _token = activate(&connection, &[p(1)]);
+        for value in 1..=3 {
+            push.send(notify_param(1, value)).unwrap();
+        }
+        super::wait_until(|| connection.terminal().is_some());
+        assert_eq!(connection.terminal(), Some(RequestCause::InternalError));
+        assert_eq!(values(&seen.lock().unwrap()), [1]);
+        let mut delivered = Vec::new();
+        while let Ok((batch, _)) = batches.recv_timeout(Duration::from_millis(300)) {
+            delivered.extend(values(&batch.records));
+            connection.adopt_notifications(batch.ticket);
+        }
+        assert!(
+            delivered.iter().all(|value| *value == 1),
+            "neither the record it failed on nor any after: {delivered:?}"
+        );
+        assert!(connection.create_operation().is_err());
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    // A failed observer stops the queueing as an overflow does, and the reader
+    // goes on reading: the reply to the request on the wire is kept.
+    #[test]
+    fn a_reply_after_a_failed_receipt_observer_is_kept_and_the_connection_ends_with_it() {
+        let accept: fn(&Value) -> i64 = |_| 200;
+        let refuse: fn(&Value) -> i64 = |request| {
+            if uri_of(request).ends_with("operation=value") {
+                403
+            } else {
+                200
+            }
+        };
+        for (code, request, evidence) in [
+            (
+                accept,
+                Request::GetNumeric(param(5)),
+                crate::request::Evidence::Read,
+            ),
+            (
+                accept,
+                Request::SetNumeric(param(5), 3),
+                crate::request::Evidence::Accepted,
+            ),
+            (
+                refuse,
+                Request::SetNumeric(param(5), 3),
+                crate::request::Evidence::Rejected(403),
+            ),
+        ] {
+            let (port, push) = pushing_unit_coded(Duration::from_millis(300), code);
+            let (connection, _batches, _seen) = connect_observed(port, Some(-1));
+            let _token = activate(&connection, &[p(1)]);
+            let operation = connection.create_operation().unwrap();
+            let (tx, done) = mpsc::channel();
+            connection.submit_adopted(&operation, request.clone(), move |outcome| {
+                let _ = tx.send(outcome);
+            });
+            thread::sleep(Duration::from_millis(50));
+            push.send(notify_param(1, -1)).unwrap();
+            let outcome = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            match evidence {
+                crate::request::Evidence::Rejected(_) => assert!(
+                    matches!(&outcome, Outcome::Failure { evidence: found, .. } if *found == evidence),
+                    "{request:?}: {outcome:?}"
+                ),
+                _ => assert_eq!(
+                    outcome,
+                    Outcome::failed(
+                        RequestCause::InternalError,
+                        crate::request::RequestPhase::Delivery,
+                        evidence
+                    ),
+                    "{request:?}: the reply within its deadline is the evidence; its delivery fails"
+                ),
+            }
+            assert_eq!(connection.terminal(), Some(RequestCause::InternalError));
+            assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        }
+    }
+
+    // The reader thread holds the observer, so whatever the observer holds is
+    // let go once the connection is closed, whether it failed or not.
+    #[test]
+    fn the_transport_lets_go_of_the_receipt_observer_once_closed() {
+        for fail in [false, true] {
+            let (port, push) = pushing_unit(Duration::ZERO);
+            let (held, gone) = mpsc::channel::<()>();
+            let held = Mutex::new(held);
+            let handler: NotificationHandler = Arc::new(|_| {});
+            let observer: crate::connection::ReceiptObserver = Arc::new(move |_| {
+                let _held = &held;
+                assert!(!fail, "the observer failed");
+            });
+            let connection = crate::connection::open_observed(
+                port,
+                ID,
+                &options(),
+                &Control::new(),
+                handler,
+                observer,
+            )
+            .unwrap();
+            let _token = activate(&connection, &[p(1)]);
+            if fail {
+                push.send(notify_param(1, 1)).unwrap();
+                super::wait_until(|| connection.terminal().is_some());
+            }
+            assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+            assert_eq!(
+                gone.recv_timeout(Duration::from_secs(1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+                "failed: {fail}; the connection is still held here"
+            );
+        }
+    }
+
+    /// A unit that answers the handshake and every POST, and hangs up once
+    /// the returned sender is dropped.
+    fn hanging_up_unit() -> (u16, Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (hang_up, told) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let closer = stream.try_clone().unwrap();
+            thread::spawn(move || {
+                let _ = told.recv();
+                let _ = closer.shutdown(std::net::Shutdown::Both);
+            });
+            for request in BufReader::new(stream).lines() {
+                let Ok(request) = request else { return };
+                let request: Value = serde_json::from_str(&request).unwrap();
+                let uri = uri_of(&request).to_string();
+                let reply = match uri.as_str() {
+                    "/vd/synchronize" => get_reply("/vd/synchronize", online(ID)),
+                    "/vd/device" => get_reply("/vd/device", firmware()),
+                    _ => line(
+                        json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": 200 } } }),
+                    ),
+                };
+                if writer.write_all(&reply).is_err() {
+                    return;
+                }
+            }
+        });
+        (port, hang_up)
+    }
+
+    /// Runs `then` when dropped: what a receipt observer holds, reporting when
+    /// the reader lets go of it.
+    struct OnDrop<F: FnMut()>(F);
+
+    impl<F: FnMut()> Drop for OnDrop<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
+    // The observer is let go only once the reader has said it stopped
+    // reading, so a close that drop starts finds the reader's end reported.
+    #[test]
+    fn the_reader_reports_its_end_before_it_lets_go_of_the_receipt_observer() {
+        let (port, _hang_up) = hanging_up_unit();
+        let slot: Arc<OnceLock<Weak<Connection>>> = Arc::new(OnceLock::new());
+        let (tx, reading) = mpsc::channel();
+        let probe = {
+            let slot = Arc::clone(&slot);
+            let tx = Mutex::new(tx);
+            OnDrop(move || {
+                let connection = slot.get().and_then(Weak::upgrade);
+                let read = connection.map(|c| crate::connection::lock(&c.shared.ops).reading);
+                let _ = tx.lock().unwrap().send(read);
+            })
+        };
+        let observer: crate::connection::ReceiptObserver = Arc::new(move |_| {
+            let _ = &probe;
+        });
+        let handler: NotificationHandler = Arc::new(|_| {});
+        let connection = Arc::new(
+            crate::connection::open_observed(
+                port,
+                ID,
+                &options(),
+                &Control::new(),
+                handler,
+                observer,
+            )
+            .unwrap(),
+        );
+        slot.set(Arc::downgrade(&connection)).unwrap();
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+        assert_eq!(
+            reading.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some(false),
+            "the reader's end was reported when the observer was let go"
+        );
+    }
+
+    /// What a receipt observer holds: the connection, dropped first, then
+    /// `_then`, which reports once that drop, and the close it starts, return.
+    struct Holding<F: FnMut()> {
+        connection: Mutex<Option<Arc<Connection>>>,
+        _then: OnDrop<F>,
+    }
+
+    // The observer can hold the last reference to the connection: the reader
+    // then drops it as it ends, and the close that starts finishes on a
+    // helper rather than waiting for the reader itself.
+    #[test]
+    fn a_connection_the_receipt_observer_holds_last_closes_at_once_when_the_unit_hangs_up() {
+        let (port, hang_up) = hanging_up_unit();
+        let (tx, returned) = mpsc::channel::<()>();
+        let tx = Mutex::new(tx);
+        let holding = Arc::new(Holding {
+            connection: Mutex::new(None),
+            _then: OnDrop(move || {
+                let _ = tx.lock().unwrap().send(());
+            }),
+        });
+        let held = Arc::clone(&holding);
+        let observer: crate::connection::ReceiptObserver = Arc::new(move |_| {
+            let _ = &held;
+        });
+        let handler: NotificationHandler = Arc::new(|_| {});
+        let connection = crate::connection::open_observed(
+            port,
+            ID,
+            &options(),
+            &Control::new(),
+            handler,
+            observer,
+        )
+        .unwrap();
+        *holding.connection.lock().unwrap() = Some(Arc::new(connection));
+        drop(holding);
+        drop(hang_up);
+        assert_eq!(
+            returned.recv_timeout(Duration::from_secs(1)),
+            Ok(()),
+            "the drop returned within a second, not at the end of the teardown budget"
+        );
+    }
+
     #[test]
     fn requests_waiting_at_an_overflow_end_with_it_on_close_or_cancel() {
         for close in [true, false] {

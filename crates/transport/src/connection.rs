@@ -256,6 +256,11 @@ enum Event {
     Wake,
     Frame(Received),
     ReadFailed(RequestCause),
+    /// The reader stopped queueing notifications — an overflow, or a failed
+    /// receipt observer — and goes on reading: the connection ends with the
+    /// cause, and the reply to the request on the wire is still awaited
+    /// within its deadline and kept as evidence.
+    QueueingStopped(RequestCause),
 }
 
 /// One JSON frame as the reader received it.
@@ -273,6 +278,9 @@ struct Received {
 /// [`Connection::adopt_notifications`] once its records are adopted.
 pub type NotificationHandler = Arc<dyn Fn(NotificationBatch) + Send + Sync>;
 
+/// Shown each notification record as it is queued for delivery; see [`open_observed`].
+pub type ReceiptObserver = Arc<dyn Fn(&NotificationRecord) + Send + Sync>;
+
 /// An open connection to one unit. It is shared by reference: closing takes
 /// `&self`, and every call to [`Connection::close`] joins the same close.
 pub struct Connection {
@@ -288,6 +296,7 @@ pub struct Connection {
     /// Kept apart from the handles, which a close takes.
     worker_id: ThreadId,
     delivery_id: Option<ThreadId>,
+    reader_id: ThreadId,
     reader: Mutex<Option<JoinHandle<()>>>,
     close: Arc<CloseCell>,
 }
@@ -394,13 +403,54 @@ pub fn open_with(
     control: &Control,
     notifications: Option<NotificationHandler>,
 ) -> Result<Connection, LinkFailure> {
+    open_delivering(port, expected_id, options, control, notifications, None)
+}
+
+/// Like [`open_with`], also showing `at_receipt` each notification record as
+/// it is queued for `notifications`: on the reader thread, in receive order,
+/// before the delivery can hand the record on, however long the delivery
+/// waits for an acknowledgment. It sees exactly the records that are queued —
+/// not a frame dropped for want of a recipient, nor one past the delivery
+/// budget (K6), nor any after an overflow. It must return promptly and must
+/// not call into the connection: the reader receives nothing, replies
+/// included, until it returns. If it panics, nothing more is queued and the
+/// connection ends with `internal_error`; as after an overflow, the reply to
+/// the request on the wire is still awaited and kept as evidence. The reader
+/// thread holds it and drops it once that thread ends, by the time the
+/// connection is closed.
+pub fn open_observed(
+    port: u16,
+    expected_id: &str,
+    options: &ConnectionOptions,
+    control: &Control,
+    notifications: NotificationHandler,
+    at_receipt: ReceiptObserver,
+) -> Result<Connection, LinkFailure> {
+    open_delivering(
+        port,
+        expected_id,
+        options,
+        control,
+        Some(notifications),
+        Some(at_receipt),
+    )
+}
+
+fn open_delivering(
+    port: u16,
+    expected_id: &str,
+    options: &ConnectionOptions,
+    control: &Control,
+    notifications: Option<NotificationHandler>,
+    at_receipt: Option<ReceiptObserver>,
+) -> Result<Connection, LinkFailure> {
     let budget = Budget::starting_now(options.connect_deadline, Cause::ConnectTimeout);
     let mut link = Link::connect(port, &budget, Phase::Connect, control)?;
     link.set_phase(Phase::Identity);
     let firmware = identify(&mut link, expected_id, options, &budget)
         .map_err(|failure| link.failed(failure))?;
     let (sock, reader) = link.into_parts();
-    Connection::start(sock, reader, firmware, options, notifications)
+    Connection::start(sock, reader, firmware, options, notifications, at_receipt)
         .map_err(|_| Failure::cause(Cause::InternalError, Phase::Connect).into())
 }
 
@@ -455,6 +505,7 @@ impl Connection {
         firmware: SystemFirmware,
         options: &ConnectionOptions,
         notifications: Option<NotificationHandler>,
+        at_receipt: Option<ReceiptObserver>,
     ) -> std::io::Result<Connection> {
         // A failure leaves nothing running: the clones come before any thread
         // starts, and a thread that cannot be started stops those that did.
@@ -487,6 +538,9 @@ impl Connection {
         });
         let (events, inbox) = mpsc::channel();
         let reader_stop = Arc::new(AtomicBool::new(false));
+        // Held by the reader thread, which shows it each record it queues, so
+        // the transport lets go of it once that thread ends.
+        let at_receipt = at_receipt.filter(|_| notifications.is_some());
         // A thread that cannot be started fails the opening; the ones already
         // started are stopped and waited for first, so nothing is left running.
         let abandon = |started: Vec<JoinHandle<()>>| {
@@ -519,7 +573,8 @@ impl Connection {
             let events = events.clone();
             let stop = Arc::clone(&reader_stop);
             let shared = Arc::clone(&shared);
-            match spawner.spawn(move || read_frames(sock, reader, events, stop, shared)) {
+            match spawner.spawn(move || read_frames(sock, reader, events, stop, shared, at_receipt))
+            {
                 Ok(thread) => thread,
                 Err(error) => {
                     abandon(delivery_thread.into_iter().collect());
@@ -542,6 +597,7 @@ impl Connection {
         Ok(Connection {
             generation,
             delivery_id: delivery_thread.as_ref().map(|handle| handle.thread().id()),
+            reader_id: reader_thread.thread().id(),
             delivery: Mutex::new(delivery_thread),
             firmware,
             shared,
@@ -849,8 +905,10 @@ impl Connection {
             end,
         };
         if self.on_own_thread() {
-            // A completion or delivery callback cannot wait for the thread it
-            // runs on; a helper finishes the close within the same budget.
+            // A completion or delivery callback, or the reader dropping a
+            // receipt observer that held the last reference, cannot wait for
+            // the thread it runs on; a helper finishes the close within the
+            // same budget.
             let cell = Arc::clone(&self.close);
             let slot = Arc::new(Mutex::new(Some(rest)));
             let taken = Arc::clone(&slot);
@@ -876,19 +934,21 @@ impl Connection {
     }
 
     /// Whether this thread is one the close waits for: the worker, the
-    /// notification delivery thread, a completing thread, or the thread
-    /// running the close.
+    /// notification delivery thread, the reader, a completing thread, or the
+    /// thread running the close.
     fn must_not_wait(&self) -> bool {
         let me = thread::current().id();
         self.on_own_thread() || lock(&self.close.exempt).contains(&me)
     }
 
-    /// Whether this is the worker, the notification delivery thread or a
-    /// completing thread (an expired request's, or what a close took).
+    /// Whether this is the worker, the notification delivery thread, the
+    /// reader or a completing thread (an expired request's, or what a close
+    /// took).
     fn on_own_thread(&self) -> bool {
         let me = thread::current().id();
         self.worker_id == me
             || self.delivery_id == Some(me)
+            || self.reader_id == me
             || lock(&self.shared.expiry.pool).ids.contains(&me)
     }
 }
@@ -1585,12 +1645,20 @@ enum Routed {
     Dropped,
     /// A notification beyond the delivery budget (K6).
     Overflow,
+    /// The receipt observer panicked on a notification, which is not queued.
+    ObserverFailed,
 }
 
 /// Decides, at receipt, which tokens a notification frame is for, and
-/// queues it for them within the budget (K6). Once `accepting` is false
-/// (after an overflow), notifications are no longer queued.
-fn route(shared: &Shared, received: &Received, accepting: bool) -> Routed {
+/// queues it for them within the budget (K6), showing it to `at_receipt`
+/// first. Once `accepting` is false (after an overflow or a failed
+/// observer), notifications are no longer queued.
+fn route(
+    shared: &Shared,
+    received: &Received,
+    accepting: bool,
+    at_receipt: Option<&ReceiptObserver>,
+) -> Routed {
     let Some(payload) = Inbound::new(received.message.clone()).notification() else {
         return Routed::NotNotification;
     };
@@ -1619,6 +1687,16 @@ fn route(shared: &Shared, received: &Received, accepting: bool) -> Routed {
         received_at_ms: received.received_at_ms,
         payload,
     };
+    if let Some(observe) = at_receipt {
+        // Only this thread queues, and nothing else adds to what the queue
+        // retains, so a record that fits now still fits once it is seen.
+        if !lock(queue).fits(received.len) {
+            return Routed::Overflow;
+        }
+        if panic::catch_unwind(AssertUnwindSafe(|| observe(&record))).is_err() {
+            return Routed::ObserverFailed;
+        }
+    }
     let pushed = lock(queue).push(record, received.len);
     shared.deliverable.notify_all();
     match pushed {
@@ -1659,18 +1737,23 @@ fn deliver_notifications(shared: &Shared, handler: &NotificationHandler, events:
     }
 }
 
-/// Receives frames until told to stop or the link fails.
+/// Receives frames until told to stop or the link fails, showing each
+/// queued notification to `at_receipt`, which it drops on the way out.
 fn read_frames(
     sock: TcpStream,
     reader: FrameReader,
     events: Sender<Event>,
     stop: Arc<AtomicBool>,
     shared: Arc<Shared>,
+    at_receipt: Option<ReceiptObserver>,
 ) {
-    read_until_stopped(sock, reader, &events, &stop, &shared);
+    read_until_stopped(sock, reader, &events, &stop, &shared, at_receipt.as_ref());
     // Whatever the reader met is reported by now, or never will be.
     lock(&shared.ops).reading = false;
     shared.ops_changed.notify_all();
+    // Last: the observer can hold the last reference to the connection, and
+    // the close its drop starts waits for what the reader's end lets go.
+    drop(at_receipt);
 }
 
 /// The reader's loop (`read_frames`).
@@ -1680,14 +1763,16 @@ fn read_until_stopped(
     events: &Sender<Event>,
     stop: &AtomicBool,
     shared: &Arc<Shared>,
+    at_receipt: Option<&ReceiptObserver>,
 ) {
     let shared = Arc::clone(shared);
     let record = |cause| {
         record_end(&shared, cause);
     };
-    // After an overflow, replies to a request already sent still arrive;
-    // further notifications are not queued, even once budget is released.
-    let mut overflowed = false;
+    // After an overflow or a failed receipt observer, replies to a request
+    // already sent still arrive; further notifications are not queued, even
+    // once budget is released.
+    let mut queueing = true;
     begin_op(&shared, Side::Reader);
     let set = sock
         .set_read_timeout(Some(READ_POLL))
@@ -1725,16 +1810,18 @@ fn read_until_stopped(
                         cutoff: 0,
                     };
                     // Recipients and budget are decided here, at receipt.
-                    match route(&shared, &received, !overflowed) {
+                    match route(&shared, &received, queueing, at_receipt) {
                         Routed::NotNotification => {}
                         Routed::Queued | Routed::Dropped => continue,
-                        Routed::Overflow => {
-                            if !overflowed {
-                                overflowed = true;
-                                record(RequestCause::NotificationOverflow);
-                                let _ = events
-                                    .send(Event::ReadFailed(RequestCause::NotificationOverflow));
-                            }
+                        // Only while queueing: once not, `route` drops every notification.
+                        stopped @ (Routed::Overflow | Routed::ObserverFailed) => {
+                            queueing = false;
+                            let cause = match stopped {
+                                Routed::Overflow => RequestCause::NotificationOverflow,
+                                _ => RequestCause::InternalError,
+                            };
+                            record(cause);
+                            let _ = events.send(Event::QueueingStopped(cause));
                             continue;
                         }
                     }
@@ -1974,7 +2061,7 @@ fn serve(
                     note_loss(&shared, LinkLoss::UnitLost);
                     RequestCause::ConnectionLost
                 }),
-                Ok(Event::ReadFailed(cause)) => Some(cause),
+                Ok(Event::ReadFailed(cause) | Event::QueueingStopped(cause)) => Some(cause),
                 Err(_) => return,
             },
         };
@@ -2862,8 +2949,9 @@ fn exchange(
             true,
         ))
     };
-    // An overflow ends the connection but not this request: its reply is
-    // still awaited within its deadline and kept as evidence.
+    // A stop of the queueing (an overflow, or a failed receipt observer) ends
+    // the connection but not this request: its reply is still awaited within
+    // its deadline and kept as evidence.
     let mut ending = None;
     loop {
         let remaining = response_end.saturating_duration_since(Instant::now());
@@ -2888,8 +2976,8 @@ fn exchange(
                 }
             }
             Ok(Event::Wake) => {}
-            Ok(Event::ReadFailed(RequestCause::NotificationOverflow)) => {
-                ending = Some(RequestCause::NotificationOverflow);
+            Ok(Event::QueueingStopped(cause)) => {
+                ending.get_or_insert(cause);
             }
             Ok(Event::ReadFailed(cause)) => return unconfirmed(cause),
             Err(RecvTimeoutError::Timeout) => return unconfirmed(ending.unwrap_or(timeout)),
