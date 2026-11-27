@@ -1170,6 +1170,9 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             loss: std::sync::Mutex::new(None),
+            loss_recorded: std::sync::Condvar::new(),
+            // No reader runs beside a scripted write.
+            reading: std::sync::atomic::AtomicBool::new(false),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
@@ -1184,6 +1187,117 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
         end_before_write,
         writes: 0,
         recordable_during_write: false,
+    }
+}
+
+// The reader decides how a reset link was lost: a write that meets only a
+// symptom of it waits for the reader's account, and keeps its own only where
+// the reader gives none in time or is not reading.
+#[test]
+fn a_write_meeting_a_symptom_takes_the_readers_account_of_the_loss() {
+    use std::sync::atomic::Ordering;
+    let reset = LinkLoss::SocketError(std::io::ErrorKind::ConnectionReset);
+    let pipe = LinkLoss::SocketError(std::io::ErrorKind::BrokenPipe);
+    let loss = |shared: &super::Shared| *super::lock(&shared.loss);
+
+    // The reader records the reset while the write waits: the reset stands.
+    let shared = Arc::clone(&scripted(None).shared);
+    shared.reading.store(true, Ordering::SeqCst);
+    let reader = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            super::note_loss(&shared, reset);
+        })
+    };
+    super::note_write_loss(&shared, pipe);
+    reader.join().unwrap();
+    assert_eq!(loss(&shared), Some(reset));
+
+    // The reader stops reading without an account: the write's own, at once.
+    let shared = Arc::clone(&scripted(None).shared);
+    shared.reading.store(true, Ordering::SeqCst);
+    let reader = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            let _loss = super::lock(&shared.loss);
+            shared.reading.store(false, Ordering::SeqCst);
+            shared.loss_recorded.notify_all();
+        })
+    };
+    let started = Instant::now();
+    super::note_write_loss(&shared, LinkLoss::PeerClosed);
+    reader.join().unwrap();
+    assert_eq!(loss(&shared), Some(LinkLoss::PeerClosed));
+    assert!(
+        started.elapsed() < super::WRITE_LOSS_WAIT,
+        "{:?}",
+        started.elapsed()
+    );
+
+    // The reader reads on and accounts for nothing: the write's own, after the wait.
+    let shared = Arc::clone(&scripted(None).shared);
+    shared.reading.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    super::note_write_loss(&shared, pipe);
+    assert_eq!(loss(&shared), Some(pipe));
+    assert!(
+        started.elapsed() >= super::WRITE_LOSS_WAIT,
+        "{:?}",
+        started.elapsed()
+    );
+
+    // A reset the write met itself is recorded at once.
+    let shared = Arc::clone(&scripted(None).shared);
+    shared.reading.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    super::note_write_loss(&shared, reset);
+    assert_eq!(loss(&shared), Some(reset));
+    assert!(
+        started.elapsed() < super::WRITE_LOSS_WAIT,
+        "{:?}",
+        started.elapsed()
+    );
+
+    // An account already recorded stands over the write's symptom.
+    let shared = Arc::clone(&scripted(None).shared);
+    super::note_loss(&shared, reset);
+    super::note_write_loss(&shared, pipe);
+    assert_eq!(loss(&shared), Some(reset));
+}
+
+// A peer that resets the operational connection: the requests in flight and
+// after it fail as `connection_lost`, and the loss reads as the reset from the
+// first failure through the close, however the reader and the worker meet it.
+#[test]
+fn a_reset_after_the_opening_is_known_as_the_reset() {
+    for round in 0..20 {
+        let peer = resetting(vec![
+            get_reply("/vd/synchronize", online(ID)),
+            get_reply("/vd/device", firmware()),
+        ]);
+        let connection = open(peer, ID, &options(), &Control::new()).expect("open");
+        let operation = connection.create_operation().unwrap();
+        let first = submit(&connection, &operation, Request::GetNumeric(address(1)));
+        let second = submit(&connection, &operation, Request::GetNumeric(address(2)));
+        for rx in [first, second] {
+            assert!(
+                matches!(outcome(&rx), Outcome::Failure { .. }),
+                "round {round}: a request on a reset link fails"
+            );
+            assert!(
+                is_reset(connection.lost_link()),
+                "round {round}: {:?}",
+                connection.lost_link()
+            );
+        }
+        connection.close(TEARDOWN);
+        assert!(
+            is_reset(connection.lost_link()),
+            "round {round} after the close: {:?}",
+            connection.lost_link()
+        );
     }
 }
 
