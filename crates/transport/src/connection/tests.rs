@@ -1225,11 +1225,24 @@ fn a_loss_is_settled_with_both_sides_accounts() {
     );
     reader.join().unwrap();
 
-    // The reader's next read ends with nothing: the writer's own stands.
+    // The reader reads on and meets nothing: the writer's own stands. The
+    // reader reads the way the real one does, one read after another, so
+    // the writer's wait for its next read ends whichever thread runs first.
     let shared = fresh(true);
-    let reader = later(&shared, Side::Reader, None);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (shared, done) = (Arc::clone(&shared), Arc::clone(&done));
+        thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                begin_op(&shared, Side::Reader);
+                thread::sleep(Duration::from_millis(5));
+                end_op(&shared, Side::Reader, None);
+            }
+        })
+    };
     let pipe = LinkLoss::SocketError(BrokenPipe);
     assert_eq!(settle_loss(&shared, Side::Writer, pipe), pipe);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
     reader.join().unwrap();
 
     // No reader reads: the writer's own, at once.
