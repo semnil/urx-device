@@ -206,11 +206,12 @@ struct Shared {
     /// How the link was lost, recorded before a `connection_lost` end is
     /// (R1-L-A). The first one recorded stands.
     loss: Mutex<Option<LinkLoss>>,
-    /// Signalled, with `loss`, when a loss is recorded.
-    loss_recorded: Condvar,
-    /// Whether the reader is reading: it decides how a reset link was lost,
-    /// so a write that meets only a reset's symptom waits for its account.
-    reading: AtomicBool,
+    /// What the reader and the writer are doing on the socket, and whether
+    /// either met a reset: how a lost connection was lost is decided with
+    /// both their accounts in.
+    ops: Mutex<SocketOps>,
+    /// Signalled, with `ops`, when an operation ends or the reader stops.
+    ops_changed: Condvar,
     /// Signalled when the worker settles its active request.
     settled: Condvar,
     /// Signalled, with the state lock, when what a held result waits for may
@@ -457,8 +458,11 @@ impl Connection {
             state: Mutex::new(State::default()),
             link_end: Mutex::new(None),
             loss: Mutex::new(None),
-            loss_recorded: Condvar::new(),
-            reading: AtomicBool::new(true),
+            ops: Mutex::new(SocketOps {
+                reading: true,
+                ..SocketOps::default()
+            }),
+            ops_changed: Condvar::new(),
             settled: Condvar::new(),
             advance: Condvar::new(),
             expiry: Arc::new(Expiry::default()),
@@ -1651,10 +1655,9 @@ fn read_frames(
     shared: Arc<Shared>,
 ) {
     read_until_stopped(sock, reader, &events, &stop, &shared);
-    // Whatever the reader recorded is recorded by now, or never will be.
-    let _loss = lock(&shared.loss);
-    shared.reading.store(false, Ordering::SeqCst);
-    shared.loss_recorded.notify_all();
+    // Whatever the reader met is reported by now, or never will be.
+    lock(&shared.ops).reading = false;
+    shared.ops_changed.notify_all();
 }
 
 /// The reader's loop (`read_frames`).
@@ -1672,17 +1675,30 @@ fn read_until_stopped(
     // After an overflow, replies to a request already sent still arrive;
     // further notifications are not queued, even once budget is released.
     let mut overflowed = false;
-    if let Err(error) = sock
+    begin_op(&shared, Side::Reader);
+    let set = sock
         .set_read_timeout(Some(READ_POLL))
-        .map_err(|error| crate::link::pending_or(&sock, error))
-    {
-        note_loss(&shared, LinkLoss::SocketError(error.kind()));
+        .map_err(|error| crate::link::pending_or(&sock, error));
+    end_op(
+        &shared,
+        Side::Reader,
+        set.as_ref().err().map(std::io::Error::kind),
+    );
+    if let Err(error) = set {
+        note_socket_loss(&shared, Side::Reader, LinkLoss::SocketError(error.kind()));
         record(RequestCause::ConnectionLost);
         let _ = events.send(Event::ReadFailed(RequestCause::ConnectionLost));
         return;
     }
     while !stop.load(Ordering::SeqCst) {
-        match reader.read_frame(&mut sock) {
+        begin_op(&shared, Side::Reader);
+        let read = reader.read_frame(&mut sock);
+        let met = match &read {
+            Err(ReadError::Io(kind)) => Some(*kind),
+            _ => None,
+        };
+        end_op(&shared, Side::Reader, met);
+        match read {
             Ok(Some(frame)) => {
                 if let Some(json) = frame.json {
                     if lost_notification(&json) {
@@ -1724,11 +1740,11 @@ fn read_until_stopped(
                     let cause = match error {
                         ReadError::Oversized { .. } => RequestCause::InvalidResponse,
                         ReadError::Closed => {
-                            note_loss(&shared, LinkLoss::PeerClosed);
+                            note_socket_loss(&shared, Side::Reader, LinkLoss::PeerClosed);
                             RequestCause::ConnectionLost
                         }
                         ReadError::Io(kind) => {
-                            note_loss(&shared, LinkLoss::SocketError(kind));
+                            note_socket_loss(&shared, Side::Reader, LinkLoss::SocketError(kind));
                             RequestCause::ConnectionLost
                         }
                     };
@@ -1745,41 +1761,90 @@ fn read_until_stopped(
 /// before the `connection_lost` end it explains is recorded (R1-L-A).
 fn note_loss(shared: &Shared, loss: LinkLoss) {
     lock(&shared.loss).get_or_insert(loss);
-    shared.loss_recorded.notify_all();
 }
 
-/// How long a write that met only a symptom of a lost link waits for the
-/// reader's account of it: twice the reader's poll, which a reset ends at
-/// once.
-const WRITE_LOSS_WAIT: Duration = Duration::from_millis(200);
+/// The two threads that operate on a connection's socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Reader,
+    Writer,
+}
 
-/// Records how a write found the link lost. A reset is recorded at once. A
-/// symptom — a closed stream, a broken pipe, a refused timeout — waits, up
-/// to `WRITE_LOSS_WAIT` and while the reader is reading, for the reader to
-/// record what it found, since the reader reads the whole connection long
-/// and meets the reset itself; the writer takes no pending error, which
-/// leaves the reset for the reader. Only a symptom the reader never
-/// accounts for is recorded as the write's own.
-fn note_write_loss(shared: &Shared, observed: LinkLoss) {
-    if observed == LinkLoss::SocketError(ErrorKind::ConnectionReset) {
-        return note_loss(shared, observed);
+/// The reader's and the writer's socket operations (`Shared::ops`).
+#[derive(Debug, Default)]
+struct SocketOps {
+    /// The reader runs; it reads the whole connection long.
+    reading: bool,
+    reader_busy: bool,
+    /// Reader operations finished.
+    reads: u64,
+    writer_busy: bool,
+    /// Either met a reset.
+    reset: bool,
+}
+
+/// Marks the start of a socket operation by `side`.
+fn begin_op(shared: &Shared, side: Side) {
+    let mut ops = lock(&shared.ops);
+    match side {
+        Side::Reader => ops.reader_busy = true,
+        Side::Writer => ops.writer_busy = true,
     }
-    let deadline = Instant::now() + WRITE_LOSS_WAIT;
-    let mut loss = lock(&shared.loss);
-    while loss.is_none() && shared.reading.load(Ordering::SeqCst) {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+}
+
+/// Marks the end of `side`'s socket operation with the error it met, if
+/// any, in one step: an operation that met a reset is never seen finished
+/// without it.
+fn end_op(shared: &Shared, side: Side, met: Option<ErrorKind>) {
+    let mut ops = lock(&shared.ops);
+    match side {
+        Side::Reader => {
+            ops.reader_busy = false;
+            ops.reads += 1;
+        }
+        Side::Writer => ops.writer_busy = false,
+    }
+    ops.reset |= met == Some(ErrorKind::ConnectionReset);
+    drop(ops);
+    shared.ops_changed.notify_all();
+}
+
+/// How the connection was lost, `own` being what `side` met, once the
+/// other side's account is in: a reset either met, else `own`. The reader
+/// waits for a write in progress to end; the writer waits for the reader's
+/// next read to end, which meets a reset the writer only saw a symptom of,
+/// or for the reader to stop. Each side has ended its own operation first,
+/// so neither waits for the other's wait. The waits are bounded by the
+/// socket operations themselves: a write by its send deadline, a read by
+/// the reader's poll.
+fn settle_loss(shared: &Shared, side: Side, own: LinkLoss) -> LinkLoss {
+    let mut ops = lock(&shared.ops);
+    let target = ops.reads + 1;
+    loop {
+        let waiting = match side {
+            Side::Reader => ops.writer_busy,
+            Side::Writer => ops.reading && ops.reads < target,
+        };
+        if ops.reset || !waiting {
             break;
         }
-        loss = shared
-            .loss_recorded
-            .wait_timeout(loss, remaining)
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .0;
+        ops = shared
+            .ops_changed
+            .wait(ops)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
-    loss.get_or_insert(observed);
-    drop(loss);
-    shared.loss_recorded.notify_all();
+    if ops.reset {
+        LinkLoss::SocketError(ErrorKind::ConnectionReset)
+    } else {
+        own
+    }
+}
+
+/// Records how a socket failure `side` met lost the connection
+/// (`settle_loss`).
+fn note_socket_loss(shared: &Shared, side: Side, own: LinkLoss) {
+    let loss = settle_loss(shared, side, own);
+    note_loss(shared, loss);
 }
 
 /// The worker: runs admitted requests one at a time until the connection
@@ -2852,8 +2917,15 @@ fn write_frame<O: Outgoing>(
         if remaining.is_zero() {
             return failed(RequestCause::SendTimeout);
         }
-        if let Err(error) = sock.set_write_timeout(Some(remaining.min(WRITE_POLL))) {
-            note_write_loss(shared, LinkLoss::SocketError(error.kind()));
+        begin_op(shared, Side::Writer);
+        let set = sock.set_write_timeout(Some(remaining.min(WRITE_POLL)));
+        end_op(
+            shared,
+            Side::Writer,
+            set.as_ref().err().map(std::io::Error::kind),
+        );
+        if let Err(error) = set {
+            note_socket_loss(shared, Side::Writer, LinkLoss::SocketError(error.kind()));
             return failed(RequestCause::ConnectionLost);
         }
         // Held across the write: the reader cannot record an end, and a
@@ -2879,7 +2951,13 @@ fn write_frame<O: Outgoing>(
                 return failed(RequestCause::SendTimeout);
             }
         }
+        begin_op(shared, Side::Writer);
         let outcome = sock.write(&frame[written..]);
+        end_op(
+            shared,
+            Side::Writer,
+            outcome.as_ref().err().map(std::io::Error::kind),
+        );
         // Counted before the gate is let go: `sent_frames` reads under it, so
         // a frame the peer has whole is never missing from a count read after.
         if let (Some(sent), Ok(n)) = (sent, &outcome) {
@@ -2890,7 +2968,7 @@ fn write_frame<O: Outgoing>(
         drop(link_end);
         match outcome {
             Ok(0) => {
-                note_write_loss(shared, LinkLoss::PeerClosed);
+                note_socket_loss(shared, Side::Writer, LinkLoss::PeerClosed);
                 return failed(RequestCause::ConnectionLost);
             }
             Ok(n) => written += n,
@@ -2900,7 +2978,7 @@ fn write_frame<O: Outgoing>(
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                 ) => {}
             Err(e) => {
-                note_write_loss(shared, LinkLoss::SocketError(e.kind()));
+                note_socket_loss(shared, Side::Writer, LinkLoss::SocketError(e.kind()));
                 return failed(RequestCause::ConnectionLost);
             }
         }

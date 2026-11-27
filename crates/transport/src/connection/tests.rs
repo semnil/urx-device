@@ -1170,9 +1170,9 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             state: std::sync::Mutex::new(super::State::default()),
             link_end: std::sync::Mutex::new(None),
             loss: std::sync::Mutex::new(None),
-            loss_recorded: std::sync::Condvar::new(),
             // No reader runs beside a scripted write.
-            reading: std::sync::atomic::AtomicBool::new(false),
+            ops: std::sync::Mutex::new(super::SocketOps::default()),
+            ops_changed: std::sync::Condvar::new(),
             settled: std::sync::Condvar::new(),
             advance: std::sync::Condvar::new(),
             expiry: Default::default(),
@@ -1190,81 +1190,75 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
     }
 }
 
-// The reader decides how a reset link was lost: a write that meets only a
-// symptom of it waits for the reader's account, and keeps its own only where
-// the reader gives none in time or is not reading.
+// How a lost connection was lost is decided with both sides' accounts in: a
+// side that met only a symptom waits for the other's operation in progress —
+// the writer for the reader's next read, the reader for a write — and a reset
+// either met is the loss, whichever side met it and in whatever order.
 #[test]
-fn a_write_meeting_a_symptom_takes_the_readers_account_of_the_loss() {
-    use std::sync::atomic::Ordering;
-    let reset = LinkLoss::SocketError(std::io::ErrorKind::ConnectionReset);
-    let pipe = LinkLoss::SocketError(std::io::ErrorKind::BrokenPipe);
-    let loss = |shared: &super::Shared| *super::lock(&shared.loss);
-
-    // The reader records the reset while the write waits: the reset stands.
-    let shared = Arc::clone(&scripted(None).shared);
-    shared.reading.store(true, Ordering::SeqCst);
-    let reader = {
-        let shared = Arc::clone(&shared);
+fn a_loss_is_settled_with_both_sides_accounts() {
+    use super::{begin_op, end_op, settle_loss, Side, SocketOps};
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset, InvalidInput};
+    let reset = LinkLoss::SocketError(ConnectionReset);
+    let fresh = |reading: bool| {
+        let shared = Arc::clone(&scripted(None).shared);
+        *super::lock(&shared.ops) = SocketOps {
+            reading,
+            ..SocketOps::default()
+        };
+        shared
+    };
+    let later = |shared: &Arc<super::Shared>, side: Side, met: Option<std::io::ErrorKind>| {
+        let shared = Arc::clone(shared);
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
-            super::note_loss(&shared, reset);
+            end_op(&shared, side, met);
         })
     };
-    super::note_write_loss(&shared, pipe);
+
+    // The writer met a refused timeout while the reader's read was meeting the reset.
+    let shared = fresh(true);
+    begin_op(&shared, Side::Reader);
+    let reader = later(&shared, Side::Reader, Some(ConnectionReset));
+    assert_eq!(
+        settle_loss(&shared, Side::Writer, LinkLoss::SocketError(InvalidInput)),
+        reset
+    );
     reader.join().unwrap();
-    assert_eq!(loss(&shared), Some(reset));
 
-    // The reader stops reading without an account: the write's own, at once.
-    let shared = Arc::clone(&scripted(None).shared);
-    shared.reading.store(true, Ordering::SeqCst);
-    let reader = {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
-            let _loss = super::lock(&shared.loss);
-            shared.reading.store(false, Ordering::SeqCst);
-            shared.loss_recorded.notify_all();
-        })
-    };
-    let started = Instant::now();
-    super::note_write_loss(&shared, LinkLoss::PeerClosed);
+    // The reader's next read ends with nothing: the writer's own stands.
+    let shared = fresh(true);
+    let reader = later(&shared, Side::Reader, None);
+    let pipe = LinkLoss::SocketError(BrokenPipe);
+    assert_eq!(settle_loss(&shared, Side::Writer, pipe), pipe);
     reader.join().unwrap();
-    assert_eq!(loss(&shared), Some(LinkLoss::PeerClosed));
-    assert!(
-        started.elapsed() < super::WRITE_LOSS_WAIT,
-        "{:?}",
-        started.elapsed()
+
+    // No reader reads: the writer's own, at once.
+    assert_eq!(settle_loss(&fresh(false), Side::Writer, pipe), pipe);
+
+    // The reader met the stream's end while a write was meeting the reset.
+    let shared = fresh(true);
+    begin_op(&shared, Side::Writer);
+    let writer = later(&shared, Side::Writer, Some(ConnectionReset));
+    assert_eq!(
+        settle_loss(&shared, Side::Reader, LinkLoss::PeerClosed),
+        reset
+    );
+    writer.join().unwrap();
+
+    // No write in progress: the reader's own, at once.
+    assert_eq!(
+        settle_loss(&fresh(true), Side::Reader, LinkLoss::PeerClosed),
+        LinkLoss::PeerClosed
     );
 
-    // The reader reads on and accounts for nothing: the write's own, after the wait.
-    let shared = Arc::clone(&scripted(None).shared);
-    shared.reading.store(true, Ordering::SeqCst);
-    let started = Instant::now();
-    super::note_write_loss(&shared, pipe);
-    assert_eq!(loss(&shared), Some(pipe));
-    assert!(
-        started.elapsed() >= super::WRITE_LOSS_WAIT,
-        "{:?}",
-        started.elapsed()
+    // A reset already met by either side is the loss.
+    let shared = fresh(true);
+    begin_op(&shared, Side::Writer);
+    end_op(&shared, Side::Writer, Some(ConnectionReset));
+    assert_eq!(
+        settle_loss(&shared, Side::Reader, LinkLoss::PeerClosed),
+        reset
     );
-
-    // A reset the write met itself is recorded at once.
-    let shared = Arc::clone(&scripted(None).shared);
-    shared.reading.store(true, Ordering::SeqCst);
-    let started = Instant::now();
-    super::note_write_loss(&shared, reset);
-    assert_eq!(loss(&shared), Some(reset));
-    assert!(
-        started.elapsed() < super::WRITE_LOSS_WAIT,
-        "{:?}",
-        started.elapsed()
-    );
-
-    // An account already recorded stands over the write's symptom.
-    let shared = Arc::clone(&scripted(None).shared);
-    super::note_loss(&shared, reset);
-    super::note_write_loss(&shared, pipe);
-    assert_eq!(loss(&shared), Some(reset));
 }
 
 // A peer that resets the operational connection: the requests in flight and
