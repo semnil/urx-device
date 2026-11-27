@@ -11,7 +11,7 @@
 
 import type { ConsoleLockGuard } from "../operations/console-lock.js";
 import type { OperationContext, WriteGuard } from "../operations/context.js";
-import type { OperationCause } from "../operations/failure.js";
+import type { LaterCause, OperationCause, OperationPhase } from "../operations/failure.js";
 import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "../operations/transport.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
 import { DEVICE_RULES } from "../catalog/device.js";
@@ -39,6 +39,13 @@ export interface ApplyResult {
   readonly error: string | null;
   /** The rate observation's release failure code, reported even after an earlier failure; null when released or never registered. */
   readonly cleanup: string | null;
+  /**
+   * A cause found after `error` had stopped the import (E3): the lock read's
+   * or the rate read's own failure, or a rate condition (L5) the rate read or
+   * a rate notification found; the first one found, null when there is none.
+   * A lock the guard found is the guard's own `stop`.
+   */
+  readonly later: LaterCause | null;
 }
 
 /** The device sample rate (F11-C): 766, x 0, y 0. */
@@ -93,26 +100,39 @@ const sameAddress = (a: ParameterAddress, b: ParameterAddress) => a.paramId === 
 /** The device sample rate's codec, shared with its read (F11-C). */
 const RATE_CODEC = codecOf(DEVICE_RULES["device.sample-rate"].value);
 
-/** An observation's outcome: its first failure, and the release that reports its own failure. */
+/**
+ * An observation's outcome: its first failure, the registration's or the
+ * read's own failure where it came after an earlier stop, the condition its
+ * watch holds, and the release that reports its own failure.
+ */
 interface RateObservation {
   readonly error: string | null;
+  readonly later: LaterCause | null;
+  readonly stop: () => OperationCause | undefined;
   readonly release: () => Promise<string | null>;
+}
+
+/** `code` found at `phase`, where the operation had already stopped for another cause. */
+function besideStop(context: OperationContext, code: OperationCause, phase: OperationPhase): LaterCause | null {
+  return context.stopping !== undefined && context.stopping !== code ? { code, phase } : null;
 }
 
 /**
  * Registers the rate observation, then makes the one rate read (L3, L5):
  * a mismatch is a failed precondition before any write. The clock is never
  * written from the file. A failure is the operation's first stopping cause
- * where one stopped it. The observation's release is always returned, and
- * reports its own failure instead of replacing an earlier one.
+ * where one stopped it, and the registration's or the read's own failure
+ * after that stop goes beside it. The observation's release is always
+ * returned, and reports its own failure instead of replacing an earlier one.
  */
 async function watchRate(context: OperationContext, fileRate: number): Promise<RateObservation> {
   const watch = new RateWatch(context, fileRate);
+  const stop = () => watch.stop;
   let operation: TransportOperation;
   try {
     operation = context.transport.createOperation();
   } catch {
-    return { error: "internal_error", release: async () => null };
+    return { error: "internal_error", later: null, stop, release: async () => null };
   }
   let subscription: TransportSubscription | undefined;
   // The subscription's release failure first, then the owner's; neither replaces the result.
@@ -138,9 +158,12 @@ async function watchRate(context: OperationContext, fileRate: number): Promise<R
     if (device.value !== fileRate) {
       watch.latch("precondition_failed");
     }
-    return { error: watch.stop === undefined ? null : (context.stopping ?? watch.stop), release };
+    // A condition the read found after an earlier stop is the watch's, which `run` reports.
+    return { error: watch.stop === undefined ? null : (context.stopping ?? watch.stop), later: null, stop, release };
   } catch (error) {
-    return { error: context.stopping ?? operationFailureOf(error)?.code ?? "internal_error", release };
+    const failure = operationFailureOf(error);
+    const later = failure === undefined ? null : besideStop(context, failure.code, failure.phase);
+    return { error: context.stopping ?? failure?.code ?? "internal_error", later, stop, release };
   }
 }
 
@@ -170,13 +193,14 @@ export async function applyCurrent(
     return { steps: results, error: context.stopping ?? failure?.code ?? "internal_error" };
   };
   if (context.model !== plan.model) {
-    return { steps: results, error: "invalid_input", cleanup: null };
+    return { steps: results, error: "invalid_input", cleanup: null, later: null };
   }
   let detach: () => void;
   try {
     detach = await options.guard.begin(context);
   } catch (error) {
-    return { steps: results, error: operationFailureOf(error)?.code ?? "internal_error", cleanup: null };
+    const failure = operationFailureOf(error);
+    return { steps: results, error: failure?.code ?? "internal_error", cleanup: null, later: failure?.later ?? null };
   }
   try {
     return await run(context, plan, results, failWith, options.dryRun === true);
@@ -185,8 +209,8 @@ export async function applyCurrent(
   }
 }
 
-/** The steps and overall error before the observation's release is added. */
-type Outcome = Omit<ApplyResult, "cleanup">;
+/** The steps and overall error before the observation's release and its later cause are added. */
+type Outcome = Omit<ApplyResult, "cleanup" | "later">;
 
 async function run(
   context: OperationContext,
@@ -205,7 +229,13 @@ async function run(
       // E3, in processing order: the first failure or stop; for a dry run, whose result is settled only
       // now, a stop recorded during the release; then a release failure.
       const stop = dryRun ? (context.stopping ?? null) : null;
-      outcome = { ...outcome, error: outcome.error ?? stop ?? cleanup, cleanup } as ApplyResult;
+      const error = outcome.error ?? stop ?? cleanup;
+      // The rate condition the read or a notification latched after the import had stopped for
+      // another cause, where the registration and the read failed for nothing of their own.
+      const watched = rate.stop();
+      const later =
+        rate.later ?? (error !== null && watched !== undefined && watched !== error ? { code: watched, phase: "preparation" as const } : null);
+      outcome = { ...outcome, error, cleanup, later } as ApplyResult;
     }
   }
   return outcome as ApplyResult;

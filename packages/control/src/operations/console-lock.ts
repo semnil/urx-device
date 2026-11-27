@@ -7,7 +7,7 @@
 // then refused at the send boundary and the attached operations cancelled.
 // No polling, unlock, bypass or password access; it reads nothing else.
 
-import { OperationFailureError, operationFailureOf, type OperationCause } from "./failure.js";
+import { OperationFailureError, operationFailureOf, type OperationCause, type OperationFailure } from "./failure.js";
 import type { OperationContext, WriteGuard } from "./context.js";
 import { readSetting } from "./registry.js";
 import type { ParameterAddress, Transport, TransportNotification, TransportOperation, TransportSubscription } from "./transport.js";
@@ -70,7 +70,11 @@ export class ConsoleLockGuard implements WriteGuard {
    * Begins one write operation under the guard: attaches `context`, then
    * makes its one fresh strict lock read. A locked unit, a latched stop, or
    * a failed read rejects (the context detached), and no setting is sent;
-   * a stop latched before the rejection is its cause.
+   * a stop latched before the rejection is its cause. Where the operation
+   * had already stopped for one cause and the sent lock read then failed for
+   * another of its own, that one is the failure's `later` (E3); a read that
+   * failed because the operation was cancelled has none, and a lock the guard
+   * found is its own `stop`.
    * A context on another connection than the guard's is refused before any
    * request: the lock it observes would not be that connection's.
    * The returned function detaches the context once its operation is done.
@@ -84,19 +88,27 @@ export class ConsoleLockGuard implements WriteGuard {
     }
     context.guardWrites(this);
     this.#attached.add(context);
+    // The lock read's own failure, kept apart from the guard's stops.
+    let read: OperationFailure | undefined;
     try {
       this.#refuseIfStopped();
-      const reading = await readSetting(context, "device.console-lock", {});
+      const reading = await readSetting(context, "device.console-lock", {}).catch((error: unknown) => {
+        read = operationFailureOf(error);
+        throw error;
+      });
       if (reading.value) {
         this.#latch("precondition_failed");
       }
       this.#refuseIfStopped();
     } catch (error) {
       detach();
-      // The operation's first stopping cause stays, whatever the lock read then returned.
+      // The operation's first stopping cause stays the code, whatever the lock read then returned, and
+      // the read's own failure goes beside it.
       const failure = operationFailureOf(error);
-      if (context.stopping !== undefined && failure !== undefined && failure.code !== context.stopping) {
-        throw new OperationFailureError({ code: context.stopping, phase: failure.phase, progress: failure.progress });
+      const stopping = context.stopping;
+      if (stopping !== undefined && failure !== undefined && failure.code !== stopping) {
+        const later = read !== undefined && read.code !== stopping ? { later: { code: read.code, phase: read.phase } } : {};
+        throw new OperationFailureError({ code: stopping, phase: failure.phase, progress: failure.progress, ...later });
       }
       throw error;
     }

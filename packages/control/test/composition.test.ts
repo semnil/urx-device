@@ -653,28 +653,31 @@ describe("CURRENT composition (K36, F18)", () => {
       [rate("32000"), "invalid_response"],
     ] as const) {
       const { result, t } = await apply((t) => t.script("getNumeric", read("0"), after(t, [note], read("48000"))), true);
-      expect([result.error, ...result.steps.map((s) => s.outcome)], JSON.stringify(note)).toEqual([code, "not_sent", "not_sent", "not_sent"]);
+      expect([result.error, result.later, ...result.steps.map((s) => s.outcome)], JSON.stringify(note)).toEqual([code, null, "not_sent", "not_sent", "not_sent"]);
       expect(t.calls.filter((c) => c.method.startsWith("set"))).toEqual([]);
     }
-    // Execution: a rate change, then an invalid lock value, keeps the rate's cause; the reverse keeps the lock's.
-    for (const [notes, code] of [
-      [[rate("96000"), lock("2")], "precondition_failed"],
-      [[lock("2"), rate("96000")], "invalid_response"],
+    // Execution: a rate change, then an invalid lock value, keeps the rate's cause; the reverse keeps the lock's, the
+    // rate change found after it beside it. A lock found after a rate change is the guard's own stop.
+    for (const [notes, code, later] of [
+      [[rate("96000"), lock("2")], "precondition_failed", null],
+      [[lock("2"), rate("96000")], "invalid_response", { code: "precondition_failed", phase: "preparation" }],
     ] as const) {
       const { result } = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", after(t, notes, accepted), accepted, accepted).script("setText", accepted, accepted, accepted));
       // The refused step reports the same first cause.
       expect([result.error, ...result.steps.map((s) => `${s.outcome} ${s.error}`)], JSON.stringify(notes)).toEqual([code, "accepted null", `not_sent ${code}`, "not_sent null"]);
+      expect(result.later, JSON.stringify(notes)).toEqual(later);
     }
     // During the lock read, a lock before an invalid read value: the lock's cause stays, nothing is read or sent after.
     const reading = await apply((t) => t.script("getNumeric", after(t, [lock("1")], read("3"))));
-    expect([reading.result.error, reading.t.calls.length]).toEqual(["precondition_failed", 1]);
-    // During the rate read, an invalid lock value before a mismatched rate: the lock's cause stays.
+    expect([reading.result.error, reading.result.later, reading.t.calls.length]).toEqual(["precondition_failed", { code: "invalid_response", phase: "response" }, 1]);
+    // During the rate read, an invalid lock value before a mismatched rate: the lock's cause stays, the mismatch beside it.
     const early = await apply((t) => t.script("getNumeric", read("0"), after(t, [lock("2")], read("96000"))));
-    expect(early.result.error).toBe("invalid_response");
+    expect([early.result.error, early.result.later]).toEqual(["invalid_response", { code: "precondition_failed", phase: "preparation" }]);
     // A sent write rejected after a lock: the step keeps its rejection, the import the lock.
     const raced = await apply((t) => t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, after(t, [lock("1")], rejected), accepted).script("setText", accepted, accepted, accepted));
-    expect([raced.result.error, ...raced.result.steps.map((s) => `${s.outcome} ${s.error}`)]).toEqual([
+    expect([raced.result.error, raced.result.later, ...raced.result.steps.map((s) => `${s.outcome} ${s.error}`)]).toEqual([
       "precondition_failed",
+      null,
       "accepted null",
       "rejected device_rejected",
       "not_sent null",
@@ -710,13 +713,82 @@ describe("CURRENT composition (K36, F18)", () => {
       t.script("getNumeric", read("0"), read("48000")).script("setNumeric", accepted, accepted, accepted).script("setText", accepted, accepted, accepted);
       releasing(t, false);
     });
-    expect([settled.result.error, settled.result.cleanup, ...settled.result.steps.map((s) => s.outcome)]).toEqual([null, null, "accepted", "accepted", "accepted"]);
+    expect([settled.result.error, settled.result.cleanup, settled.result.later, ...settled.result.steps.map((s) => s.outcome)]).toEqual([
+      null,
+      null,
+      null,
+      "accepted",
+      "accepted",
+      "accepted",
+    ]);
     for (const fail of [false, true]) {
       const dry = await apply((t) => {
         t.script("getNumeric", read("0"), read("48000"));
         releasing(t, fail);
       }, true);
-      expect([dry.result.error, dry.result.cleanup], `release fails: ${fail}`).toEqual(["precondition_failed", fail ? "connection_lost" : null]);
+      expect([dry.result.error, dry.result.cleanup, dry.result.later], `release fails: ${fail}`).toEqual(["precondition_failed", fail ? "connection_lost" : null, null]);
+    }
+  });
+
+  // E3: the owner's stop (a Ctrl+C) stays the import's error, and what a prerequisite found after it goes beside it:
+  // the lock read's or the rate read's own failure, or a rate change the read or a notification found. Nothing is
+  // read for it, and a read the stop cancelled adds nothing.
+  it("report beside the owner's stop what a prerequisite found after it", async () => {
+    const plan = planCurrent(synthesize("URX22"), "URX22");
+    const head = { ...plan, steps: plan.steps.filter((s) => s.planned !== null).slice(0, 3), omissions: [] };
+    const read = (value: string) => ({ kind: "success", value, evidence: { state: "read" } });
+    const failed = (code: string) => ({ kind: "failure", failure: { kind: "cause", code, phase: "response" }, evidence: { state: "unconfirmed" } });
+    const cancelled = { kind: "failure", failure: { kind: "cancelled", phase: "response" }, evidence: { state: "unconfirmed" } };
+    const rate = (value: string) => ({ kind: "numeric", address: { paramId: 766, x: "0", y: "0" }, value }) as const;
+    const apply = async (build: (t: FakeTransport, stopped: (record: unknown) => unknown) => void) => {
+      const t = new FakeTransport();
+      let context: OperationContext | undefined;
+      /** A reply that settles with `record` once the owner has stopped the import. */
+      const stopped = (record: unknown) => ({
+        then(resolve: (value: unknown) => void) {
+          context?.cancel("interrupted");
+          resolve(record);
+        },
+      });
+      build(t, stopped);
+      context = new OperationContext(t, "URX22");
+      const guard = await ConsoleLockGuard.open(context);
+      try {
+        return { result: await applyCurrent(context, head, { guard }), t };
+      } finally {
+        await guard.release().catch(() => undefined);
+      }
+    };
+    for (const [name, build, later, reads, handed] of [
+      ["lock read lost", (t, stopped) => t.script("getNumeric", stopped(failed("connection_lost"))), { code: "connection_lost", phase: "response" }, 1, 0],
+      ["lock read cancelled", (t, stopped) => t.script("getNumeric", stopped(cancelled)), null, 1, 0],
+      ["rate read late", (t, stopped) => t.script("getNumeric", read("0"), stopped(failed("response_timeout"))), { code: "response_timeout", phase: "response" }, 2, 0],
+      ["rate read mismatched", (t, stopped) => t.script("getNumeric", read("0"), stopped(read("96000"))), { code: "precondition_failed", phase: "preparation" }, 2, 0],
+      ["rate read cancelled", (t, stopped) => t.script("getNumeric", read("0"), stopped(cancelled)), null, 2, 0],
+      [
+        "rate notified after the stop",
+        (t, stopped) => {
+          // The stop came after the rate read was sent and it read the file's rate, so the steps go on to the
+          // transport, which refuses them unsent for the cancelled operation.
+          const unsent = { kind: "failure", failure: { kind: "cancelled", phase: "admission" }, evidence: { state: "not_sent" } };
+          t.script("getNumeric", read("0"), stopped(read("48000")))
+            .script("setNumeric", unsent, unsent, unsent)
+            .script("setText", unsent, unsent, unsent);
+          t.onRelease = () => {
+            t.onRelease = undefined;
+            t.notify(rate("96000"));
+          };
+        },
+        { code: "precondition_failed", phase: "preparation" },
+        2,
+        1,
+      ],
+    ] as const satisfies ReadonlyArray<readonly [string, (t: FakeTransport, stopped: (record: unknown) => unknown) => void, unknown, number, number]>) {
+      const { result, t } = await apply(build);
+      expect([result.error, result.later, ...result.steps.map((s) => s.outcome)], name).toEqual(["interrupted", later, "not_sent", "not_sent", "not_sent"]);
+      expect(t.calls.filter((c) => c.method === "getNumeric"), name).toHaveLength(reads);
+      // Handed over only where the steps ran, and refused unsent there.
+      expect(t.calls.filter((c) => c.method.startsWith("set")), name).toHaveLength(handed);
     }
   });
 

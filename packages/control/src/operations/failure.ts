@@ -27,12 +27,25 @@ export type OperationCause =
 /** Where an operation failed: a request phase, or before any request. */
 export type OperationPhase = NativeRequestPhase | "preparation";
 
+/**
+ * A cause an operation found after it had already stopped for another (E3): the
+ * failure of a request it had sent, or a condition it found. The first
+ * stopping cause stays the failure's code; this is what the caller reports
+ * beside it.
+ */
+export interface LaterCause {
+  readonly code: OperationCause;
+  readonly phase: OperationPhase;
+}
+
 /** The serializable failure payload; it never relies on class identity. */
 export interface OperationFailure<P = unknown> {
   readonly code: OperationCause;
   readonly phase: OperationPhase;
   /** Typed execution evidence, or null when none exists. */
   readonly progress: P | null;
+  /** A cause found after `code` had stopped the operation; absent when there is none. */
+  readonly later?: LaterCause;
 }
 
 /** The single failure type of shared operations (K3-B). */
