@@ -1176,6 +1176,8 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             notifications: None,
             deliverable: std::sync::Condvar::new(),
             delivery_stop: std::sync::atomic::AtomicBool::new(false),
+            sent_registrations: std::sync::atomic::AtomicU64::new(0),
+            sent_unregistrations: std::sync::atomic::AtomicU64::new(0),
             response_gate: std::sync::Mutex::new(None),
         }),
         written: Vec::new(),
@@ -1202,7 +1204,7 @@ fn a_write_does_not_start_once_waiting_for_the_state_used_up_its_budget() {
     held.recv().unwrap();
     let deadline = Instant::now() + Duration::from_millis(100);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only, None),
         Err(super::WriteError::Failed {
             cause: RequestCause::SendTimeout,
             written: 0
@@ -1216,41 +1218,68 @@ fn a_write_does_not_start_once_waiting_for_the_state_used_up_its_budget() {
 fn a_write_never_starts_after_the_reader_records_the_end() {
     let frame = vec![b'x'; 30];
     let deadline = Instant::now() + Duration::from_secs(5);
+    // A frame counts as sent once written whole (R1-C-A).
+    let sent = std::sync::atomic::AtomicU64::new(0);
+    let count = || sent.load(std::sync::atomic::Ordering::SeqCst);
 
     // Recorded while the first write is being prepared: nothing goes out.
     let mut sock = scripted(Some(0));
     let shared = Arc::clone(&sock.shared);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        super::write_frame(
+            &mut sock,
+            &shared,
+            &frame,
+            deadline,
+            &closing_only,
+            Some(&sent)
+        ),
         Err(super::WriteError::Failed {
             cause: RequestCause::ConnectionLost,
             written: 0
         })
     );
     assert!(sock.written.is_empty());
+    assert_eq!(count(), 0, "a frame never started is not sent");
 
     // Recorded after the first 8 bytes, while the next part is being
     // prepared: no more bytes go out, and the count says how many did.
     let mut sock = scripted(Some(1));
     let shared = Arc::clone(&sock.shared);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        super::write_frame(
+            &mut sock,
+            &shared,
+            &frame,
+            deadline,
+            &closing_only,
+            Some(&sent)
+        ),
         Err(super::WriteError::Failed {
             cause: RequestCause::ConnectionLost,
             written: 8
         })
     );
     assert_eq!(sock.written.len(), 8);
+    assert_eq!(count(), 0, "a frame cut short is not sent");
 
     // Without an end the whole frame goes out, and no write ran while the
     // reader could have recorded one.
     let mut sock = scripted(None);
     let shared = Arc::clone(&sock.shared);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        super::write_frame(
+            &mut sock,
+            &shared,
+            &frame,
+            deadline,
+            &closing_only,
+            Some(&sent)
+        ),
         Ok(())
     );
     assert_eq!(sock.written, frame);
+    assert_eq!(count(), 1);
     assert!(
         !sock.recordable_during_write,
         "the end lock is held across each write"
@@ -1369,7 +1398,7 @@ fn a_write_not_yet_started_when_closing_begins_is_never_sent() {
     let shared = Arc::clone(&sock.shared);
     shared.lock().closing = true;
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only, None),
         Err(super::WriteError::Stopped(super::Stop::Closing))
     );
     assert!(sock.written.is_empty());
@@ -1390,7 +1419,7 @@ fn a_write_not_yet_started_when_closing_begins_is_never_sent() {
     }
     let mut sock = CloseAfterFirst(std::mem::replace(&mut sock, scripted(None)));
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only),
+        super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only, None),
         Ok(())
     );
     assert_eq!(sock.0.written, frame);
@@ -2026,7 +2055,7 @@ fn an_opening_with_no_thread_to_start_fails_and_leaves_nothing_running() {
 mod lifecycle {
     use super::{connect, firmware, online, options, ID, TEARDOWN};
     use crate::connection::{
-        open, CloseOutcome, Connection, ConnectionOptions, LinkLoss, Subscription,
+        open, CloseOutcome, Connection, ConnectionOptions, LinkLoss, SentFrames, Subscription,
     };
     use crate::lifecycle::{
         Cause, Cleanup, CleanupState, Control, Failure, LifecycleFailure, LifecycleOutcome, Phase,
@@ -2085,6 +2114,26 @@ mod lifecycle {
 
     fn reg(id: u32) -> String {
         format!("/vd/parameters/{id}:0:0?operation=regist")
+    }
+
+    /// The frames the connection counts as sent are the ones the peer
+    /// received (R1-C-A), however the calls that sent them ended.
+    fn counted_as_received(connection: &Connection, peer: &Peer) {
+        let posted = posts(peer);
+        let of = |operation: &str| {
+            posted
+                .iter()
+                .filter(|uri| uri.ends_with(&format!("operation={operation}")))
+                .count() as u64
+        };
+        assert_eq!(
+            connection.sent_frames(),
+            SentFrames {
+                registrations: of("regist"),
+                unregistrations: of("unregist"),
+            },
+            "{posted:?}"
+        );
     }
 
     fn unreg(id: u32) -> String {
@@ -2160,6 +2209,7 @@ mod lifecycle {
                 "/vd/meters/7:0?operation=unregist".into()
             ]
         );
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2179,6 +2229,7 @@ mod lifecycle {
             failed(Cause::DeviceRejected, Cleanup::COMPLETE)
         );
         assert_eq!(posts(&peer), [reg(1), reg(2), reg(3), reg(4), unreg(3)]);
+        counted_as_received(&connection, &peer);
         assert_eq!(
             connection.terminal(),
             None,
@@ -2186,6 +2237,7 @@ mod lifecycle {
         );
         assert_eq!(settled(&release(&old)), Ok(()));
         assert_eq!(&posts(&peer)[5..], [unreg(1), unreg(2)]);
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2195,6 +2247,7 @@ mod lifecycle {
         let token = connection.prepare_subscription(&[p(1)]).unwrap();
         assert_eq!(settled(&release(&token)), Ok(()));
         assert!(posts(&peer).is_empty());
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2243,6 +2296,7 @@ mod lifecycle {
                 assert_eq!(settled(&released), Ok(()));
             }
             assert_eq!(posts(&peer), [reg(1), unreg(1)], "release: {by_release}");
+            counted_as_received(&connection, &peer);
         }
     }
 
@@ -2295,6 +2349,7 @@ mod lifecycle {
             [reg(1), reg(2)],
             "no unregistration after the end"
         );
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2562,6 +2617,7 @@ mod lifecycle {
             expected,
             "each registered address once, in address order; nothing for a token that never started"
         );
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2593,6 +2649,7 @@ mod lifecycle {
             "a repeated close shares the outcome and sends nothing"
         );
         assert_eq!(posts(&peer).len(), 3);
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2725,6 +2782,8 @@ mod lifecycle {
                 phase: Phase::Teardown
             }))
         );
+        // The unregistration was written whole and never answered: it counts.
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2739,6 +2798,7 @@ mod lifecycle {
         ));
         thread::sleep(Duration::from_millis(100));
         assert_eq!(posts(&peer), [reg(1)]);
+        counted_as_received(&connection, &peer);
     }
 
     #[test]
@@ -2942,7 +3002,7 @@ fn a_write_whose_operation_was_cancelled_before_its_first_byte_is_not_started() 
     let shared = Arc::clone(&sock.shared);
     let cancelled = |_: &super::State| Some(super::Stop::Cancelled);
     assert_eq!(
-        super::write_frame(&mut sock, &shared, &frame, deadline, &cancelled),
+        super::write_frame(&mut sock, &shared, &frame, deadline, &cancelled, None),
         Err(super::WriteError::Stopped(super::Stop::Cancelled))
     );
     assert!(sock.written.is_empty());

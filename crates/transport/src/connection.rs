@@ -220,6 +220,9 @@ struct Shared {
     /// Signalled when a batch can be formed or delivery must stop.
     deliverable: Condvar,
     delivery_stop: AtomicBool,
+    /// The registration and unregistration frames written whole (R1-C-A).
+    sent_registrations: AtomicU64,
+    sent_unregistrations: AtomicU64,
     /// Holds the next sent request's response deadline from starting until
     /// signalled, for a case that closes while that request is on the wire.
     #[cfg(test)]
@@ -294,6 +297,14 @@ impl CloseCell {
         *lock(&self.state) = CloseState::Done(outcome);
         self.done.notify_all();
     }
+}
+
+/// The registration and unregistration frames a connection has written
+/// whole (`Connection::sent_frames`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SentFrames {
+    pub registrations: u64,
+    pub unregistrations: u64,
 }
 
 /// How a close ended.
@@ -449,6 +460,8 @@ impl Connection {
                 .map(|_| Mutex::new(Queue::new(generation))),
             deliverable: Condvar::new(),
             delivery_stop: AtomicBool::new(false),
+            sent_registrations: AtomicU64::new(0),
+            sent_unregistrations: AtomicU64::new(0),
             #[cfg(test)]
             response_gate: Mutex::new(None),
         });
@@ -551,6 +564,17 @@ impl Connection {
             return None;
         }
         *lock(&self.shared.loss)
+    }
+
+    /// The registration and unregistration frames this connection has
+    /// written whole, since it opened (R1-C-A): what a registration, a
+    /// release or a close sent, whether it then succeeded or failed. A frame
+    /// cut short is not counted, and nor is one that never started.
+    pub fn sent_frames(&self) -> SentFrames {
+        SentFrames {
+            registrations: self.shared.sent_registrations.load(Ordering::SeqCst),
+            unregistrations: self.shared.sent_unregistrations.load(Ordering::SeqCst),
+        }
     }
 
     /// A new operation owner, or `not_connected` once the connection is
@@ -2094,12 +2118,22 @@ impl Io<'_> {
                 None
             }
         };
+        let sent = match request {
+            wire::Request::RegisterParameter(_) | wire::Request::RegisterMeter(_) => {
+                Some(&self.shared.sent_registrations)
+            }
+            wire::Request::UnregisterParameter(_) | wire::Request::UnregisterMeter(_) => {
+                Some(&self.shared.sent_unregistrations)
+            }
+            _ => None,
+        };
         let outbound = Outbound {
             frame: &frame,
             key: &key,
             send_end,
             cap,
             unstarted: &unstarted,
+            sent,
         };
         match exchange(self.sock, self.inbox, self.shared, self.options, outbound) {
             Ok(held) => {
@@ -2427,6 +2461,7 @@ fn execute(
         send_end,
         cap: None,
         unstarted: &unstarted,
+        sent: None,
     };
     match exchange(sock, inbox, shared, options, outbound) {
         Ok(reply) => {
@@ -2611,6 +2646,8 @@ struct Outbound<'a> {
     cap: Option<Instant>,
     /// Whether a frame not yet started must not start.
     unstarted: &'a dyn Fn(&State) -> Option<Stop>,
+    /// The count a frame written whole adds one to, if any.
+    sent: Option<&'a AtomicU64>,
 }
 
 fn exchange(
@@ -2626,6 +2663,7 @@ fn exchange(
         send_end,
         cap,
         unstarted,
+        sent,
     } = outbound;
     if Instant::now() >= send_end {
         return Err(Failed::new(
@@ -2635,7 +2673,7 @@ fn exchange(
             false,
         ));
     }
-    match write_frame(sock, shared, frame, send_end, unstarted) {
+    match write_frame(sock, shared, frame, send_end, unstarted, sent) {
         Ok(()) => {}
         Err(WriteError::Stopped(Stop::Closing)) => {
             return Err(Failed::new(
@@ -2730,13 +2768,16 @@ impl Outgoing for TcpStream {
 }
 
 /// Writes `frame` by `end`, starting no write once the reader has recorded
-/// the link's end. On failure, the cause and how many bytes went out.
+/// the link's end. On failure, the cause and how many bytes went out. A
+/// frame written whole adds one to `sent`, if given; one cut short or never
+/// started adds nothing.
 fn write_frame<O: Outgoing>(
     sock: &mut O,
     shared: &Shared,
     frame: &[u8],
     end: Instant,
     unstarted: &dyn Fn(&State) -> Option<Stop>,
+    sent: Option<&AtomicU64>,
 ) -> Result<(), WriteError> {
     debug_assert!(frame.len() <= MAX_FRAME_BYTES + 1);
     let mut written = 0;
@@ -2791,6 +2832,9 @@ fn write_frame<O: Outgoing>(
                 return failed(RequestCause::ConnectionLost);
             }
         }
+    }
+    if let Some(sent) = sent {
+        sent.fetch_add(1, Ordering::SeqCst);
     }
     Ok(())
 }
