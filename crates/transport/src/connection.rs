@@ -1649,7 +1649,10 @@ fn read_frames(
     // After an overflow, replies to a request already sent still arrive;
     // further notifications are not queued, even once budget is released.
     let mut overflowed = false;
-    if let Err(error) = sock.set_read_timeout(Some(READ_POLL)) {
+    if let Err(error) = sock
+        .set_read_timeout(Some(READ_POLL))
+        .map_err(|error| crate::link::pending_or(&sock, error))
+    {
         note_loss(&shared, LinkLoss::SocketError(error.kind()));
         record(RequestCause::ConnectionLost);
         let _ = events.send(Event::ReadFailed(RequestCause::ConnectionLost));
@@ -2764,6 +2767,7 @@ trait Outgoing {
 impl Outgoing for TcpStream {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_write_timeout(self, timeout)
+            .map_err(|error| crate::link::pending_or(self, error))
     }
 
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

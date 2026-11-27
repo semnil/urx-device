@@ -266,7 +266,16 @@ trait Source: Read {
 impl Source for TcpStream {
     fn set_poll(&mut self, timeout: Duration) -> std::io::Result<()> {
         self.set_read_timeout(Some(timeout))
+            .map_err(|error| pending_or(self, error))
     }
+}
+
+/// The error a socket holds pending, when setting its timeout failed: a
+/// socket the peer reset refuses the option (`InvalidInput` on macOS) while
+/// the reset itself waits as its pending error, and the reset is how the
+/// link was lost (R1-L-A). The option's own error when nothing is pending.
+pub(crate) fn pending_or(sock: &TcpStream, error: std::io::Error) -> std::io::Error {
+    sock.take_error().ok().flatten().unwrap_or(error)
 }
 
 /// What [`write_within`] writes to: the connection's socket, or a test's
@@ -278,6 +287,7 @@ trait Sink: Write {
 impl Sink for TcpStream {
     fn set_write_poll(&mut self, timeout: Duration) -> std::io::Result<()> {
         self.set_write_timeout(Some(timeout))
+            .map_err(|error| pending_or(self, error))
     }
 }
 
