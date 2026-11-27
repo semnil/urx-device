@@ -1136,10 +1136,23 @@ struct Scripted {
     writes: usize,
     /// Whether the reader could record an end while a write was running.
     recordable_during_write: bool,
+    /// The error the socket holds pending.
+    pending: Option<std::io::ErrorKind>,
+    /// Refuse the write timeout, as a reset socket does.
+    refuse_timeout: bool,
+    /// Fail each write: with this error, or as a closed stream (`Some(None)`).
+    fail_write: Option<Option<std::io::ErrorKind>>,
 }
 
 impl super::Outgoing for Scripted {
+    fn pending_error(&self) -> Option<std::io::ErrorKind> {
+        self.pending
+    }
+
     fn set_write_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+        if self.refuse_timeout {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         if self.end_before_write == Some(self.writes) {
             self.shared
                 .link_end()
@@ -1149,6 +1162,11 @@ impl super::Outgoing for Scripted {
     }
 
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.fail_write {
+            Some(Some(kind)) => return Err(kind.into()),
+            Some(None) => return Ok(0),
+            None => {}
+        }
         if self.shared.link_end.try_lock().is_ok() {
             self.recordable_during_write = true;
         }
@@ -1187,6 +1205,9 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
         end_before_write,
         writes: 0,
         recordable_during_write: false,
+        pending: None,
+        refuse_timeout: false,
+        fail_write: None,
     }
 }
 
@@ -1272,6 +1293,65 @@ fn a_loss_is_settled_with_both_sides_accounts() {
         settle_loss(&shared, Side::Reader, LinkLoss::PeerClosed),
         reset
     );
+}
+
+// A write whose timeout the socket refuses reports the reset the socket holds,
+// if it holds one, so the loss is the reset whatever the reader did meanwhile;
+// with nothing pending the refusal itself is the loss.
+#[test]
+fn a_refused_write_timeout_gives_way_to_the_reset_the_socket_holds() {
+    let frame = vec![b'x'; 30];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for (pending, expected) in [
+        (
+            Some(std::io::ErrorKind::ConnectionReset),
+            std::io::ErrorKind::ConnectionReset,
+        ),
+        (None, std::io::ErrorKind::InvalidInput),
+    ] {
+        let mut sock = scripted(None);
+        sock.pending = pending;
+        sock.refuse_timeout = true;
+        let shared = Arc::clone(&sock.shared);
+        assert!(
+            super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only, None).is_err()
+        );
+        assert_eq!(
+            *super::lock(&shared.loss),
+            Some(LinkLoss::SocketError(expected)),
+            "{pending:?}"
+        );
+        assert!(sock.written.is_empty());
+    }
+    // Likewise a write that fails, and one that writes nothing.
+    let reset = LinkLoss::SocketError(std::io::ErrorKind::ConnectionReset);
+    for (fail, pending, expected) in [
+        (
+            Some(std::io::ErrorKind::BrokenPipe),
+            Some(std::io::ErrorKind::ConnectionReset),
+            reset,
+        ),
+        (
+            Some(std::io::ErrorKind::BrokenPipe),
+            None,
+            LinkLoss::SocketError(std::io::ErrorKind::BrokenPipe),
+        ),
+        (None, Some(std::io::ErrorKind::ConnectionReset), reset),
+        (None, None, LinkLoss::PeerClosed),
+    ] {
+        let mut sock = scripted(None);
+        sock.pending = pending;
+        sock.fail_write = Some(fail);
+        let shared = Arc::clone(&sock.shared);
+        assert!(
+            super::write_frame(&mut sock, &shared, &frame, deadline, &closing_only, None).is_err()
+        );
+        assert_eq!(
+            *super::lock(&shared.loss),
+            Some(expected),
+            "{fail:?} {pending:?}"
+        );
+    }
 }
 
 // A peer that resets the operational connection: the requests in flight and
@@ -1529,6 +1609,10 @@ fn a_write_not_yet_started_when_closing_begins_is_never_sent() {
     let shared = Arc::clone(&sock.shared);
     struct CloseAfterFirst(Scripted);
     impl super::Outgoing for CloseAfterFirst {
+        fn pending_error(&self) -> Option<std::io::ErrorKind> {
+            None
+        }
+
         fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
             self.0.set_write_timeout(timeout)
         }

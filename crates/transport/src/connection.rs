@@ -2885,11 +2885,17 @@ fn exchange(
 trait Outgoing {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize>;
+    /// The error the socket holds pending, taken.
+    fn pending_error(&self) -> Option<ErrorKind>;
 }
 
 impl Outgoing for TcpStream {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_write_timeout(self, timeout)
+    }
+
+    fn pending_error(&self) -> Option<ErrorKind> {
+        self.take_error().ok().flatten().map(|error| error.kind())
     }
 
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -2918,14 +2924,15 @@ fn write_frame<O: Outgoing>(
             return failed(RequestCause::SendTimeout);
         }
         begin_op(shared, Side::Writer);
-        let set = sock.set_write_timeout(Some(remaining.min(WRITE_POLL)));
-        end_op(
-            shared,
-            Side::Writer,
-            set.as_ref().err().map(std::io::Error::kind),
-        );
-        if let Err(error) = set {
-            note_socket_loss(shared, Side::Writer, LinkLoss::SocketError(error.kind()));
+        // A refused timeout's symptom gives way to the reset the socket
+        // holds, reported with the operation's end, so the reader settles
+        // with it.
+        let set = sock
+            .set_write_timeout(Some(remaining.min(WRITE_POLL)))
+            .map_err(|error| sock.pending_error().unwrap_or(error.kind()));
+        end_op(shared, Side::Writer, set.err());
+        if let Err(kind) = set {
+            note_socket_loss(shared, Side::Writer, LinkLoss::SocketError(kind));
             return failed(RequestCause::ConnectionLost);
         }
         // Held across the write: the reader cannot record an end, and a
@@ -2953,11 +2960,14 @@ fn write_frame<O: Outgoing>(
         }
         begin_op(shared, Side::Writer);
         let outcome = sock.write(&frame[written..]);
-        end_op(
-            shared,
-            Side::Writer,
-            outcome.as_ref().err().map(std::io::Error::kind),
-        );
+        // A failed write's symptom gives way to the reset the socket holds,
+        // likewise; a write that only timed out met nothing.
+        let met = match &outcome {
+            Ok(0) => sock.pending_error(),
+            Err(e) if !transient(e.kind()) => Some(sock.pending_error().unwrap_or(e.kind())),
+            _ => None,
+        };
+        end_op(shared, Side::Writer, met);
         // Counted before the gate is let go: `sent_frames` reads under it, so
         // a frame the peer has whole is never missing from a count read after.
         if let (Some(sent), Ok(n)) = (sent, &outcome) {
@@ -2968,22 +2978,29 @@ fn write_frame<O: Outgoing>(
         drop(link_end);
         match outcome {
             Ok(0) => {
-                note_socket_loss(shared, Side::Writer, LinkLoss::PeerClosed);
+                let own = met.map_or(LinkLoss::PeerClosed, LinkLoss::SocketError);
+                note_socket_loss(shared, Side::Writer, own);
                 return failed(RequestCause::ConnectionLost);
             }
             Ok(n) => written += n,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
+            Err(e) if transient(e.kind()) => {}
             Err(e) => {
-                note_socket_loss(shared, Side::Writer, LinkLoss::SocketError(e.kind()));
+                let kind = met.unwrap_or(e.kind());
+                note_socket_loss(shared, Side::Writer, LinkLoss::SocketError(kind));
                 return failed(RequestCause::ConnectionLost);
             }
         }
     }
     Ok(())
+}
+
+/// Whether a write's error leaves the socket as it was: it only ran out of
+/// its poll or was interrupted.
+fn transient(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+    )
 }
 
 /// Why a frame whose first byte had not gone out was not started.
