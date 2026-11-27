@@ -75,13 +75,21 @@ export function constant(value: number): Exact {
   return exact;
 }
 
+/**
+ * The text of a decimal write value: an object whose own `decimal` is C6
+ * text, read once; undefined for anything else.
+ */
+function decimalTextOf(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || !Object.hasOwn(value, "decimal")) {
+    return undefined;
+  }
+  const text: unknown = (value as { decimal: unknown }).decimal;
+  return typeof text === "string" && C6.test(text) ? text : undefined;
+}
+
 /** Whether `value` is a decimal write value: an object whose own `decimal` is C6 text. */
 export function isDecimalValue(value: unknown): value is DecimalValue {
-  if (typeof value !== "object" || value === null || !Object.hasOwn(value, "decimal")) {
-    return false;
-  }
-  const text = (value as { decimal: unknown }).decimal;
-  return typeof text === "string" && C6.test(text);
+  return decimalTextOf(value) !== undefined;
 }
 
 /**
@@ -94,10 +102,8 @@ export function numericRequest(value: unknown): { readonly exact: Exact; readonl
     const exact = exactOfNumber(value);
     return exact === undefined ? undefined : { exact, decimal: false };
   }
-  if (isDecimalValue(value)) {
-    return { exact: parseDecimal(value.decimal) as Exact, decimal: true };
-  }
-  return undefined;
+  const text = decimalTextOf(value);
+  return text === undefined ? undefined : { exact: parseDecimal(text) as Exact, decimal: true };
 }
 
 export function compare(a: Exact, b: Exact): -1 | 0 | 1 {
@@ -181,9 +187,15 @@ export function decimalValue(text: string): DecimalValue | undefined {
   return exact === undefined ? undefined : Object.freeze({ decimal: formatExact(exact) });
 }
 
-/** A requested value as a plan reports it: a decimal write value in canonical form, anything else as given. */
+/**
+ * A requested value as one operation works from it: a decimal write value
+ * read once into a frozen canonical copy, so nothing the caller does to its
+ * own object later reaches the check, the plan, the write or the report;
+ * anything else as given.
+ */
 export function canonicalRequest<V>(value: V): V {
-  return isDecimalValue(value) ? (Object.freeze({ decimal: formatExact(parseDecimal(value.decimal) as Exact) }) as V) : value;
+  const text = decimalTextOf(value);
+  return text === undefined ? value : (Object.freeze({ decimal: formatExact(parseDecimal(text) as Exact) }) as V);
 }
 
 /** `a` in a request's own form: canonical decimal text, or the number nearest to it. */

@@ -157,7 +157,7 @@ import {
 import { integrationActive, integrationPostFaderSource, knobBank, panelSendsTarget } from "./integration-panel.js";
 import { knobAssignment } from "./knob.js";
 import { recorderCardPresent, recorderSource, recorderState, recorderTrackCount, sceneCurrent, sceneCursor } from "./scene-recorder.js";
-import type { DecimalValue } from "../catalog/decimal.js";
+import { canonicalRequest, type DecimalValue } from "../catalog/decimal.js";
 import type { DryRunPlan, Reading, UnverifiedCondition, VerifiedPlan, WritePlan, WriteResult } from "./results.js";
 
 type Target<K extends SettingId> = SettingTypes[K]["target"];
@@ -445,14 +445,14 @@ export function writeSetting<A extends WriteArgs | DecimalWriteArgs>(
 ): Promise<WriteResult<Planned<A>>> {
   return settled(() => {
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
-    return handler.write(context, target as Target<A[0]>, value as Input<A[0]>) as Promise<WriteResult<Planned<A>>>;
+    return handler.write(context, target as Target<A[0]>, canonicalRequest(value) as Input<A[0]>) as Promise<WriteResult<Planned<A>>>;
   });
 }
 
 /** The plan a write of `value` would send, through the same validation; no traffic. */
 export function previewSetting<A extends WriteArgs | DecimalWriteArgs>(model: string, ...[id, target, value]: A): WritePlan<Planned<A>> {
   const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
-  return handler.plan(model, target as Target<A[0]>, value as Input<A[0]>) as WritePlan<Planned<A>>;
+  return handler.plan(model, target as Target<A[0]>, canonicalRequest(value) as Input<A[0]>) as WritePlan<Planned<A>>;
 }
 
 /**
@@ -464,10 +464,11 @@ export function previewSetting<A extends WriteArgs | DecimalWriteArgs>(model: st
  */
 export function validateSetting<A extends WriteArgs | DecimalWriteArgs>(model: string, ...[id, target, value]: A): void {
   const handler = writeHandler(id, model, target) as WriteHandler<A[0]>;
+  const own = canonicalRequest(value) as Input<A[0]>;
   if (handler.validate === undefined) {
-    handler.plan(model, target as Target<A[0]>, value as Input<A[0]>);
+    handler.plan(model, target as Target<A[0]>, own);
   } else {
-    handler.validate(model, target as Target<A[0]>, value as Input<A[0]>);
+    handler.validate(model, target as Target<A[0]>, own);
   }
 }
 
@@ -482,11 +483,12 @@ export function dryRunSetting<A extends WriteArgs | DecimalWriteArgs>(
 ): Promise<VerifiedPlan<Planned<A>>> {
   return settled(() => {
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    const own = canonicalRequest(value) as Input<A[0]>;
     if (handler.dryRun === undefined) {
-      const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
+      const plan = handler.plan(context.model, target as Target<A[0]>, own);
       return Promise.resolve({ ...plan, unverified: [] }) as Promise<VerifiedPlan<Planned<A>>>;
     }
-    return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>) as Promise<VerifiedPlan<Planned<A>>>;
+    return handler.dryRun(context, target as Target<A[0]>, own) as Promise<VerifiedPlan<Planned<A>>>;
   });
 }
 
@@ -503,11 +505,12 @@ export function dryRunSettingAfter<A extends WriteArgs | DecimalWriteArgs>(
 ): Promise<DryRunPlan<Planned<A>>> {
   return settled(() => {
     const handler = writeHandler(id, context.model, target) as WriteHandler<A[0]>;
+    const own = canonicalRequest(value) as Input<A[0]>;
     if (handler.dryRun === undefined) {
-      const plan = handler.plan(context.model, target as Target<A[0]>, value as Input<A[0]>);
+      const plan = handler.plan(context.model, target as Target<A[0]>, own);
       return Promise.resolve({ ...plan, unverified: [] }) as Promise<DryRunPlan<Planned<A>>>;
     }
-    return handler.dryRun(context, target as Target<A[0]>, value as Input<A[0]>, affected) as Promise<DryRunPlan<Planned<A>>>;
+    return handler.dryRun(context, target as Target<A[0]>, own, affected) as Promise<DryRunPlan<Planned<A>>>;
   });
 }
 

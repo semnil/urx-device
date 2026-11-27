@@ -339,7 +339,9 @@ function writesOn(gate: WriteGate, model: string): boolean {
 }
 
 function handler<V, I = V>(resolve: (model: string, target: unknown, write: boolean) => { at: ParameterAddress; codec: Codec }) {
-  const planned = (model: string, target: unknown, requested: I) => {
+  const planned = (model: string, target: unknown, given: I) => {
+    // Read once: the check, the plan and the report all come from this copy.
+    const requested = canonicalRequest(given);
     const { at, codec } = resolve(model, target, true);
     const result = codec.plan(requested);
     if (result === "unsupported") {
@@ -347,7 +349,7 @@ function handler<V, I = V>(resolve: (model: string, target: unknown, write: bool
     }
     return result === undefined
       ? refuse("invalid_input")
-      : { at, codec, raw: result.raw as I64Text, requested: canonicalRequest(requested), planned: result.planned as I };
+      : { at, codec, raw: result.raw as I64Text, requested, planned: result.planned as I };
   };
   return {
     /** The target's read resolution without traffic: its refusal, if any. */
@@ -674,16 +676,19 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
      * `dryRun` performs those reads.
      */
     plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      requested = canonicalRequest(requested);
       const resolved = resolve(model, target);
       staticCheck(resolved.field, resolved.effect, requested);
       return refuse("invalid_input");
     },
     /** The static checks alone: bus, effect, parameter and value or its type-wide envelope. */
     validate(model: string, target: unknown, requested: V): void {
+      requested = canonicalRequest(requested);
       const resolved = resolve(model, target);
       staticCheck(resolved.field, resolved.effect, requested);
     },
     dryRun: dryRunOf<V>(async (context, target, requested, affected) => {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target);
       staticCheck(resolved.field, resolved.effect, requested);
       const unverified: UnverifiedCondition[] = [];
@@ -691,6 +696,7 @@ export function fxParameterSetting<V>(rule: FxParameterRule) {
       return { requested: canonicalRequest(requested), planned: codec === null ? null : (plannedWith(codec, requested).planned as V), unverified };
     }),
     async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target);
       staticCheck(resolved.field, resolved.effect, requested);
       const result = plannedWith((await prepare(context, resolved)) as Codec, requested);
@@ -897,16 +903,19 @@ export function geqGainSetting(rule: GeqGainRule) {
     },
     /** No static plan: the range depends on the live Limit (`dryRun` reads it). */
     plan(model: string, target: unknown, requested: number): WritePlan<number> {
+      requested = canonicalRequest(requested);
       resolve(model, target, true);
       staticCheck(requested);
       return refuse("invalid_input");
     },
     /** The static checks alone: the target and the union of every Limit's range. */
     validate(model: string, target: unknown, requested: number): void {
+      requested = canonicalRequest(requested);
       resolve(model, target, true);
       staticCheck(requested);
     },
     dryRun: dryRunOf<number>(async (context, target, requested, affected) => {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target, true);
       const value = staticCheck(requested);
       const unverified: UnverifiedCondition[] = [];
@@ -914,6 +923,7 @@ export function geqGainSetting(rule: GeqGainRule) {
       return { requested: canonicalRequest(requested), planned: range === null ? null : planWithin(range, value).planned, unverified };
     }),
     async write(context: OperationContext, target: unknown, requested: number): Promise<WriteResult<number>> {
+      requested = canonicalRequest(requested);
       const resolved = resolve(context.model, target, true);
       // Static checks before any read.
       const value = staticCheck(requested);
@@ -1035,20 +1045,24 @@ export function deviceRuleSetting<V>(rule: DeviceSettingRule) {
     ...base,
     /** A connection-free plan where `model` has no applicable prerequisite; refused where the plan needs device state. */
     plan(model: string, target: unknown, requested: V): WritePlan<V> {
+      requested = canonicalRequest(requested);
       const { planned: p } = planned(model, target, requested);
       return applicable(model).length === 0 ? { requested: canonicalRequest(requested), planned: p } : refuse("invalid_input");
     },
     /** The static checks alone: model, target and value; the prerequisites are read by the operation. */
     validate(model: string, target: unknown, requested: V): void {
+      requested = canonicalRequest(requested);
       planned(model, target, requested);
     },
     dryRun: dryRunOf<V>(async (context, target, requested, affected) => {
+      requested = canonicalRequest(requested);
       const { planned: p } = planned(context.model, target, requested);
       const unverified: UnverifiedCondition[] = [];
       await prepare(context, affected, unverified);
       return { requested: canonicalRequest(requested), planned: p, unverified };
     }),
     async write(context: OperationContext, target: unknown, requested: V): Promise<WriteResult<V>> {
+      requested = canonicalRequest(requested);
       const { at, raw, planned: p } = planned(context.model, target, requested);
       await prepare(context);
       return writeRaw(context, at, raw, { requested: canonicalRequest(requested), planned: p });

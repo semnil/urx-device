@@ -155,6 +155,38 @@ describe("numeric writes given as decimal text (W2)", () => {
     expect((await failureOf(writeAny(new OperationContext(new FakeTransport(), "URX44"), "channel.on", { channel: 1 }, decimal("1"))))?.code).toBe("invalid_input");
   });
 
+  // One operation works from the value as it was when the call was made: a caller that changes
+  // its object while the prerequisites are read changes nothing the operation checks, sends or
+  // reports, and a value read by a getter is read once.
+  it("read a decimal value once, at the call", async () => {
+    const changing = (...texts: string[]) => {
+      let reads = 0;
+      return {
+        value: {
+          get decimal() {
+            reads += 1;
+            return texts[Math.min(reads, texts.length) - 1] as string;
+          },
+        },
+        reads: () => reads,
+      };
+    };
+    const pan = changing("3", "0.5");
+    expect(previewAny("URX44", "channel.pan", { channel: 1 }, pan.value)).toEqual({ requested: { decimal: "3" }, planned: { decimal: "3" } });
+    expect(pan.reads()).toBe(1);
+    const time = changing("0.927", "10.3");
+    const transport = new FakeTransport().script("getNumeric", read("0"), read("0")).script("setNumeric", accepted);
+    const fx = { bus: "fx-1", effect: "rev-x-hall", parameter: "reverb-time" };
+    const result = await writeAny(new OperationContext(transport, "URX44"), "bus.fx.parameter", fx, time.value);
+    expect([result.requested, result.planned, transport.calls.at(-1)?.value, time.reads()]).toEqual([{ decimal: "0.927" }, { decimal: "0.927" }, "24", 1]);
+    const owned = { decimal: "0.5" };
+    const gain = new FakeTransport().script("getNumeric", read("2"), read("1")).script("setNumeric", accepted);
+    const writing = writeAny(new OperationContext(gain, "URX44"), "bus.geq.gain", { bus: "mix-1", side: "left", band: "20" }, owned);
+    owned.decimal = "2";
+    const written = await writing;
+    expect([written.requested, written.planned, gain.calls.at(-1)?.value]).toEqual([{ decimal: "0.5" }, { decimal: "0.5" }, "50"]);
+  });
+
   it("type a decimal write as numeric settings only, its plan in decimal text", () => {
     const check = () => {
       const plan: { planned: DecimalValue } = previewSetting("URX44", "channel.fader", { channel: 1 }, decimal("-3"));
@@ -172,3 +204,4 @@ describe("numeric writes given as decimal text (W2)", () => {
     void check;
   });
 });
+
