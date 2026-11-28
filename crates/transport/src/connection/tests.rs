@@ -677,17 +677,20 @@ fn cancelling_an_operation_drops_only_its_waiting_requests() {
 // are gone, nothing of it remains, however many owners were cancelled.
 #[test]
 fn a_cancelled_owner_leaves_nothing_on_the_connection() {
-    let peer = slow(Duration::from_millis(100));
+    let peer = unit(plain);
     let connection = connect(&peer);
     let mut kept = Vec::new();
     for n in 0..200 {
         let operation = connection.create_operation().unwrap();
         if n == 0 {
-            // One cancelled with a request sent and another waiting behind it.
+            // One cancelled with a request sent and another waiting behind it: the first one's
+            // response is not read until the cancellation has returned.
+            let read = hold_the_next_response_deadline(&connection);
             let sent = submit(&connection, &operation, Request::GetNumeric(address(1)));
             wait_until(|| parameter_uris(&peer).len() == 1);
             let waiting = submit(&connection, &operation, Request::GetNumeric(address(2)));
             operation.cancel();
+            drop(read);
             assert_eq!(outcome(&waiting), cancelled());
             assert!(matches!(outcome(&sent), Outcome::Success { .. }));
         }
