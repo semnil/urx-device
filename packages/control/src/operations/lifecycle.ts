@@ -1,7 +1,7 @@
 // Lifecycle outcome records (K37) and the discovery result (D14), validated
 // at the adapter boundary like single-request records (K33/K34).
 
-import type { LaterCause, OperationCause, OperationPhase } from "./failure.js";
+import type { LaterCause, OperationCause } from "./failure.js";
 import type { NativeRequestCause, NativeRequestPhase } from "./native.js";
 
 export type LifecyclePhase = "discovery" | "connect" | "identity" | "admission" | "subscription" | "teardown";
@@ -159,37 +159,12 @@ const OPERATION_CAUSES: readonly string[] = [
 ];
 
 /**
- * Where a cleanup failure that names no request occurred, as an operation
- * phase: the record names the lifecycle phase only, so the phase follows the
- * cause as K34 places it — causes before sending at admission, a send
- * deadline, a lost link or a teardown budget while sending, a verdict or its
- * absence at the response, and the remaining causes at delivery.
- */
-function phaseOfCause(code: OperationCause): OperationPhase {
-  switch (code) {
-    case "invalid_input":
-    case "precondition_failed":
-    case "not_connected":
-      return "admission";
-    case "send_timeout":
-    case "connection_lost":
-    case "teardown_timeout":
-      return "send";
-    case "device_rejected":
-    case "response_timeout":
-    case "invalid_response":
-      return "response";
-    default:
-      return "delivery";
-  }
-}
-
-/**
  * The failure a failed subscription call's own cleanup settled, as the cause
  * that goes beside the call's failure (E3, `OperationFailure.later`): the
  * transport's release of what the call had registered, its automatic
  * unregistration of a registration the owner's cancellation stopped among
- * them, at the phase of the request that failed. An adapter carries that
+ * them, at the phase of the request that failed, or the record's lifecycle
+ * phase where it names none. An adapter carries that
  * cleanup as the call's `progress.cleanup` (`TransportSubscription.activate`).
  * None when the progress carries no valid cleanup, or the cleanup failed
  * nothing.
@@ -203,7 +178,7 @@ export function cleanupFailureOf(progress: unknown): LaterCause | undefined {
     return undefined;
   }
   const code = (OPERATION_CAUSES.includes(failure.code) ? failure.code : "internal_error") as OperationCause;
-  return { code, phase: failure.request ?? phaseOfCause(code) };
+  return { code, phase: failure.request ?? failure.phase };
 }
 
 /**

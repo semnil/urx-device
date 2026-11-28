@@ -145,14 +145,11 @@ describe("Console Lock write guard (F20-L-A)", () => {
       ["invalid_response", "send", "send"],
       ["notification_overflow", "response", "response"],
       ["internal_error", "send", "send"],
-      // A failure that names no request is placed where K34 places its cause.
-      ["device_rejected", null, "response"],
-      ["response_timeout", null, "response"],
-      ["connection_lost", null, "send"],
-      ["send_timeout", null, "send"],
-      ["not_connected", null, "admission"],
-      ["notification_overflow", null, "delivery"],
-      ["identity_error", null, "delivery"],
+      // A failure that names no request keeps the record's lifecycle phase.
+      ["device_rejected", null, "subscription"],
+      ["connection_lost", null, "subscription"],
+      ["invalid_response", null, "subscription"],
+      ["identity_error", null, "subscription"],
     ] as const) {
       const t = new FakeTransport();
       t.activation = new OperationFailureError({ code: "interrupted", phase: "send", progress: cleanup(code, request), cancelled: true });

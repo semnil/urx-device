@@ -1172,6 +1172,16 @@ describe("CURRENT composition (K36, F18)", () => {
       new OperationFailureError({ code: "device_rejected", phase: "response", progress: lostAt("send") }),
     );
     expect(sending.later).toEqual({ code: "connection_lost", phase: "send" });
+    // One that names no request keeps the record's lifecycle phase.
+    const unnamed = await apply(
+      (t) => t.script("getNumeric", read("0")),
+      new OperationFailureError({
+        code: "device_rejected",
+        phase: "response",
+        progress: { cleanup: { state: "connection_closed", failure: { kind: "cause", code: "connection_lost", phase: "subscription", request: null } } },
+      }),
+    );
+    expect(unnamed.later).toEqual({ code: "connection_lost", phase: "subscription" });
     expect(activation.later, "a registration whose cleanup failed nothing has none").toBeNull();
     // A later the registration's failure already carries stays the one, as the guard keeps it; the
     // cleanup's failure behind it does not replace it, and the release's result stays its own.
