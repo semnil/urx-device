@@ -126,6 +126,8 @@ struct Item {
     frame: Vec<u8>,
     key: ReplyKey,
     submitted: Instant,
+    /// Asked before the first byte, when the request was submitted with one.
+    gate: Option<SendGate>,
     done: Done,
 }
 
@@ -236,6 +238,14 @@ struct Shared {
     /// signalled, for a case that closes while that request is on the wire.
     #[cfg(test)]
     response_gate: Mutex<Option<Receiver<()>>>,
+    /// Holds the next request's write between its last check and its first
+    /// byte, with the end gate held, until signalled.
+    #[cfg(test)]
+    first_byte_gate: Mutex<Option<Receiver<()>>>,
+    /// Holds the next frame taken out of the buffer, with the end gate held,
+    /// before it is routed, when a receipt observer watches, until signalled.
+    #[cfg(test)]
+    receipt_gate: Mutex<Option<Receiver<()>>>,
 }
 
 impl Shared {
@@ -280,6 +290,10 @@ pub type NotificationHandler = Arc<dyn Fn(NotificationBatch) + Send + Sync>;
 
 /// Shown each notification record as it is queued for delivery; see [`open_observed`].
 pub type ReceiptObserver = Arc<dyn Fn(&NotificationRecord) + Send + Sync>;
+
+/// Asked whether a request may go out, just before its first byte; see
+/// [`Connection::submit_gated`].
+pub type SendGate = Box<dyn Fn() -> bool + Send>;
 
 /// An open connection to one unit. It is shared by reference: closing takes
 /// `&self`, and every call to [`Connection::close`] joins the same close.
@@ -411,9 +425,11 @@ pub fn open_with(
 /// before the delivery can hand the record on, however long the delivery
 /// waits for an acknowledgment. It sees exactly the records that are queued —
 /// not a frame dropped for want of a recipient, nor one past the delivery
-/// budget (K6), nor any after an overflow. It must return promptly and must
-/// not call into the connection: the reader receives nothing, replies
-/// included, until it returns. If it panics, nothing more is queued and the
+/// budget (K6), nor any after an overflow. It is called under the gate a
+/// write's first byte starts under, so a send gate (`Connection::submit_gated`)
+/// sees what it took from every record received before that byte. It must
+/// return promptly and must not call into the connection: the reader receives
+/// nothing, replies included, and no write starts, until it returns. If it panics, nothing more is queued and the
 /// connection ends with `internal_error`; as after an overflow, the reply to
 /// the request on the wire is still awaited and kept as evidence. The reader
 /// thread holds it and drops it once that thread ends, by the time the
@@ -535,6 +551,10 @@ impl Connection {
             sent_sets: AtomicU64::new(0),
             #[cfg(test)]
             response_gate: Mutex::new(None),
+            #[cfg(test)]
+            first_byte_gate: Mutex::new(None),
+            #[cfg(test)]
+            receipt_gate: Mutex::new(None),
         });
         let (events, inbox) = mpsc::channel();
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -690,6 +710,37 @@ impl Connection {
         request: Request,
         done: impl FnOnce(Outcome, ResultAdoption) + Send + 'static,
     ) {
+        self.admit(operation, request, None, done);
+    }
+
+    /// Like [`Connection::submit`], also asking `gate` whether the request
+    /// may go out just before its first byte would: on the worker thread,
+    /// under the gate a receipt observer is called under (`open_observed`),
+    /// so it sees every record received before that byte, and none received
+    /// after. It is asked again before each try at the first byte — a try a
+    /// transient socket error ends sends nothing — and never once a byte is
+    /// out, so it reads the current state rather than consuming a permit. A
+    /// refusal, or a panic in it, completes the request unsent as
+    /// `precondition_failed` at admission, and the connection goes on. It
+    /// must return promptly and must not call into the connection; it is let
+    /// go outside the connection's locks, however the request ends.
+    pub fn submit_gated(
+        &self,
+        operation: &Operation,
+        request: Request,
+        gate: SendGate,
+        done: impl FnOnce(Outcome, ResultAdoption) + Send + 'static,
+    ) {
+        self.admit(operation, request, Some(gate), done);
+    }
+
+    fn admit(
+        &self,
+        operation: &Operation,
+        request: Request,
+        gate: Option<SendGate>,
+        done: impl FnOnce(Outcome, ResultAdoption) + Send + 'static,
+    ) {
         let refuse = |code, phase| Outcome::failed(code, phase, Evidence::NotSent);
         let message = message_of(&request);
         let frame = match frame::encode(&message) {
@@ -746,6 +797,7 @@ impl Connection {
             request,
             frame,
             submitted: Instant::now(),
+            gate,
             done: Box::new(move |outcome, adoption| {
                 let _reserved = reservation;
                 done(outcome, adoption);
@@ -1500,14 +1552,17 @@ impl Expiry {
             let bytes = item.frame.len();
             pool.charged += 1;
             pool.charged_bytes += bytes;
+            // Its gate goes with it and is let go on its thread, outside the locks it was taken under.
+            let Item { gate, done, .. } = item;
             pool.queue.push_back(Entry {
                 run: Box::new(move || {
+                    drop(gate);
                     let timeout = Outcome::failed(
                         RequestCause::SendTimeout,
                         RequestPhase::Admission,
                         Evidence::NotSent,
                     );
-                    deliver(item.done, timeout, ResultAdoption::none());
+                    deliver(done, timeout, ResultAdoption::none());
                 }),
                 charged_bytes: Some(bytes),
             });
@@ -1658,6 +1713,7 @@ fn route(
     received: &Received,
     accepting: bool,
     at_receipt: Option<&ReceiptObserver>,
+    received_under: Option<MutexGuard<'_, Option<RequestCause>>>,
 ) -> Routed {
     let Some(payload) = Inbound::new(received.message.clone()).notification() else {
         return Routed::NotNotification;
@@ -1665,6 +1721,10 @@ fn route(
     let Some(queue) = shared.notifications.as_ref().filter(|_| accepting) else {
         return Routed::Dropped;
     };
+    // With an observer, the notification is shown under the end gate it was received under, so a
+    // send gate sees it if, and only if, it was received before that write's first byte
+    // (`Connection::submit_gated`).
+    let gate = at_receipt.map(|_| received_under.unwrap_or_else(|| shared.link_end()));
     let recipients = {
         let state = shared.lock();
         match &payload {
@@ -1697,6 +1757,7 @@ fn route(
             return Routed::ObserverFailed;
         }
     }
+    drop(gate);
     let pushed = lock(queue).push(record, received.len);
     shared.deliverable.notify_all();
     match pushed {
@@ -1789,28 +1850,52 @@ fn read_until_stopped(
         return;
     }
     while !stop.load(Ordering::SeqCst) {
-        begin_op(&shared, Side::Reader);
-        let read = reader.read_frame(&mut sock);
-        let met = match &read {
-            Err(ReadError::Io(kind)) => Some(*kind),
-            _ => None,
+        // A frame is received when it is taken out of the buffer complete: with a receipt
+        // observer, under the end gate a write's first byte starts under, so the reader and the
+        // writer order a receipt and a first byte alike (`Connection::submit_gated`). The wait for
+        // input stays outside it.
+        let mut gate = at_receipt.map(|_| shared.link_end());
+        let read = match reader.take_frame() {
+            Ok(None) => {
+                drop(gate.take());
+                begin_op(&shared, Side::Reader);
+                let filled = reader.fill(&mut sock);
+                let met = match &filled {
+                    Err(ReadError::Io(kind)) => Some(*kind),
+                    _ => None,
+                };
+                end_op(&shared, Side::Reader, met);
+                match filled {
+                    Ok(_) => continue,
+                    Err(error) => Err(error),
+                }
+            }
+            taken => taken,
         };
-        end_op(&shared, Side::Reader, met);
         match read {
             Ok(Some(frame)) => {
+                let received_at_ms = now_ms();
+                #[cfg(test)]
+                if gate.is_some() {
+                    let hook = lock(&shared.receipt_gate).take();
+                    if let Some(hook) = hook {
+                        let _ = hook.recv();
+                    }
+                }
                 if let Some(json) = frame.json {
                     if lost_notification(&json) {
+                        drop(gate.take());
                         note_loss(&shared, LinkLoss::UnitLost);
                         record(RequestCause::ConnectionLost);
                     }
                     let mut received = Received {
                         message: json,
                         len: frame.len,
-                        received_at_ms: now_ms(),
+                        received_at_ms,
                         cutoff: 0,
                     };
                     // Recipients and budget are decided here, at receipt.
-                    match route(&shared, &received, queueing, at_receipt) {
+                    match route(&shared, &received, queueing, at_receipt, gate.take()) {
                         Routed::NotNotification => {}
                         Routed::Queued | Routed::Dropped => continue,
                         // Only while queueing: once not, `route` drops every notification.
@@ -1836,6 +1921,7 @@ fn read_until_stopped(
             }
             Ok(None) => {}
             Err(error) => {
+                drop(gate.take());
                 if !stop.load(Ordering::SeqCst) {
                     let cause = match error {
                         ReadError::Oversized { .. } => RequestCause::InvalidResponse,
@@ -2161,9 +2247,12 @@ impl Taken {
     fn completions(self, cause: RequestCause) -> Vec<Completion> {
         let mut completions: Vec<Completion> = Vec::new();
         for item in self.waiting {
+            // Its gate goes with it and is let go here, outside the locks it was taken under.
+            let Item { gate, done, .. } = item;
             completions.push(Box::new(move || {
+                drop(gate);
                 deliver(
-                    item.done,
+                    done,
                     Outcome::failed(cause, RequestPhase::Admission, Evidence::NotSent),
                     ResultAdoption::none(),
                 );
@@ -2662,6 +2751,7 @@ fn execute(
         frame,
         key,
         submitted,
+        gate,
         ..
     } = item;
     if shared.lock().cancelled_owners.contains(owner) {
@@ -2681,6 +2771,11 @@ fn execute(
             Some(Stop::Closing)
         } else if state.cancelled_owners.contains(owner) {
             Some(Stop::Cancelled)
+        } else if gate
+            .as_ref()
+            .is_some_and(|gate| !panic::catch_unwind(AssertUnwindSafe(gate)).unwrap_or(false))
+        {
+            Some(Stop::Held)
         } else {
             None
         }
@@ -2918,6 +3013,14 @@ fn exchange(
             ))
         }
         Err(WriteError::Stopped(Stop::Cancelled)) => return Err(Failed::cancelled()),
+        Err(WriteError::Stopped(Stop::Held)) => {
+            return Err(Failed::new(
+                RequestCause::PreconditionFailed,
+                RequestPhase::Admission,
+                Evidence::NotSent,
+                false,
+            ))
+        }
         Err(WriteError::Failed { cause, written }) => {
             let evidence = if written == 0 {
                 Evidence::NotSent
@@ -3058,6 +3161,14 @@ fn write_frame<O: Outgoing>(
                 return Err(WriteError::Stopped(stop));
             }
             drop(state);
+            #[cfg(test)]
+            {
+                // Taken first, so the wait does not hold the slot's lock.
+                let gate = lock(&shared.first_byte_gate).take();
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+            }
             // And after the state lock, the last wait before the write.
             if Instant::now() >= end {
                 return failed(RequestCause::SendTimeout);
@@ -3115,6 +3226,8 @@ enum Stop {
     Closing,
     /// Its operation was cancelled, or its token's release was asked for.
     Cancelled,
+    /// Its send gate refused it (`Connection::submit_gated`).
+    Held,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

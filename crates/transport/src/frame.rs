@@ -99,6 +99,18 @@ impl FrameReader {
         self.take_buffered()
     }
 
+    /// A frame already complete in the buffer, taken out of it, with no read
+    /// of the stream.
+    pub fn take_frame(&mut self) -> Result<Option<Frame>, ReadError> {
+        self.take_buffered()
+    }
+
+    /// One read of `src` into the buffer: `false` when the stream reported a
+    /// read timeout; an interrupted read counts as a read with no data.
+    pub fn fill<R: Read>(&mut self, src: &mut R) -> Result<bool, ReadError> {
+        self.read_chunk(src)
+    }
+
     fn take_buffered(&mut self) -> Result<Option<Frame>, ReadError> {
         if let Some(nl) = self.pending.iter().position(|&b| b == b'\n') {
             if nl > MAX_FRAME_BYTES {
