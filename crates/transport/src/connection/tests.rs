@@ -1202,6 +1202,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             sent_gets: std::sync::atomic::AtomicU64::new(0),
             sent_sets: std::sync::atomic::AtomicU64::new(0),
             response_gate: std::sync::Mutex::new(None),
+            first_byte_gate: std::sync::Mutex::new(None),
         }),
         written: Vec::new(),
         end_before_write,
@@ -4256,6 +4257,154 @@ mod notifications {
             Ok(()),
             "the drop returned within a second, not at the end of the teardown budget"
         );
+    }
+
+    /// Submits `request` with `gate` and hands back its outcome's receiver.
+    fn submit_gated_on(
+        connection: &Connection,
+        request: Request,
+        gate: crate::connection::SendGate,
+    ) -> Receiver<Outcome> {
+        let operation = connection.create_operation().unwrap();
+        let (tx, rx) = mpsc::channel();
+        connection.submit_gated(&operation, request, gate, move |outcome, adoption| {
+            adoption.adopt();
+            let _ = tx.send(outcome);
+        });
+        rx
+    }
+
+    fn held() -> Outcome {
+        Outcome::failed(
+            RequestCause::PreconditionFailed,
+            crate::request::RequestPhase::Admission,
+            crate::request::Evidence::NotSent,
+        )
+    }
+
+    // A request its gate refuses, or whose gate fails, completes unsent, and
+    // the connection goes on.
+    #[test]
+    fn a_request_its_send_gate_refuses_is_not_sent_and_the_connection_goes_on() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let refused = submit_gated_on(
+            &connection,
+            Request::SetNumeric(param(5), 3),
+            Box::new(|| false),
+        );
+        assert_eq!(
+            refused.recv_timeout(Duration::from_secs(5)).unwrap(),
+            held()
+        );
+        let failed = submit_gated_on(
+            &connection,
+            Request::SetText(param(6), "Vox".to_string()),
+            Box::new(|| panic!("the gate failed")),
+        );
+        assert_eq!(failed.recv_timeout(Duration::from_secs(5)).unwrap(), held());
+        assert_eq!(connection.sent_frames().sets, 0, "neither went out");
+        let allowed = submit_gated_on(
+            &connection,
+            Request::SetNumeric(param(5), 3),
+            Box::new(|| true),
+        );
+        assert!(matches!(
+            allowed.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Outcome::Success { .. }
+        ));
+        assert_eq!(connection.sent_frames().sets, 1);
+        assert_eq!(connection.terminal(), None);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    /// A connection whose receipt observer sets `locked` from each numeric
+    /// notification's value, and whose delivery acknowledges every batch.
+    fn connect_locking(port: u16, locked: &Arc<std::sync::atomic::AtomicBool>) -> Arc<Connection> {
+        let seen = Arc::clone(locked);
+        let observer: crate::connection::ReceiptObserver = Arc::new(move |record| {
+            if let Notification::Numeric { value, .. } = record.payload {
+                seen.store(value != 0, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let slot: Arc<OnceLock<Weak<Connection>>> = Arc::new(OnceLock::new());
+        let adopting = Arc::clone(&slot);
+        let handler: NotificationHandler = Arc::new(move |batch| {
+            if let Some(connection) = adopting.get().and_then(Weak::upgrade) {
+                connection.adopt_notifications(batch.ticket);
+            }
+        });
+        let connection = Arc::new(
+            crate::connection::open_observed(
+                port,
+                ID,
+                &options(),
+                &Control::new(),
+                handler,
+                observer,
+            )
+            .unwrap(),
+        );
+        assert!(slot.set(Arc::downgrade(&connection)).is_ok());
+        connection
+    }
+
+    // The gate is asked as the request goes out, not as it is submitted: a
+    // lock received while it waited behind another request holds it.
+    #[test]
+    fn a_send_gate_is_asked_as_the_request_goes_out_not_as_it_is_submitted() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connection = connect_locking(port, &locked);
+        let _token = activate(&connection, &[p(1)]);
+        let release = block_worker(&connection);
+        let open = Arc::clone(&locked);
+        let write = submit_gated_on(
+            &connection,
+            Request::SetNumeric(param(5), 3),
+            Box::new(move || !open.load(std::sync::atomic::Ordering::SeqCst)),
+        );
+        push.send(notify_param(1, 1)).unwrap();
+        super::wait_until(|| locked.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        assert_eq!(write.recv_timeout(Duration::from_secs(5)).unwrap(), held());
+        assert_eq!(connection.sent_frames().sets, 0);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    // A record received while a write is between its gate and its first byte
+    // is shown to the observer only once that byte is out: the gate and the
+    // observer share the end gate, so the gate never misses a record received
+    // before the byte it lets go.
+    #[test]
+    fn a_record_received_while_a_write_starts_is_seen_only_after_its_first_byte() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connection = connect_locking(port, &locked);
+        let _token = activate(&connection, &[p(1)]);
+        let (go, wait) = mpsc::channel();
+        *crate::connection::lock(&connection.shared.first_byte_gate) = Some(wait);
+        let open = Arc::clone(&locked);
+        let write = submit_gated_on(
+            &connection,
+            Request::SetNumeric(param(5), 3),
+            Box::new(move || !open.load(std::sync::atomic::Ordering::SeqCst)),
+        );
+        // The write has passed its gate and holds before its first byte.
+        super::wait_until(|| crate::connection::lock(&connection.shared.first_byte_gate).is_none());
+        push.send(notify_param(1, 1)).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !locked.load(std::sync::atomic::Ordering::SeqCst),
+            "not seen while the write starts"
+        );
+        go.send(()).unwrap();
+        assert!(matches!(
+            write.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Outcome::Success { .. }
+        ));
+        super::wait_until(|| locked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     }
 
     #[test]
