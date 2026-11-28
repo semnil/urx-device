@@ -1166,6 +1166,22 @@ describe("CURRENT composition (K36, F18)", () => {
     );
     expect([...outcomes(settled), settled.later]).toEqual(["device_rejected", "connection_lost", "not_sent", "not_sent", { code: "response_timeout", phase: "response" }]);
     expect(activation.later, "a registration whose cleanup failed nothing has none").toBeNull();
+    // A later the registration's failure already carries stays the one, as the guard keeps it; the
+    // cleanup's failure behind it does not replace it, and the release's result stays its own.
+    const invalid = { code: "invalid_response", phase: "response" } as const;
+    for (const progress of [null, unregistration]) {
+      const carried = await apply(
+        (t) => t.script("getNumeric", read("0")),
+        new OperationFailureError({ code: "device_rejected", phase: "response", progress, later: invalid }),
+      );
+      expect([...outcomes(carried), carried.later], JSON.stringify(progress)).toEqual([
+        "device_rejected",
+        "connection_lost",
+        "not_sent",
+        "not_sent",
+        invalid,
+      ]);
+    }
     // The rate read fails.
     const readFails = await apply((t) => t.script("getNumeric", read("0"), { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } }));
     expect(outcomes(readFails)).toEqual(["response_timeout", "connection_lost", "not_sent", "not_sent"]);

@@ -214,9 +214,10 @@ async function watchRate(context: OperationContext, fileRate: number, record: Im
   const failed = (error: unknown): true => {
     const failure = operationFailureOf(error);
     record.failure(failure?.code ?? "internal_error", failure?.phase ?? "preparation", failure?.cancelled !== true);
-    // A failure the registration's own cleanup settled goes beside it, as the guard's does (`cleanupFailureOf`).
-    const unregistration = cleanupFailureOf(failure?.progress);
-    if (unregistration !== undefined) record.failure(unregistration.code, unregistration.phase, true);
+    // The cause found after it, as the guard keeps it: the one the failure already carries, else a
+    // failure the registration's own cleanup settled (`cleanupFailureOf`).
+    const after = failure?.later ?? cleanupFailureOf(failure?.progress);
+    if (after !== undefined) record.failure(after.code, after.phase, true);
     return true;
   };
   let operation: TransportOperation;
