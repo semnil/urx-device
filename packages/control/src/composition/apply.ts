@@ -11,9 +11,10 @@
 
 import type { ConsoleLockGuard } from "../operations/console-lock.js";
 import type { OperationContext, WriteGuard } from "../operations/context.js";
-import type { LaterCause, OperationCause, OperationPhase } from "../operations/failure.js";
+import type { LaterCause, OperationCause } from "../operations/failure.js";
 import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "../operations/transport.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
+import { cleanupFailureOf } from "../operations/lifecycle.js";
 import { DEVICE_RULES } from "../catalog/device.js";
 import { dryRunSettingAfter, readSetting, writeSetting, type WriteArgs } from "../operations/registry.js";
 import { codecOf } from "../operations/rules.js";
@@ -102,7 +103,7 @@ class RateWatch implements WriteGuard {
 /** One event on the import's record. */
 type ImportEvent =
   | { readonly kind: "stop"; readonly code: OperationCause }
-  | { readonly kind: "failure"; readonly code: OperationCause; readonly phase: OperationPhase; readonly beside: boolean }
+  | { readonly kind: "failure"; readonly code: OperationCause; readonly phase: LaterCause["phase"]; readonly beside: boolean }
   | { readonly kind: "condition"; readonly code: OperationCause }
   | { readonly kind: "settled" };
 
@@ -125,7 +126,7 @@ class ImportRecord {
   }
 
   /** A failure: a prerequisite's own (`beside`: a cause that may go beside the stop), a step's, or a cancellation. */
-  failure(code: OperationCause, phase: OperationPhase, beside: boolean): void {
+  failure(code: OperationCause, phase: LaterCause["phase"], beside: boolean): void {
     this.#append({ kind: "failure", code, phase, beside });
   }
 
@@ -213,6 +214,10 @@ async function watchRate(context: OperationContext, fileRate: number, record: Im
   const failed = (error: unknown): true => {
     const failure = operationFailureOf(error);
     record.failure(failure?.code ?? "internal_error", failure?.phase ?? "preparation", failure?.cancelled !== true);
+    // The cause found after it, as the guard keeps it: the one the failure already carries, else a
+    // failure the registration's own cleanup settled (`cleanupFailureOf`).
+    const after = failure?.later ?? cleanupFailureOf(failure?.progress);
+    if (after !== undefined) record.failure(after.code, after.phase, true);
     return true;
   };
   let operation: TransportOperation;

@@ -130,6 +130,77 @@ describe("Console Lock write guard (F20-L-A)", () => {
     expect((await failureOf(guard.release()))?.code).toBe("internal_error");
   });
 
+  // E3: the registration's failure is the cause, and a failure its own cleanup settled — the
+  // transport's automatic unregistration of a registration the owner's cancellation stopped — goes
+  // beside it once, as the failure's `later`, whatever the guard's own release then answers.
+  it("report the failure a registration's own cleanup settled beside the registration's", async () => {
+    const cleanup = (code: string, request: string | null = null) => ({
+      cleanup: { state: "incomplete", failure: { kind: "cause", code, phase: "subscription", request } },
+    });
+    for (const [code, request, phase] of [
+      // The phase the failed unregistration was in, where the record names it.
+      ["connection_lost", "send", "send"],
+      ["connection_lost", "response", "response"],
+      ["send_timeout", "admission", "admission"],
+      ["invalid_response", "send", "send"],
+      ["notification_overflow", "response", "response"],
+      ["internal_error", "send", "send"],
+      // A failure that names no request keeps the record's lifecycle phase.
+      ["device_rejected", null, "subscription"],
+      ["connection_lost", null, "subscription"],
+      ["invalid_response", null, "subscription"],
+      ["identity_error", null, "subscription"],
+    ] as const) {
+      const t = new FakeTransport();
+      t.activation = new OperationFailureError({ code: "interrupted", phase: "send", progress: cleanup(code, request), cancelled: true });
+      t.releaseFailure = new OperationFailureError({ code: "not_connected", phase: "admission", progress: null });
+      const failure = await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44")));
+      expect(failure, `${code} ${request}`).toEqual({
+        code: "interrupted",
+        phase: "send",
+        progress: { cleanup: "not_connected" },
+        cancelled: true,
+        later: { code: code === "identity_error" ? "internal_error" : code, phase },
+      });
+    }
+    // A registration's own failure keeps its cause, its cleanup's failure beside it.
+    const own = new FakeTransport();
+    own.activation = new OperationFailureError({ code: "device_rejected", phase: "response", progress: cleanup("response_timeout", "response") });
+    expect(await failureOf(ConsoleLockGuard.open(new OperationContext(own, "URX44")))).toEqual({
+      code: "device_rejected",
+      phase: "response",
+      progress: null,
+      later: { code: "response_timeout", phase: "response" },
+    });
+    // A cleanup that failed nothing, or a progress that is no valid cleanup, adds nothing; a later
+    // the registration's failure already carries stays the one.
+    for (const progress of [
+      { cleanup: { state: "complete", failure: null } },
+      { cleanup: { state: "incomplete", failure: { kind: "cause", code: "connect_timeout", phase: "subscription", request: null } } },
+      { cleanup: { state: "incomplete", failure: { kind: "cause", code: "connection_lost", phase: "subscription" } } },
+      { cleanup: { state: "incomplete", failure: { kind: "cause", code: "connection_lost", phase: "subscription", request: "reply" } } },
+      { cleanup: "teardown_timeout" },
+      { other: 1 },
+      null,
+    ]) {
+      const t = new FakeTransport();
+      t.activation = new OperationFailureError({ code: "interrupted", phase: "send", progress, cancelled: true });
+      expect((await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44"))))?.later, JSON.stringify(progress)).toBeUndefined();
+    }
+    const carried = new FakeTransport();
+    carried.activation = new OperationFailureError({
+      code: "interrupted",
+      phase: "send",
+      progress: cleanup("device_rejected", "response"),
+      cancelled: true,
+      later: { code: "invalid_response", phase: "response" },
+    });
+    expect((await failureOf(ConsoleLockGuard.open(new OperationContext(carried, "URX44"))))?.later).toEqual({
+      code: "invalid_response",
+      phase: "response",
+    });
+  });
+
   it("keep a stop latched during the lock read as the cause, whatever the read returns, its own failure beside it", async () => {
     for (const [note, reply, code, later] of [
       ["1", read("3"), "precondition_failed", { code: "invalid_response", phase: "response" }],

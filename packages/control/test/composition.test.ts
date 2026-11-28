@@ -1157,6 +1157,48 @@ describe("CURRENT composition (K36, F18)", () => {
     // The rate registration fails: its own cause stays, the failed release beside it.
     const activation = await apply((t) => t.script("getNumeric", read("0")), new OperationFailureError({ code: "device_rejected", phase: "response", progress: null }));
     expect(outcomes(activation)).toEqual(["device_rejected", "connection_lost", "not_sent", "not_sent"]);
+    // A failure the registration's own cleanup settled is the cause that goes beside its own (E3), as
+    // the guard's is (`cleanupFailureOf`).
+    const lostAt = (request: string) => ({ cleanup: { state: "connection_closed", failure: { kind: "cause", code: "connection_lost", phase: "subscription", request } } });
+    const unregistration = lostAt("response");
+    const settled = await apply(
+      (t) => t.script("getNumeric", read("0")),
+      new OperationFailureError({ code: "device_rejected", phase: "response", progress: unregistration }),
+    );
+    expect([...outcomes(settled), settled.later]).toEqual(["device_rejected", "connection_lost", "not_sent", "not_sent", { code: "connection_lost", phase: "response" }]);
+    // The phase is the one the failed unregistration was in, as the record names it.
+    const sending = await apply(
+      (t) => t.script("getNumeric", read("0")),
+      new OperationFailureError({ code: "device_rejected", phase: "response", progress: lostAt("send") }),
+    );
+    expect(sending.later).toEqual({ code: "connection_lost", phase: "send" });
+    // One that names no request keeps the record's lifecycle phase.
+    const unnamed = await apply(
+      (t) => t.script("getNumeric", read("0")),
+      new OperationFailureError({
+        code: "device_rejected",
+        phase: "response",
+        progress: { cleanup: { state: "connection_closed", failure: { kind: "cause", code: "connection_lost", phase: "subscription", request: null } } },
+      }),
+    );
+    expect(unnamed.later).toEqual({ code: "connection_lost", phase: "subscription" });
+    expect(activation.later, "a registration whose cleanup failed nothing has none").toBeNull();
+    // A later the registration's failure already carries stays the one, as the guard keeps it; the
+    // cleanup's failure behind it does not replace it, and the release's result stays its own.
+    const invalid = { code: "invalid_response", phase: "response" } as const;
+    for (const progress of [null, unregistration]) {
+      const carried = await apply(
+        (t) => t.script("getNumeric", read("0")),
+        new OperationFailureError({ code: "device_rejected", phase: "response", progress, later: invalid }),
+      );
+      expect([...outcomes(carried), carried.later], JSON.stringify(progress)).toEqual([
+        "device_rejected",
+        "connection_lost",
+        "not_sent",
+        "not_sent",
+        invalid,
+      ]);
+    }
     // The rate read fails.
     const readFails = await apply((t) => t.script("getNumeric", read("0"), { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } }));
     expect(outcomes(readFails)).toEqual(["response_timeout", "connection_lost", "not_sent", "not_sent"]);

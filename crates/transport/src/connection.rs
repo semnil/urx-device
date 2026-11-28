@@ -2367,6 +2367,8 @@ enum Posted {
     Refused {
         verdict: Verdict,
         cause: RequestCause,
+        /// Where the request stopped (K34).
+        phase: RequestPhase,
         /// The end of the connection it comes with, if any: its own cause,
         /// or an end recorded meanwhile that leaves its verdict as it is.
         ends: Option<RequestCause>,
@@ -2416,13 +2418,19 @@ impl Io<'_> {
         stop: &dyn Fn(&State) -> bool,
         cleanup: bool,
     ) -> Posted {
-        let refused = |verdict, cause, ends| Posted::Refused {
+        let refused = |verdict, cause, phase, ends| Posted::Refused {
             verdict,
             cause,
+            phase,
             ends,
         };
         let Ok(frame) = frame::encode(&request.message()) else {
-            return refused(Verdict::Rejected, RequestCause::InternalError, None);
+            return refused(
+                Verdict::Rejected,
+                RequestCause::InternalError,
+                RequestPhase::Admission,
+                None,
+            );
         };
         let key = request.reply_key();
         let cap = self.teardown;
@@ -2466,28 +2474,42 @@ impl Io<'_> {
                     .expect("exchange returns the matching reply");
                 let posted = match reply.post_verdict() {
                     PostVerdict::Accepted => Posted::Accepted,
-                    PostVerdict::Rejected(_) => {
-                        refused(Verdict::Rejected, RequestCause::DeviceRejected, None)
-                    }
-                    PostVerdict::Malformed => {
-                        refused(Verdict::Unknown, RequestCause::InvalidResponse, None)
-                    }
+                    PostVerdict::Rejected(_) => refused(
+                        Verdict::Rejected,
+                        RequestCause::DeviceRejected,
+                        RequestPhase::Response,
+                        None,
+                    ),
+                    PostVerdict::Malformed => refused(
+                        Verdict::Unknown,
+                        RequestCause::InvalidResponse,
+                        RequestPhase::Response,
+                        None,
+                    ),
                 };
                 // An end before the verdict is consumed ends the connection;
-                // an acceptance then fails with it, and a refusal keeps its
-                // own cause (K34).
+                // an acceptance then fails with it at delivery, and a refusal
+                // keeps its own cause (K34).
                 match (posted, ending) {
                     (posted, None) => posted,
-                    (Posted::Accepted, Some(end)) => refused(Verdict::Accepted, end, Some(end)),
-                    (Posted::Refused { verdict, cause, .. }, Some(end)) => {
-                        refused(verdict, cause, Some(end))
+                    (Posted::Accepted, Some(end)) => {
+                        refused(Verdict::Accepted, end, RequestPhase::Delivery, Some(end))
                     }
+                    (
+                        Posted::Refused {
+                            verdict,
+                            cause,
+                            phase,
+                            ..
+                        },
+                        Some(end),
+                    ) => refused(verdict, cause, phase, Some(end)),
                     (Posted::Stopped, Some(_)) => Posted::Stopped,
                 }
             }
             Err(failed) => match failed.failure {
                 RequestFailure::Cancelled { .. } => Posted::Stopped,
-                RequestFailure::Cause { code, .. } => {
+                RequestFailure::Cause { code, phase } => {
                     // A send budget cut short by the teardown's end expires
                     // as the teardown (N2, K34).
                     let code = match (code, cap) {
@@ -2501,7 +2523,7 @@ impl Io<'_> {
                     } else {
                         Verdict::Unknown
                     };
-                    refused(verdict, code, failed.ends)
+                    refused(verdict, code, phase, failed.ends)
                 }
             },
         }
@@ -2580,10 +2602,12 @@ impl Io<'_> {
                 Posted::Refused {
                     verdict,
                     cause,
+                    phase,
                     ends,
                 } => {
                     self.shared.lock().ledger.registered(address, verdict);
-                    let failed = Failure::cause(lifecycle_cause(cause), Phase::Subscription);
+                    let failed =
+                        Failure::of_request(lifecycle_cause(cause), Phase::Subscription, phase);
                     failure = Some((failed, ends));
                     break;
                 }
@@ -2666,6 +2690,7 @@ impl Io<'_> {
                     verdict,
                     cause,
                     ends,
+                    ..
                 } => {
                     // A failure that ends the link is the connection's end,
                     // recorded before the close reports it, as a request's is
@@ -2696,12 +2721,17 @@ impl Io<'_> {
                 Posted::Refused {
                     verdict,
                     cause,
+                    phase,
                     ends,
-                } => (verdict, Some(cause), ends),
-                Posted::Stopped => (Verdict::Rejected, Some(RequestCause::NotConnected), None),
+                } => (verdict, Some((cause, phase)), ends),
+                Posted::Stopped => (
+                    Verdict::Rejected,
+                    Some((RequestCause::NotConnected, RequestPhase::Admission)),
+                    None,
+                ),
             };
             self.shared.lock().ledger.unregistered(address, verdict);
-            if let Some(cause) = cause {
+            if let Some((cause, phase)) = cause {
                 let mut state = self.shared.lock();
                 state.ledger.finish(token);
                 if state.closing {
@@ -2709,7 +2739,8 @@ impl Io<'_> {
                     state.close_cleanup_failure.get_or_insert(teardown);
                 }
                 drop(state);
-                let failure = Failure::cause(lifecycle_cause(cause), Phase::Subscription);
+                let failure =
+                    Failure::of_request(lifecycle_cause(cause), Phase::Subscription, phase);
                 let cleanup = Cleanup {
                     state: CleanupState::ConnectionClosed,
                     failure: Some(failure),

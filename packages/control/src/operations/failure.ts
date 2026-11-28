@@ -2,6 +2,7 @@
 // it, preserving the actual cause, where it occurred and the evidence the
 // operation had established.
 
+import type { LifecyclePhase } from "./lifecycle.js";
 import type { NativeRequestPhase } from "./native.js";
 
 /** E2 cause identifiers a shared operation can report. */
@@ -35,7 +36,12 @@ export type OperationPhase = NativeRequestPhase | "preparation";
  */
 export interface LaterCause {
   readonly code: OperationCause;
-  readonly phase: OperationPhase;
+  /**
+   * Where it occurred: an operation phase, or the lifecycle phase of a
+   * lifecycle record's failure that names no request phase
+   * (`cleanupFailureOf`).
+   */
+  readonly phase: OperationPhase | LifecyclePhase;
 }
 
 /** The serializable failure payload; it never relies on class identity. */

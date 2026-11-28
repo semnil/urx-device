@@ -4,6 +4,8 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use crate::request::RequestPhase;
+
 /// The E2 causes a lifecycle call can report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cause {
@@ -53,13 +55,36 @@ pub enum Phase {
 /// A lifecycle call's failure: its first cause, or cancellation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
-    Cause { code: Cause, phase: Phase },
-    Cancelled { phase: Phase },
+    Cause {
+        code: Cause,
+        phase: Phase,
+        /// The phase of the request whose failure this is, where the
+        /// transport records one: a subscription call's registration, or an
+        /// unregistration of its cleanup or of a release (K34). None for any
+        /// other cause, a close's among them.
+        request: Option<RequestPhase>,
+    },
+    Cancelled {
+        phase: Phase,
+    },
 }
 
 impl Failure {
     pub(crate) fn cause(code: Cause, phase: Phase) -> Self {
-        Failure::Cause { code, phase }
+        Failure::Cause {
+            code,
+            phase,
+            request: None,
+        }
+    }
+
+    /// The failure of a request this call sent, at `request`.
+    pub(crate) fn of_request(code: Cause, phase: Phase, request: RequestPhase) -> Self {
+        Failure::Cause {
+            code,
+            phase,
+            request: Some(request),
+        }
     }
 }
 

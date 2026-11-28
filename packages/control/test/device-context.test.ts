@@ -29,7 +29,7 @@ const device = (id: string, model = "URX44V", firmware: string | null = "1.2.3")
 const plain = (id: string, model = "URX44V") => ({ id, model });
 const failure = (f: unknown, cleanup: unknown) => ({ kind: "failure", failure: f, cleanup });
 const complete = { state: "complete", failure: null };
-const cause = (code: string, phase: string) => ({ kind: "cause", code, phase });
+const cause = (code: string, phase: string, request: string | null = null) => ({ kind: "cause", code, phase, request });
 
 describe("discovery outcome (D14, K37)", () => {
   it("keeps a complete list as reported, for either metadata mode", () => {
@@ -112,6 +112,12 @@ describe("lifecycle outcomes (K37)", () => {
     expect(validateLifecycle(failure(cause("teardown_timeout", "teardown"), complete), () => null)?.kind).toBe(
       "failure",
     );
+    // A subscription call's failure names the phase of the request that failed, its cleanup's too.
+    for (const request of ["validation", "admission", "send", "response", "delivery"]) {
+      const lost = cause("connection_lost", "subscription", request);
+      const record = failure(lost, { state: "connection_closed", failure: lost });
+      expect(validateLifecycle(record, () => null), request).toEqual(record);
+    }
   });
 
   it("reject inconsistent records, stage deadlines outside their phases included", () => {
@@ -130,6 +136,19 @@ describe("lifecycle outcomes (K37)", () => {
         failure: cause("device_rejected", "subscription"),
       }),
       failure(cause("discovery_timeout", "discovery"), { state: "complete", failure: [] }),
+      // A request phase outside a subscription call, one that is no phase, or none recorded at all.
+      failure(cause("connection_lost", "teardown", "response"), complete),
+      failure(cause("connection_lost", "connect", "send"), complete),
+      failure(cause("connection_lost", "subscription", "reply"), complete),
+      failure(cause("connection_lost", "subscription"), {
+        state: "connection_closed",
+        failure: cause("connection_lost", "teardown", "send"),
+      }),
+      failure({ kind: "cause", code: "connection_lost", phase: "subscription" }, complete),
+      failure(cause("connection_lost", "subscription"), {
+        state: "connection_closed",
+        failure: { kind: "cause", code: "connection_lost", phase: "subscription" },
+      }),
       { kind: "failure", failure: { kind: "cancelled", phase: "discovery" } },
       { kind: "success", value: [], cleanup: complete },
       { kind: "success" },

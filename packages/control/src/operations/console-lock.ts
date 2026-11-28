@@ -9,6 +9,7 @@
 
 import { marksOf, OperationFailureError, operationFailureOf, type OperationCause, type OperationFailure } from "./failure.js";
 import type { OperationContext, WriteGuard } from "./context.js";
+import { cleanupFailureOf } from "./lifecycle.js";
 import { readSetting } from "./registry.js";
 import type { ParameterAddress, Transport, TransportNotification, TransportOperation, TransportSubscription } from "./transport.js";
 
@@ -36,7 +37,11 @@ export class ConsoleLockGuard implements WriteGuard {
    * (K9): it settles once the registration is accepted, and nothing is read
    * yet. A refused admission or a failed registration rejects with its
    * cause, the guard's own resources released; where that release fails
-   * too, its code is the failure's `progress.cleanup`.
+   * too, its code is the failure's `progress.cleanup`. A failure the
+   * registration's own cleanup settled — the transport's unregistration of
+   * what it had registered, a cancelled registration's automatic one among
+   * them — is the failure's `later`, unless the registration's failure
+   * already carries one (`cleanupFailureOf`).
    */
   static async open(context: OperationContext): Promise<ConsoleLockGuard> {
     let operation: TransportOperation;
@@ -56,11 +61,13 @@ export class ConsoleLockGuard implements WriteGuard {
         (failure: unknown) => operationFailureOf(failure)?.code ?? "internal_error",
       );
       const failure = operationFailureOf(error);
+      const unregistration = failure?.later === undefined ? cleanupFailureOf(failure?.progress) : undefined;
       throw new OperationFailureError({
         code: failure?.code ?? "internal_error",
         phase: failure?.phase ?? "admission",
         progress: cleanup === null ? null : { cleanup },
         ...marksOf(failure),
+        ...(unregistration === undefined ? {} : { later: unregistration }),
       });
     }
     return guard;

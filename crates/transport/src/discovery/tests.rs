@@ -86,6 +86,7 @@ fn fails_with(code: Cause) -> Result<Vec<DeviceEntry>, Failure> {
     Err(Failure::Cause {
         code,
         phase: Phase::Discovery,
+        request: None,
     })
 }
 
@@ -305,6 +306,7 @@ fn a_discovery_that_loses_a_link_says_how() {
         failure: Failure::Cause {
             code: Cause::ConnectionLost,
             phase: Phase::Discovery,
+            request: None,
         },
         lost_link,
     };
@@ -349,6 +351,7 @@ fn a_discovery_that_loses_a_link_says_how() {
             Failure::Cause {
                 code: Cause::ConnectionLost,
                 phase: Phase::Discovery,
+                request: None,
             },
             "{case}"
         );
@@ -363,6 +366,7 @@ fn a_discovery_that_loses_a_link_says_how() {
             failure: Failure::Cause {
                 code: Cause::InvalidResponse,
                 phase: Phase::Discovery,
+                request: None,
             },
             lost_link: None,
         })
