@@ -673,6 +673,34 @@ fn cancelling_an_operation_drops_only_its_waiting_requests() {
     );
 }
 
+// What the connection keeps of a cancellation goes with the owner and the work it left: once both
+// are gone, nothing of it remains, however many owners were cancelled.
+#[test]
+fn a_cancelled_owner_leaves_nothing_on_the_connection() {
+    let peer = slow(Duration::from_millis(100));
+    let connection = connect(&peer);
+    let mut kept = Vec::new();
+    for n in 0..200 {
+        let operation = connection.create_operation().unwrap();
+        if n == 0 {
+            // One cancelled with a request sent and another waiting behind it.
+            let sent = submit(&connection, &operation, Request::GetNumeric(address(1)));
+            wait_until(|| parameter_uris(&peer).len() == 1);
+            let waiting = submit(&connection, &operation, Request::GetNumeric(address(2)));
+            operation.cancel();
+            assert_eq!(outcome(&waiting), cancelled());
+            assert!(matches!(outcome(&sent), Outcome::Success { .. }));
+        }
+        operation.cancel();
+        operation.cancel();
+        let late = submit(&connection, &operation, Request::GetNumeric(address(3)));
+        assert_eq!(outcome(&late), cancelled(), "a later submission is refused");
+        kept.push(Arc::downgrade(&operation.cancelled));
+    }
+    wait_until(|| kept.iter().all(|flag| flag.upgrade().is_none()));
+    assert_eq!(parameter_uris(&peer), ["/vd/parameters/1:0:0"]);
+}
+
 #[test]
 fn a_request_whose_send_deadline_passes_while_waiting_is_never_sent() {
     let peer = slow(Duration::from_millis(300));
