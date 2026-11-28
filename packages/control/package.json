@@ -1,6 +1,6 @@
 {
   "name": "@urx/device-control",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "Device definitions, codecs and semantic operations for YAMAHA URX series audio interfaces",
   "license": "MIT",
