@@ -198,13 +198,31 @@ describe("source gain (F03-G)", () => {
     ]);
   });
 
-  it("does not write a source whose write sequence needs evidence", async () => {
-    for (const source of ["aux", "sd-playback", "usb-main-a", "usb-main-b", "usb-main-c", "usb-sub", "hdmi"] as const) {
-      const { transport, context: c } = context("URX44V");
-      expect((await failureOf(writeSetting(c, "source.gain", { source }, 0)))?.code, source).toBe(
-        "unsupported_operation",
-      );
-      expect(transport.calls).toEqual([]);
+  it("writes every other source once at its representative instance, on every model it is on", async () => {
+    const pairs = [
+      ["aux", 9],
+      ["sd-playback", 11],
+      ["usb-main-a", 13],
+      ["usb-main-b", 14],
+      ["usb-main-c", 15],
+      ["usb-sub", 16],
+      ["hdmi", 17],
+    ] as const;
+    const on = { URX22: ["aux", "usb-main-a", "usb-main-b", "usb-main-c", "usb-sub"], URX44: ["aux", "sd-playback", "usb-main-a", "usb-main-b", "usb-main-c", "usb-sub"], URX44V: pairs.map(([s]) => s) };
+    for (const model of ["URX22", "URX44", "URX44V"] as const) {
+      for (const [source, paramId] of pairs) {
+        const { transport, context: c } = context(model, "setNumeric", accepted);
+        const label = `${model} ${source}`;
+        if ((on[model] as readonly string[]).includes(source)) {
+          expect(await writeSetting(c, "source.gain", { source }, -3), label).toEqual({ requested: -3, planned: -3, outcome: "accepted" });
+          expect(transport.calls, label).toEqual([
+            { method: "setNumeric", address: { paramId, x: "0", y: "0" }, value: "-300", ticket: "t0" },
+          ]);
+        } else {
+          expect((await failureOf(writeSetting(c, "source.gain", { source }, -3)))?.code, label).toBe("unsupported_operation");
+          expect(transport.calls, label).toEqual([]);
+        }
+      }
     }
   });
 
