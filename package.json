@@ -1,6 +1,6 @@
 {
   "name": "urx-device",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "Shared device definitions, operations and transport for YAMAHA URX series audio interfaces",
   "license": "MIT",
