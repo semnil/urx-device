@@ -634,10 +634,13 @@ fn a_request_too_large_for_one_frame_is_invalid_input_and_never_sent() {
 
 #[test]
 fn cancelling_an_operation_drops_only_its_waiting_requests() {
-    let peer = slow(Duration::from_millis(150));
+    let peer = unit(plain);
     let connection = connect(&peer);
     let a = connection.create_operation().unwrap();
     let b = connection.create_operation().unwrap();
+    // The active request's response is not read until the checks below have run, so the others
+    // wait behind it whatever the test's pace.
+    let read = hold_the_next_response_deadline(&connection);
     let a_active = submit(&connection, &a, Request::SetNumeric(address(1), 1));
     wait_until(|| parameter_uris(&peer).len() == 1);
     let a_waiting = submit(&connection, &a, Request::SetNumeric(address(2), 1));
@@ -653,6 +656,7 @@ fn cancelling_an_operation_drops_only_its_waiting_requests() {
         a_active.try_recv().is_err(),
         "the active request is still pending"
     );
+    drop(read);
     assert_eq!(
         outcome(&a_active),
         Outcome::Success {
@@ -671,6 +675,37 @@ fn cancelling_an_operation_drops_only_its_waiting_requests() {
             "/vd/parameters/3:0:0?operation=value"
         ]
     );
+}
+
+// What the connection keeps of a cancellation goes with the owner and the work it left: once both
+// are gone, nothing of it remains, however many owners were cancelled.
+#[test]
+fn a_cancelled_owner_leaves_nothing_on_the_connection() {
+    let peer = unit(plain);
+    let connection = connect(&peer);
+    let mut kept = Vec::new();
+    for n in 0..200 {
+        let operation = connection.create_operation().unwrap();
+        if n == 0 {
+            // One cancelled with a request sent and another waiting behind it: the first one's
+            // response is not read until the cancellation has returned.
+            let read = hold_the_next_response_deadline(&connection);
+            let sent = submit(&connection, &operation, Request::GetNumeric(address(1)));
+            wait_until(|| parameter_uris(&peer).len() == 1);
+            let waiting = submit(&connection, &operation, Request::GetNumeric(address(2)));
+            operation.cancel();
+            drop(read);
+            assert_eq!(outcome(&waiting), cancelled());
+            assert!(matches!(outcome(&sent), Outcome::Success { .. }));
+        }
+        operation.cancel();
+        operation.cancel();
+        let late = submit(&connection, &operation, Request::GetNumeric(address(3)));
+        assert_eq!(outcome(&late), cancelled(), "a later submission is refused");
+        kept.push(Arc::downgrade(&operation.cancelled));
+    }
+    wait_until(|| kept.iter().all(|flag| flag.upgrade().is_none()));
+    assert_eq!(parameter_uris(&peer), ["/vd/parameters/1:0:0"]);
 }
 
 #[test]

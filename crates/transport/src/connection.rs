@@ -122,6 +122,9 @@ struct HeldResult {
 
 struct Item {
     owner: u64,
+    /// Its owner's cancellation, held by the owner and by its work still
+    /// to run, and by nothing else.
+    cancelled: Arc<AtomicBool>,
     request: Request,
     frame: Vec<u8>,
     key: ReplyKey,
@@ -142,7 +145,6 @@ struct State {
     /// started cleanup included, before the teardown budget starts.
     job: bool,
     terminal: Option<RequestCause>,
-    cancelled_owners: Vec<u64>,
     next_owner: u64,
     ledger: Ledger,
     /// Subscription lifecycle work, run one job at a time ahead of requests.
@@ -182,7 +184,8 @@ type LifecycleDone = Box<dyn FnOnce(LifecycleOutcome) + Send>;
 enum Job {
     Activate {
         token: TokenId,
-        owner: u64,
+        /// The activating owner's cancellation.
+        cancelled: Arc<AtomicBool>,
         done: LifecycleDone,
     },
     Release {
@@ -373,9 +376,13 @@ enum CloseState {
 
 /// The owner of one logical operation's requests. Cancelling it completes
 /// its waiting requests unsent; a request already sent settles normally.
+/// What the connection keeps of its cancellation goes with the owner and
+/// the work it left: nothing of it accumulates on the connection.
 pub struct Operation {
     id: u64,
     shared: Weak<Shared>,
+    /// Set, under the connection's state lock, by `cancel`.
+    cancelled: Arc<AtomicBool>,
 }
 
 /// Why an opening or a discovery failed: its failure and, when it ended as
@@ -695,6 +702,7 @@ impl Connection {
         Ok(Operation {
             id: state.next_owner,
             shared: Arc::downgrade(&self.shared),
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -761,7 +769,7 @@ impl Connection {
                 ResultAdoption::none(),
             );
         }
-        if state.cancelled_owners.contains(&operation.id) {
+        if operation.cancelled.load(Ordering::SeqCst) {
             drop(state);
             let cancelled = Outcome::Failure {
                 failure: RequestFailure::Cancelled {
@@ -793,6 +801,7 @@ impl Connection {
         state.waiting_bytes += frame.len();
         state.waiting.push_back(Item {
             owner: operation.id,
+            cancelled: Arc::clone(&operation.cancelled),
             key: key_of(&request),
             request,
             frame,
@@ -1192,7 +1201,7 @@ impl Subscription {
         };
         state.jobs.push_back(Job::Activate {
             token: self.token,
-            owner: operation.id,
+            cancelled: Arc::clone(&operation.cancelled),
             done: Box::new(move |outcome| {
                 let _reserved = reservation;
                 done(outcome);
@@ -1297,9 +1306,7 @@ impl Operation {
             // Ordered with the start of every write (see write_frame).
             let gate = shared.link_end();
             let mut state = shared.lock();
-            if !state.cancelled_owners.contains(&self.id) {
-                state.cancelled_owners.push(self.id);
-            }
+            self.cancelled.store(true, Ordering::SeqCst);
             let (mine, others): (VecDeque<Item>, VecDeque<Item>) =
                 std::mem::take(&mut state.waiting)
                     .into_iter()
@@ -2303,8 +2310,12 @@ fn run_job(
         teardown: None,
     };
     match job {
-        Job::Activate { token, owner, done } => {
-            let activation = io.activate(token, owner);
+        Job::Activate {
+            token,
+            cancelled,
+            done,
+        } => {
+            let activation = io.activate(token, &cancelled);
             let mut deliveries = vec![(done, activation.outcome)];
             // An activation that a release stopped carried out that release:
             // its callers receive the cleanup's result.
@@ -2529,10 +2540,9 @@ impl Io<'_> {
         }
     }
 
-    fn activate(&mut self, token: TokenId, owner: u64) -> Activation {
+    fn activate(&mut self, token: TokenId, cancelled: &AtomicBool) -> Activation {
         let stopped = |state: &State| {
-            state.cancelled_owners.contains(&owner)
-                || state.releases.iter().any(|r| r.token == token)
+            cancelled.load(Ordering::SeqCst) || state.releases.iter().any(|r| r.token == token)
         };
         let done = |outcome, ends, released| Activation {
             outcome,
@@ -2777,7 +2787,7 @@ fn execute(
     item: &Item,
 ) -> (Outcome, Option<RequestCause>) {
     let Item {
-        owner,
+        cancelled,
         request,
         frame,
         key,
@@ -2785,7 +2795,12 @@ fn execute(
         gate,
         ..
     } = item;
-    if shared.lock().cancelled_owners.contains(owner) {
+    // Read under the state lock, as `cancel` sets it.
+    let stopped = {
+        let _state = shared.lock();
+        cancelled.load(Ordering::SeqCst)
+    };
+    if stopped {
         return (
             Outcome::Failure {
                 failure: RequestFailure::Cancelled {
@@ -2800,7 +2815,7 @@ fn execute(
     let unstarted = |state: &State| {
         if state.closing {
             Some(Stop::Closing)
-        } else if state.cancelled_owners.contains(owner) {
+        } else if cancelled.load(Ordering::SeqCst) {
             Some(Stop::Cancelled)
         } else if gate
             .as_ref()
