@@ -1,6 +1,9 @@
 version: 2
 # Every entry runs every day at 00:00 JST on a cron schedule; `interval: daily`
 # runs on weekdays only.
+#
+# Which of these pull requests merge on their own, and why: the header of
+# .github/workflows/dependabot-auto-merge.yml.
 updates:
   # Dev dependencies of the pnpm workspace (Dependabot reads pnpm-lock.yaml).
   - package-ecosystem: npm
