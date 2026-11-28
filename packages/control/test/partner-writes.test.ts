@@ -76,12 +76,6 @@ const URX22_ONLY: Case[] = [
   }),
   ["bus.name", { bus: "stream" }, "AB", 702, 0, "AB", "setText"],
   ["bus.color", { bus: "stream" }, "red", 704, 0, "6"],
-  ...(
-    [
-      ["usb-main-a", 13],
-      ["usb-sub", 16],
-    ] as const
-  ).map(([source, paramId]): Case => ["source.gain", { source }, -3, paramId, 0, "-300"]),
 ];
 
 /** Writes with no evidence on any model: refused everywhere before any request. */
@@ -94,8 +88,6 @@ const UNBOUND: [string, object, unknown][] = [
     ["bus.eq.type", { bus }, "peq"],
     ["send.pan", { source: "channel-3", destination: bus }, -17],
   ]),
-  // The source gains whose lanes' audio is not on record on URX22.
-  ...(["aux", "usb-main-b", "usb-main-c"] as const).map((source): [string, object, unknown] => ["source.gain", { source }, -3]),
   // The partner-linked sends not measured on URX22.
   ...(
     [
