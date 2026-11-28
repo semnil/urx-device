@@ -2,7 +2,7 @@
 // at the adapter boundary like single-request records (K33/K34).
 
 import type { LaterCause, OperationCause, OperationPhase } from "./failure.js";
-import type { NativeRequestCause } from "./native.js";
+import type { NativeRequestCause, NativeRequestPhase } from "./native.js";
 
 export type LifecyclePhase = "discovery" | "connect" | "identity" | "admission" | "subscription" | "teardown";
 
@@ -15,16 +15,27 @@ export type LifecycleCause =
   | "discovery_timeout"
   | "connect_timeout";
 
-export type LifecycleFailure =
-  | { kind: "cause"; code: LifecycleCause; phase: LifecyclePhase }
-  | { kind: "cancelled"; phase: LifecyclePhase };
+/**
+ * A lifecycle call's failure for a cause. `request` is the phase of the
+ * request whose failure it is, where the record names one: a subscription
+ * call's registration, or an unregistration of its cleanup or of a release
+ * (K34). Null for any other cause.
+ */
+export interface LifecycleCauseFailure {
+  kind: "cause";
+  code: LifecycleCause;
+  phase: LifecyclePhase;
+  request: NativeRequestPhase | null;
+}
+
+export type LifecycleFailure = LifecycleCauseFailure | { kind: "cancelled"; phase: LifecyclePhase };
 
 export type CleanupState = "complete" | "connection_closed" | "incomplete";
 
 export interface Cleanup {
   state: CleanupState;
   /** One structured cleanup failure, never a list. */
-  failure: { kind: "cause"; code: LifecycleCause; phase: LifecyclePhase } | null;
+  failure: LifecycleCauseFailure | null;
 }
 
 export type LifecycleOutcome<T> =
@@ -65,6 +76,7 @@ const CAUSES: readonly string[] = [
   "connect_timeout",
 ];
 const CLEANUP_STATES: readonly string[] = ["complete", "connection_closed", "incomplete"];
+const REQUEST_PHASES: readonly string[] = ["validation", "admission", "send", "response", "delivery"];
 
 type Fields = Readonly<Record<string, unknown>>;
 
@@ -82,17 +94,26 @@ const DEADLINE_PHASES: Readonly<Record<string, readonly string[]>> = {
   connect_timeout: ["connect", "identity"],
 };
 
-function causeOf(value: unknown): { kind: "cause"; code: LifecycleCause; phase: LifecyclePhase } | undefined {
-  if (!hasExactly(value, ["kind", "code", "phase"]) || value.kind !== "cause") {
+function causeOf(value: unknown): LifecycleCauseFailure | undefined {
+  if (!hasExactly(value, ["kind", "code", "phase", "request"]) || value.kind !== "cause") {
     return undefined;
   }
-  const { code, phase } = value;
+  const { code, phase, request } = value;
   if (typeof code !== "string" || !CAUSES.includes(code) || typeof phase !== "string" || !PHASES.includes(phase)) {
+    return undefined;
+  }
+  // A request phase is named only for a subscription call's requests.
+  if (request !== null && (typeof request !== "string" || !REQUEST_PHASES.includes(request) || phase !== "subscription")) {
     return undefined;
   }
   const phases = DEADLINE_PHASES[code];
   return phases === undefined || phases.includes(phase)
-    ? { kind: "cause", code: code as LifecycleCause, phase: phase as LifecyclePhase }
+    ? {
+        kind: "cause",
+        code: code as LifecycleCause,
+        phase: phase as LifecyclePhase,
+        request: request as NativeRequestPhase | null,
+      }
     : undefined;
 }
 
@@ -138,11 +159,11 @@ const OPERATION_CAUSES: readonly string[] = [
 ];
 
 /**
- * Where a cleanup's failure occurred, as an operation phase: a lifecycle
- * record names the lifecycle phase only, so the phase follows the cause as
- * K34 places it — causes before sending at admission, a send deadline, a lost
- * link or a teardown budget while sending, a verdict or its absence at the
- * response, and the remaining causes at delivery.
+ * Where a cleanup failure that names no request occurred, as an operation
+ * phase: the record names the lifecycle phase only, so the phase follows the
+ * cause as K34 places it — causes before sending at admission, a send
+ * deadline, a lost link or a teardown budget while sending, a verdict or its
+ * absence at the response, and the remaining causes at delivery.
  */
 function phaseOfCause(code: OperationCause): OperationPhase {
   switch (code) {
@@ -168,9 +189,10 @@ function phaseOfCause(code: OperationCause): OperationPhase {
  * that goes beside the call's failure (E3, `OperationFailure.later`): the
  * transport's release of what the call had registered, its automatic
  * unregistration of a registration the owner's cancellation stopped among
- * them. An adapter carries that cleanup as the call's `progress.cleanup`
- * (`TransportSubscription.activate`). None when the progress carries no
- * valid cleanup, or the cleanup failed nothing.
+ * them, at the phase of the request that failed. An adapter carries that
+ * cleanup as the call's `progress.cleanup` (`TransportSubscription.activate`).
+ * None when the progress carries no valid cleanup, or the cleanup failed
+ * nothing.
  */
 export function cleanupFailureOf(progress: unknown): LaterCause | undefined {
   if (typeof progress !== "object" || progress === null || !("cleanup" in progress)) {
@@ -181,7 +203,7 @@ export function cleanupFailureOf(progress: unknown): LaterCause | undefined {
     return undefined;
   }
   const code = (OPERATION_CAUSES.includes(failure.code) ? failure.code : "internal_error") as OperationCause;
-  return { code, phase: phaseOfCause(code) };
+  return { code, phase: failure.request ?? phaseOfCause(code) };
 }
 
 /**

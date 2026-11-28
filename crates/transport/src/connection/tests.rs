@@ -162,6 +162,7 @@ fn open_refuses_a_unit_that_is_absent_or_not_the_one_requested() {
         Err(Failure::Cause {
             code,
             phase: Phase::Identity,
+            request: None,
         })
     };
     let cases = [
@@ -207,6 +208,7 @@ fn lost_while_opening(lost_link: Option<LinkLoss>) -> Result<(), LinkFailure> {
         failure: Failure::Cause {
             code: Cause::ConnectionLost,
             phase: Phase::Identity,
+            request: None,
         },
         lost_link,
     })
@@ -258,6 +260,7 @@ fn an_opening_that_loses_its_link_says_how() {
             Failure::Cause {
                 code: Cause::ConnectionLost,
                 phase: Phase::Identity,
+                request: None,
             },
             "read {read}"
         );
@@ -301,7 +304,8 @@ fn open_fails_on_an_unreachable_or_silent_unit() {
         result(closed),
         Err(Failure::Cause {
             code: Cause::ConnectionFailed,
-            phase: Phase::Connect
+            phase: Phase::Connect,
+            request: None
         })
     );
 
@@ -317,7 +321,8 @@ fn open_fails_on_an_unreachable_or_silent_unit() {
             .map_err(|failed| failed.failure),
         Err(Failure::Cause {
             code: Cause::ConnectTimeout,
-            phase: Phase::Identity
+            phase: Phase::Identity,
+            request: None
         })
     );
     assert!(started.elapsed() < Duration::from_secs(1));
@@ -1551,7 +1556,8 @@ fn a_reader_that_does_not_finish_in_the_teardown_budget_is_incomplete() {
         outcome,
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
-            phase: Phase::Teardown
+            phase: Phase::Teardown,
+            request: None
         })
     );
     assert!(
@@ -1695,7 +1701,8 @@ fn a_callback_that_outlasts_the_teardown_budget_makes_the_close_incomplete() {
         outcome,
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
-            phase: Phase::Teardown
+            phase: Phase::Teardown,
+            request: None
         })
     );
     assert!(
@@ -1726,7 +1733,8 @@ fn a_slow_waiting_request_callback_is_bounded_by_the_teardown_budget() {
         connection.close(Duration::from_millis(300)),
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
-            phase: Phase::Teardown
+            phase: Phase::Teardown,
+            request: None
         }),
         "the waiting outcome was not delivered within the budget"
     );
@@ -1798,7 +1806,8 @@ fn a_thread_seen_finished_only_after_the_deadline_is_incomplete() {
         ),
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
-            phase: Phase::Teardown
+            phase: Phase::Teardown,
+            request: None
         })
     );
     let done = thread::spawn(|| {});
@@ -1837,7 +1846,8 @@ fn a_thread_whose_exit_does_not_finish_cannot_hold_the_close_past_its_budget() {
         ),
         CloseOutcome::Incomplete(Failure::Cause {
             code: Cause::TeardownTimeout,
-            phase: Phase::Teardown
+            phase: Phase::Teardown,
+            request: None
         })
     );
     assert!(
@@ -1967,6 +1977,7 @@ fn could_not_finish() -> CloseOutcome {
     CloseOutcome::Incomplete(Failure::Cause {
         code: Cause::InternalError,
         phase: Phase::Teardown,
+        request: None,
     })
 }
 
@@ -2117,7 +2128,8 @@ fn what_a_close_takes_is_delivered_even_when_the_end_stops_the_threads_right_aft
             outcome.map_err(|failed| failed.failure),
             Err(Failure::Cause {
                 code: Cause::NotConnected,
-                phase: Phase::Subscription
+                phase: Phase::Subscription,
+                request: None
             }),
             "{call}"
         );
@@ -2170,6 +2182,7 @@ fn a_waiting_callback_that_blocks_holds_up_no_close() {
             CloseOutcome::Incomplete(Failure::Cause {
                 code: Cause::TeardownTimeout,
                 phase: Phase::Teardown,
+                request: None,
             })
         };
         assert_eq!(
@@ -2256,7 +2269,8 @@ fn an_opening_with_no_thread_to_start_fails_and_leaves_nothing_running() {
             result.map(|_| ()).map_err(|failed| failed.failure),
             Err(Failure::Cause {
                 code: Cause::InternalError,
-                phase: Phase::Connect
+                phase: Phase::Connect,
+                request: None
             }),
             "{allowed} thread(s) allowed"
         );
@@ -2349,6 +2363,7 @@ mod lifecycle {
     use crate::lifecycle::{
         Cause, Cleanup, CleanupState, Control, Failure, LifecycleFailure, LifecycleOutcome, Phase,
     };
+    use crate::request::RequestPhase;
     use crate::subscription::SubscriptionAddress;
     use crate::test_peer::{get_reply, line, uri_of, Peer};
     use crate::wire::{MeterAddress, ParameterAddress};
@@ -2461,22 +2476,28 @@ mod lifecycle {
             .expect("an outcome")
     }
 
-    fn failed(code: Cause, cleanup: Cleanup) -> LifecycleOutcome {
+    /// A subscription call's failure: `code`, at `request` when a request
+    /// of the call failed.
+    fn failed(code: Cause, request: Option<RequestPhase>, cleanup: Cleanup) -> LifecycleOutcome {
         Err(LifecycleFailure {
             failure: Failure::Cause {
                 code,
                 phase: Phase::Subscription,
+                request,
             },
             cleanup,
         })
     }
 
-    fn closed_by(code: Cause) -> Cleanup {
+    /// A cleanup that ended the connection, failing its unregistration at
+    /// `request`.
+    fn closed_by(code: Cause, request: RequestPhase) -> Cleanup {
         Cleanup {
             state: CleanupState::ConnectionClosed,
             failure: Some(Failure::Cause {
                 code,
                 phase: Phase::Subscription,
+                request: Some(request),
             }),
         }
     }
@@ -2522,7 +2543,11 @@ mod lifecycle {
             .unwrap();
         assert_eq!(
             settled(&activate(&connection, &new)),
-            failed(Cause::DeviceRejected, Cleanup::COMPLETE)
+            failed(
+                Cause::DeviceRejected,
+                Some(RequestPhase::Response),
+                Cleanup::COMPLETE
+            )
         );
         assert_eq!(posts(&peer), [reg(1), reg(2), reg(3), reg(4), unreg(3)]);
         counted_as_received(&connection, &peer);
@@ -2634,7 +2659,11 @@ mod lifecycle {
         let token = connection.prepare_subscription(&[p(1), p(2)]).unwrap();
         assert_eq!(
             settled(&activate(&connection, &token)),
-            failed(Cause::DeviceRejected, closed_by(Cause::DeviceRejected))
+            failed(
+                Cause::DeviceRejected,
+                Some(RequestPhase::Response),
+                closed_by(Cause::DeviceRejected, RequestPhase::Response),
+            )
         );
         assert!(connection.terminal().is_some());
         assert!(connection.prepare_subscription(&[p(9)]).is_err());
@@ -2658,6 +2687,7 @@ mod lifecycle {
             settled(&activate(&connection, &token)),
             failed(
                 Cause::ResponseTimeout,
+                Some(RequestPhase::Response),
                 Cleanup {
                     state: CleanupState::ConnectionClosed,
                     failure: None
@@ -2685,7 +2715,8 @@ mod lifecycle {
             refused.failure,
             Failure::Cause {
                 code: Cause::PreconditionFailed,
-                phase: Phase::Admission
+                phase: Phase::Admission,
+                request: None
             }
         );
         assert!(posts(&peer).is_empty());
@@ -2696,7 +2727,8 @@ mod lifecycle {
             refused.failure,
             Failure::Cause {
                 code: Cause::NotConnected,
-                phase: Phase::Admission
+                phase: Phase::Admission,
+                request: None
             }
         );
     }
@@ -2755,7 +2787,7 @@ mod lifecycle {
         assert_eq!(posts(&peer), [reg(1), unreg(1)]);
         assert_eq!(
             settled(&activate(&connection, &token)),
-            failed(Cause::PreconditionFailed, Cleanup::COMPLETE),
+            failed(Cause::PreconditionFailed, None, Cleanup::COMPLETE),
             "the released token cannot be activated again"
         );
     }
@@ -2782,7 +2814,11 @@ mod lifecycle {
             } else {
                 assert_eq!(
                     a,
-                    failed(Cause::DeviceRejected, closed_by(Cause::DeviceRejected))
+                    failed(
+                        Cause::DeviceRejected,
+                        Some(RequestPhase::Response),
+                        closed_by(Cause::DeviceRejected, RequestPhase::Response),
+                    )
                 );
             }
             assert_eq!(posts(&peer), [reg(1), unreg(1)]);
@@ -2797,7 +2833,7 @@ mod lifecycle {
         assert_eq!(settled(&release(&token)), Ok(()));
         assert_eq!(
             settled(&activate(&connection, &token)),
-            failed(Cause::PreconditionFailed, Cleanup::COMPLETE)
+            failed(Cause::PreconditionFailed, None, Cleanup::COMPLETE)
         );
         assert!(posts(&peer).is_empty());
     }
@@ -2823,12 +2859,23 @@ mod lifecycle {
             let (a, b) = (settled(&first), settled(&second));
             assert_eq!(a, b);
             if code == 200 {
-                assert_eq!(outcome, failed(Cause::DeviceRejected, Cleanup::COMPLETE));
+                assert_eq!(
+                    outcome,
+                    failed(
+                        Cause::DeviceRejected,
+                        Some(RequestPhase::Response),
+                        Cleanup::COMPLETE
+                    )
+                );
                 assert_eq!(a, Ok(()));
             } else {
                 assert_eq!(
                     a,
-                    failed(Cause::DeviceRejected, closed_by(Cause::DeviceRejected))
+                    failed(
+                        Cause::DeviceRejected,
+                        Some(RequestPhase::Response),
+                        closed_by(Cause::DeviceRejected, RequestPhase::Response),
+                    )
                 );
             }
             assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1)], "code {code}");
@@ -2848,7 +2895,11 @@ mod lifecycle {
         assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
         assert_eq!(
             settled(&activated),
-            failed(Cause::DeviceRejected, Cleanup::COMPLETE)
+            failed(
+                Cause::DeviceRejected,
+                Some(RequestPhase::Response),
+                Cleanup::COMPLETE
+            )
         );
         assert_eq!(
             settled(&released),
@@ -2957,7 +3008,8 @@ mod lifecycle {
             connection.close(TEARDOWN),
             CloseOutcome::Failed(Failure::Cause {
                 code: Cause::DeviceRejected,
-                phase: Phase::Teardown
+                phase: Phase::Teardown,
+                request: None
             })
         );
         assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1)]);
@@ -2965,7 +3017,8 @@ mod lifecycle {
             connection.close(TEARDOWN),
             CloseOutcome::Failed(Failure::Cause {
                 code: Cause::DeviceRejected,
-                phase: Phase::Teardown
+                phase: Phase::Teardown,
+                request: None
             }),
             "a repeated close shares the outcome and sends nothing"
         );
@@ -3023,6 +3076,7 @@ mod lifecycle {
         let lost = CloseOutcome::Failed(Failure::Cause {
             code: Cause::ConnectionLost,
             phase: Phase::Teardown,
+            request: None,
         });
 
         let (connection, _keep) = lost_at_close(Meets::LostPush);
@@ -3048,6 +3102,113 @@ mod lifecycle {
     }
 
     #[test]
+    fn an_unregistration_lost_with_the_link_names_where_the_request_was() {
+        /// How the unit meets the unregistration.
+        #[derive(Clone, Copy)]
+        enum Meets {
+            /// A device-lost push and no reply.
+            LostPush,
+            /// Its end of the link closing.
+            Close,
+            /// Nothing: the test shuts the connection's sending side down
+            /// first, so the unregistration's write fails.
+            Nothing,
+        }
+        // `refused`: the registration the unit refuses, so the activation's
+        // cleanup unregisters what it registered; none, and the test
+        // releases the activated subscription.
+        let run = |meets: Meets, refused: Option<u32>| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (keep, kept) = mpsc::channel::<()>();
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                for request in BufReader::new(stream).lines() {
+                    let Ok(request) = request else { break };
+                    let request: Value = serde_json::from_str(&request).unwrap();
+                    let uri = uri_of(&request).to_string();
+                    let reply = match uri.as_str() {
+                        "/vd/synchronize" => get_reply("/vd/synchronize", online(ID)),
+                        "/vd/device" => get_reply("/vd/device", firmware()),
+                        uri if uri.ends_with("operation=regist") => {
+                            let code = if refused.is_some_and(|id| uri == reg(id)) {
+                                409
+                            } else {
+                                200
+                            };
+                            line(
+                                json!({ "vdp": { "method": "post", "uri": uri, "data": { "response_code": code } } }),
+                            )
+                        }
+                        _ => match meets {
+                            Meets::LostPush => line(
+                                json!({ "vdp": { "method": "notify", "uri": "/vd/synchronize", "data": { "sync_status": "offline" } } }),
+                            ),
+                            Meets::Close => return,
+                            Meets::Nothing => continue,
+                        },
+                    };
+                    writer.write_all(&reply).unwrap();
+                }
+                let _ = kept.recv();
+            });
+            let connection = open(port, ID, &options(), &Control::new()).unwrap();
+            let outcome = match refused {
+                Some(id) => {
+                    let token = connection.prepare_subscription(&[p(1), p(id)]).unwrap();
+                    settled(&activate(&connection, &token))
+                }
+                None => {
+                    let token = connection.prepare_subscription(&[p(1)]).unwrap();
+                    assert_eq!(settled(&activate(&connection, &token)), Ok(()));
+                    if let Meets::Nothing = meets {
+                        super::super::lock(&connection.sock)
+                            .as_ref()
+                            .unwrap()
+                            .shutdown(Shutdown::Write)
+                            .unwrap();
+                    }
+                    settled(&release(&token))
+                }
+            };
+            drop(keep);
+            outcome
+        };
+        let lost = |request| closed_by(Cause::ConnectionLost, request);
+        // Written whole, the unregistration was waiting for its response.
+        for meets in [Meets::LostPush, Meets::Close] {
+            assert_eq!(
+                run(meets, Some(2)),
+                failed(
+                    Cause::DeviceRejected,
+                    Some(RequestPhase::Response),
+                    lost(RequestPhase::Response)
+                ),
+                "the activation's cleanup"
+            );
+            assert_eq!(
+                run(meets, None),
+                failed(
+                    Cause::ConnectionLost,
+                    Some(RequestPhase::Response),
+                    lost(RequestPhase::Response)
+                ),
+                "a release"
+            );
+        }
+        // Its write failing, it was sending.
+        assert_eq!(
+            run(Meets::Nothing, None),
+            failed(
+                Cause::ConnectionLost,
+                Some(RequestPhase::Send),
+                lost(RequestPhase::Send)
+            )
+        );
+    }
+
+    #[test]
     fn unregistrations_at_close_stop_at_the_teardown_budget() {
         let peer = unit(Duration::from_millis(400), |_| Some(200));
         let connection = connect(&peer);
@@ -3058,7 +3219,8 @@ mod lifecycle {
             connection.close(Duration::from_millis(200)),
             CloseOutcome::Incomplete(Failure::Cause {
                 code: Cause::TeardownTimeout,
-                phase: Phase::Teardown
+                phase: Phase::Teardown,
+                request: None
             })
         );
         assert!(
@@ -3086,7 +3248,8 @@ mod lifecycle {
             connection.close(Duration::from_millis(200)),
             CloseOutcome::Incomplete(Failure::Cause {
                 code: Cause::TeardownTimeout,
-                phase: Phase::Teardown
+                phase: Phase::Teardown,
+                request: None
             })
         );
         let started = std::time::Instant::now();
@@ -3100,7 +3263,8 @@ mod lifecycle {
             connection.shared.lock().teardown,
             Some(Some(Failure::Cause {
                 code: Cause::TeardownTimeout,
-                phase: Phase::Teardown
+                phase: Phase::Teardown,
+                request: None
             }))
         );
         // The unregistration was written whole and never answered: it counts.
@@ -3143,7 +3307,8 @@ mod lifecycle {
             connection.close(Duration::from_millis(1200)),
             CloseOutcome::Failed(Failure::Cause {
                 code: Cause::ResponseTimeout,
-                phase: Phase::Teardown
+                phase: Phase::Teardown,
+                request: None
             })
         );
     }
@@ -3227,7 +3392,8 @@ mod lifecycle {
                 closed,
                 CloseOutcome::Failed(Failure::Cause {
                     code: Cause::DeviceRejected,
-                    phase: Phase::Teardown
+                    phase: Phase::Teardown,
+                    request: None
                 }),
                 "activation: {activation}"
             );
@@ -3251,7 +3417,11 @@ mod lifecycle {
         let closer = close_after(&connection, &peer, 3);
         assert_eq!(
             settled(&activated),
-            failed(Cause::DeviceRejected, Cleanup::COMPLETE)
+            failed(
+                Cause::DeviceRejected,
+                Some(RequestPhase::Response),
+                Cleanup::COMPLETE
+            )
         );
         assert_eq!(closer.join().unwrap(), CloseOutcome::Closed);
         assert_eq!(posts(&peer), [reg(1), reg(2), unreg(1)]);
@@ -3363,7 +3533,7 @@ mod notifications {
     use crate::connection::{open_with, CloseOutcome, Connection, NotificationHandler};
     use crate::delivery::{NotificationBatch, MAX_PENDING_NOTIFICATIONS};
     use crate::lifecycle::{Cause, Control, Failure, Phase};
-    use crate::request::{Outcome, Request, RequestCause};
+    use crate::request::{Outcome, Request, RequestCause, RequestPhase};
     use crate::subscription::SubscriptionAddress;
     use crate::test_peer::{get_reply, line, uri_of};
     use crate::wire::{MeterAddress, Notification, ParameterAddress};
@@ -3743,7 +3913,8 @@ mod notifications {
             failure.failure,
             Failure::Cause {
                 code: Cause::NotificationOverflow,
-                phase: Phase::Subscription
+                phase: Phase::Subscription,
+                request: Some(RequestPhase::Delivery)
             }
         );
         assert_eq!(
@@ -4793,7 +4964,8 @@ mod notifications {
             failure.failure,
             Failure::Cause {
                 code: Cause::ConnectionLost,
-                phase: Phase::Subscription
+                phase: Phase::Subscription,
+                request: Some(RequestPhase::Delivery)
             }
         );
     }
@@ -4905,7 +5077,8 @@ mod notifications {
             closed,
             CloseOutcome::Incomplete(Failure::Cause {
                 code: Cause::InternalError,
-                phase: Phase::Teardown
+                phase: Phase::Teardown,
+                request: None
             }),
             "no helper thread to finish the close on"
         );
@@ -5094,7 +5267,8 @@ mod notifications {
                 outcome.map_err(|failed| failed.failure),
                 Err(Failure::Cause {
                     code: Cause::InternalError,
-                    phase: Phase::Subscription
+                    phase: Phase::Subscription,
+                    request: None
                 }),
                 "{call}"
             );
@@ -5131,7 +5305,8 @@ mod notifications {
             failure.failure,
             Failure::Cause {
                 code: Cause::DeviceRejected,
-                phase: Phase::Subscription
+                phase: Phase::Subscription,
+                request: Some(RequestPhase::Response)
             }
         );
         super::wait_until(|| connection.terminal().is_some());

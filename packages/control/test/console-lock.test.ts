@@ -134,21 +134,31 @@ describe("Console Lock write guard (F20-L-A)", () => {
   // transport's automatic unregistration of a registration the owner's cancellation stopped — goes
   // beside it once, as the failure's `later`, whatever the guard's own release then answers.
   it("report the failure a registration's own cleanup settled beside the registration's", async () => {
-    const cleanup = (code: string) => ({ cleanup: { state: "incomplete", failure: { kind: "cause", code, phase: "subscription" } } });
-    for (const [code, phase] of [
-      ["device_rejected", "response"],
-      ["response_timeout", "response"],
-      ["connection_lost", "send"],
-      ["send_timeout", "send"],
-      ["not_connected", "admission"],
-      ["notification_overflow", "delivery"],
-      ["identity_error", "delivery"],
+    const cleanup = (code: string, request: string | null = null) => ({
+      cleanup: { state: "incomplete", failure: { kind: "cause", code, phase: "subscription", request } },
+    });
+    for (const [code, request, phase] of [
+      // The phase the failed unregistration was in, where the record names it.
+      ["connection_lost", "send", "send"],
+      ["connection_lost", "response", "response"],
+      ["send_timeout", "admission", "admission"],
+      ["invalid_response", "send", "send"],
+      ["notification_overflow", "response", "response"],
+      ["internal_error", "send", "send"],
+      // A failure that names no request is placed where K34 places its cause.
+      ["device_rejected", null, "response"],
+      ["response_timeout", null, "response"],
+      ["connection_lost", null, "send"],
+      ["send_timeout", null, "send"],
+      ["not_connected", null, "admission"],
+      ["notification_overflow", null, "delivery"],
+      ["identity_error", null, "delivery"],
     ] as const) {
       const t = new FakeTransport();
-      t.activation = new OperationFailureError({ code: "interrupted", phase: "send", progress: cleanup(code), cancelled: true });
+      t.activation = new OperationFailureError({ code: "interrupted", phase: "send", progress: cleanup(code, request), cancelled: true });
       t.releaseFailure = new OperationFailureError({ code: "not_connected", phase: "admission", progress: null });
       const failure = await failureOf(ConsoleLockGuard.open(new OperationContext(t, "URX44")));
-      expect(failure, code).toEqual({
+      expect(failure, `${code} ${request}`).toEqual({
         code: "interrupted",
         phase: "send",
         progress: { cleanup: "not_connected" },
@@ -158,18 +168,20 @@ describe("Console Lock write guard (F20-L-A)", () => {
     }
     // A registration's own failure keeps its cause, its cleanup's failure beside it.
     const own = new FakeTransport();
-    own.activation = new OperationFailureError({ code: "device_rejected", phase: "response", progress: cleanup("response_timeout") });
+    own.activation = new OperationFailureError({ code: "device_rejected", phase: "response", progress: cleanup("response_timeout", "response") });
     expect(await failureOf(ConsoleLockGuard.open(new OperationContext(own, "URX44")))).toEqual({
       code: "device_rejected",
       phase: "response",
       progress: null,
       later: { code: "response_timeout", phase: "response" },
     });
-    // A cleanup that failed nothing, or a progress that is no cleanup, adds nothing; a later the
-    // registration's failure already carries stays the one.
+    // A cleanup that failed nothing, or a progress that is no valid cleanup, adds nothing; a later
+    // the registration's failure already carries stays the one.
     for (const progress of [
       { cleanup: { state: "complete", failure: null } },
-      { cleanup: { state: "incomplete", failure: { kind: "cause", code: "connect_timeout", phase: "subscription" } } },
+      { cleanup: { state: "incomplete", failure: { kind: "cause", code: "connect_timeout", phase: "subscription", request: null } } },
+      { cleanup: { state: "incomplete", failure: { kind: "cause", code: "connection_lost", phase: "subscription" } } },
+      { cleanup: { state: "incomplete", failure: { kind: "cause", code: "connection_lost", phase: "subscription", request: "reply" } } },
       { cleanup: "teardown_timeout" },
       { other: 1 },
       null,
@@ -182,7 +194,7 @@ describe("Console Lock write guard (F20-L-A)", () => {
     carried.activation = new OperationFailureError({
       code: "interrupted",
       phase: "send",
-      progress: cleanup("device_rejected"),
+      progress: cleanup("device_rejected", "response"),
       cancelled: true,
       later: { code: "invalid_response", phase: "response" },
     });

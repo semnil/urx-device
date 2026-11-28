@@ -617,7 +617,8 @@ mod tests {
             ),
             Err(Failure::Cause {
                 code: Cause::ResponseTimeout,
-                phase: Phase::Discovery
+                phase: Phase::Discovery,
+                request: None
             }),
             "expired before the cancellation"
         );
@@ -643,6 +644,7 @@ mod tests {
         let expired = Err(Failure::Cause {
             code: Cause::ResponseTimeout,
             phase,
+            request: None,
         });
         // (cancellation time read, clock read before it)
         let cases = [
@@ -678,7 +680,8 @@ mod tests {
             stop(&control, &bound(at), Phase::Discovery),
             Err(Failure::Cause {
                 code: Cause::ResponseTimeout,
-                phase: Phase::Discovery
+                phase: Phase::Discovery,
+                request: None
             })
         );
     }
@@ -699,7 +702,8 @@ mod tests {
             ),
             Err(Failure::Cause {
                 code: Cause::ResponseTimeout,
-                phase: Phase::Connect
+                phase: Phase::Connect,
+                request: None
             })
         );
     }
