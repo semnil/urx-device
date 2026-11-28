@@ -11,7 +11,7 @@ export { decodeFileSetting, dryRunSetting, dryRunSettingAfter, previewSetting, r
 export type { DecimalWriteArgs, ReadHandler, SettingHandlers, WriteHandler } from "./registry.js";
 export type * from "./results.js";
 export type * from "./transport.js";
-export { validateDeviceList, validateDiscovery, validateLifecycle } from "./lifecycle.js";
+export { cleanupFailureOf, validateDeviceList, validateDiscovery, validateLifecycle } from "./lifecycle.js";
 export type * from "./lifecycle.js";
 export { PLAN_ITEM_LIMIT, planCurrent } from "../composition/plan.js";
 export type { CurrentPlan, Omission, PlannedStep } from "../composition/plan.js";

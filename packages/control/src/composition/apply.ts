@@ -14,6 +14,7 @@ import type { OperationContext, WriteGuard } from "../operations/context.js";
 import type { LaterCause, OperationCause, OperationPhase } from "../operations/failure.js";
 import type { ParameterAddress, TransportNotification, TransportOperation, TransportSubscription } from "../operations/transport.js";
 import { OperationFailureError, operationFailureOf } from "../operations/failure.js";
+import { cleanupFailureOf } from "../operations/lifecycle.js";
 import { DEVICE_RULES } from "../catalog/device.js";
 import { dryRunSettingAfter, readSetting, writeSetting, type WriteArgs } from "../operations/registry.js";
 import { codecOf } from "../operations/rules.js";
@@ -213,6 +214,9 @@ async function watchRate(context: OperationContext, fileRate: number, record: Im
   const failed = (error: unknown): true => {
     const failure = operationFailureOf(error);
     record.failure(failure?.code ?? "internal_error", failure?.phase ?? "preparation", failure?.cancelled !== true);
+    // A failure the registration's own cleanup settled goes beside it, as the guard's does (`cleanupFailureOf`).
+    const unregistration = cleanupFailureOf(failure?.progress);
+    if (unregistration !== undefined) record.failure(unregistration.code, unregistration.phase, true);
     return true;
   };
   let operation: TransportOperation;

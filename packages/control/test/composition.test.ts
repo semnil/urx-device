@@ -1157,6 +1157,15 @@ describe("CURRENT composition (K36, F18)", () => {
     // The rate registration fails: its own cause stays, the failed release beside it.
     const activation = await apply((t) => t.script("getNumeric", read("0")), new OperationFailureError({ code: "device_rejected", phase: "response", progress: null }));
     expect(outcomes(activation)).toEqual(["device_rejected", "connection_lost", "not_sent", "not_sent"]);
+    // A failure the registration's own cleanup settled is the cause that goes beside its own (E3), as
+    // the guard's is (`cleanupFailureOf`).
+    const unregistration = { cleanup: { state: "incomplete", failure: { kind: "cause", code: "response_timeout", phase: "subscription" } } };
+    const settled = await apply(
+      (t) => t.script("getNumeric", read("0")),
+      new OperationFailureError({ code: "device_rejected", phase: "response", progress: unregistration }),
+    );
+    expect([...outcomes(settled), settled.later]).toEqual(["device_rejected", "connection_lost", "not_sent", "not_sent", { code: "response_timeout", phase: "response" }]);
+    expect(activation.later, "a registration whose cleanup failed nothing has none").toBeNull();
     // The rate read fails.
     const readFails = await apply((t) => t.script("getNumeric", read("0"), { kind: "failure", failure: { kind: "cause", code: "response_timeout", phase: "response" }, evidence: { state: "unconfirmed" } }));
     expect(outcomes(readFails)).toEqual(["response_timeout", "connection_lost", "not_sent", "not_sent"]);

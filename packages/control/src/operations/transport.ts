@@ -62,6 +62,10 @@ export interface TransportSubscription {
    * first cause given to its operation's `cancel` as its code, and
    * `cancelled: true`; `internal_error` only when no cause was given. A
    * registration's own failure keeps its cause and carries no such mark.
+   * Its `progress.cleanup` is the owned cleanup (`Cleanup`) where the adapter
+   * records how far it got: a failure that cleanup settled of its own, an
+   * automatic unregistration's among them, is the cause the caller reports
+   * beside the activation's (`cleanupFailureOf`).
    */
   activate(): Promise<void>;
   /** Releases the subscription (K10); repeated calls join one completion. */

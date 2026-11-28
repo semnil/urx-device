@@ -1,6 +1,7 @@
 // Lifecycle outcome records (K37) and the discovery result (D14), validated
 // at the adapter boundary like single-request records (K33/K34).
 
+import type { LaterCause, OperationCause, OperationPhase } from "./failure.js";
 import type { NativeRequestCause } from "./native.js";
 
 export type LifecyclePhase = "discovery" | "connect" | "identity" | "admission" | "subscription" | "teardown";
@@ -119,6 +120,68 @@ function cleanupOf(value: unknown): Cleanup | undefined {
   const cause = causeOf(failure);
   // A cleanup failure leaves the connection closed or unconfirmed, never complete.
   return cause !== undefined && state !== "complete" ? { state: state as CleanupState, failure: cause } : undefined;
+}
+
+/** The lifecycle causes a shared operation reports as they are (E2); the rest are internal to it. */
+const OPERATION_CAUSES: readonly string[] = [
+  "invalid_input",
+  "precondition_failed",
+  "not_connected",
+  "send_timeout",
+  "response_timeout",
+  "teardown_timeout",
+  "device_rejected",
+  "invalid_response",
+  "connection_lost",
+  "notification_overflow",
+  "internal_error",
+];
+
+/**
+ * Where a cleanup's failure occurred, as an operation phase: a lifecycle
+ * record names the lifecycle phase only, so the phase follows the cause as
+ * K34 places it — causes before sending at admission, a send deadline, a lost
+ * link or a teardown budget while sending, a verdict or its absence at the
+ * response, and the remaining causes at delivery.
+ */
+function phaseOfCause(code: OperationCause): OperationPhase {
+  switch (code) {
+    case "invalid_input":
+    case "precondition_failed":
+    case "not_connected":
+      return "admission";
+    case "send_timeout":
+    case "connection_lost":
+    case "teardown_timeout":
+      return "send";
+    case "device_rejected":
+    case "response_timeout":
+    case "invalid_response":
+      return "response";
+    default:
+      return "delivery";
+  }
+}
+
+/**
+ * The failure a failed subscription call's own cleanup settled, as the cause
+ * that goes beside the call's failure (E3, `OperationFailure.later`): the
+ * transport's release of what the call had registered, its automatic
+ * unregistration of a registration the owner's cancellation stopped among
+ * them. An adapter carries that cleanup as the call's `progress.cleanup`
+ * (`TransportSubscription.activate`). None when the progress carries no
+ * valid cleanup, or the cleanup failed nothing.
+ */
+export function cleanupFailureOf(progress: unknown): LaterCause | undefined {
+  if (typeof progress !== "object" || progress === null || !("cleanup" in progress)) {
+    return undefined;
+  }
+  const failure = cleanupOf(progress.cleanup)?.failure;
+  if (failure == null) {
+    return undefined;
+  }
+  const code = (OPERATION_CAUSES.includes(failure.code) ? failure.code : "internal_error") as OperationCause;
+  return { code, phase: phaseOfCause(code) };
 }
 
 /**
