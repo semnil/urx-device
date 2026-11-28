@@ -634,10 +634,13 @@ fn a_request_too_large_for_one_frame_is_invalid_input_and_never_sent() {
 
 #[test]
 fn cancelling_an_operation_drops_only_its_waiting_requests() {
-    let peer = slow(Duration::from_millis(150));
+    let peer = unit(plain);
     let connection = connect(&peer);
     let a = connection.create_operation().unwrap();
     let b = connection.create_operation().unwrap();
+    // The active request's response is not read until the checks below have run, so the others
+    // wait behind it whatever the test's pace.
+    let read = hold_the_next_response_deadline(&connection);
     let a_active = submit(&connection, &a, Request::SetNumeric(address(1), 1));
     wait_until(|| parameter_uris(&peer).len() == 1);
     let a_waiting = submit(&connection, &a, Request::SetNumeric(address(2), 1));
@@ -653,6 +656,7 @@ fn cancelling_an_operation_drops_only_its_waiting_requests() {
         a_active.try_recv().is_err(),
         "the active request is still pending"
     );
+    drop(read);
     assert_eq!(
         outcome(&a_active),
         Outcome::Success {
