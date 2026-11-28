@@ -1142,6 +1142,8 @@ struct Scripted {
     refuse_timeout: bool,
     /// Fail each write: with this error, or as a closed stream (`Some(None)`).
     fail_write: Option<Option<std::io::ErrorKind>>,
+    /// Interrupt the n-th write, once.
+    interrupt_at: Option<usize>,
 }
 
 impl super::Outgoing for Scripted {
@@ -1162,6 +1164,11 @@ impl super::Outgoing for Scripted {
     }
 
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.interrupt_at == Some(self.writes) {
+            self.interrupt_at = None;
+            self.writes += 1;
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
         match self.fail_write {
             Some(Some(kind)) => return Err(kind.into()),
             Some(None) => return Ok(0),
@@ -1203,6 +1210,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
             sent_sets: std::sync::atomic::AtomicU64::new(0),
             response_gate: std::sync::Mutex::new(None),
             first_byte_gate: std::sync::Mutex::new(None),
+            receipt_gate: std::sync::Mutex::new(None),
         }),
         written: Vec::new(),
         end_before_write,
@@ -1211,6 +1219,7 @@ fn scripted(end_before_write: Option<usize>) -> Scripted {
         pending: None,
         refuse_timeout: false,
         fail_write: None,
+        interrupt_at: None,
     }
 }
 
@@ -3306,6 +3315,34 @@ mod lifecycle {
     }
 }
 
+// A write is asked whether it may start before each try at its first byte — a
+// try a transient error ends sends nothing — and never once a byte is out.
+#[test]
+fn a_write_is_asked_before_each_try_at_its_first_byte_and_not_after() {
+    for (interrupt_at, asked) in [(0, 2), (1, 1)] {
+        let frame = vec![b'x'; 30];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sock = scripted(None);
+        sock.interrupt_at = Some(interrupt_at);
+        let shared = Arc::clone(&sock.shared);
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        let unstarted = |_: &super::State| {
+            asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+        assert_eq!(
+            super::write_frame(&mut sock, &shared, &frame, deadline, &unstarted, None),
+            Ok(())
+        );
+        assert_eq!(
+            asks.load(std::sync::atomic::Ordering::SeqCst),
+            asked,
+            "interrupted at write {interrupt_at}"
+        );
+        assert_eq!(sock.written, frame);
+    }
+}
+
 #[test]
 fn a_write_whose_operation_was_cancelled_before_its_first_byte_is_not_started() {
     let frame = vec![b'x'; 30];
@@ -4405,6 +4442,108 @@ mod notifications {
         ));
         super::wait_until(|| locked.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    // A notification timed before a write's first byte is shown before that
+    // byte is decided: the write submitted while it is between its receipt
+    // time and its observer waits, and its gate then holds it.
+    #[test]
+    fn a_notification_timed_before_a_writes_first_byte_holds_that_write() {
+        let (port, push) = pushing_unit(Duration::ZERO);
+        let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connection = connect_locking(port, &locked);
+        let _token = activate(&connection, &[p(1)]);
+        let (go, wait) = mpsc::channel();
+        *crate::connection::lock(&connection.shared.receipt_gate) = Some(wait);
+        push.send(notify_param(1, 1)).unwrap();
+        // Timed, and held before its observer.
+        super::wait_until(|| crate::connection::lock(&connection.shared.receipt_gate).is_none());
+        let open = Arc::clone(&locked);
+        let write = submit_gated_on(
+            &connection,
+            Request::SetNumeric(param(5), 3),
+            Box::new(move || !open.load(std::sync::atomic::Ordering::SeqCst)),
+        );
+        thread::sleep(Duration::from_millis(100));
+        go.send(()).unwrap();
+        assert_eq!(write.recv_timeout(Duration::from_secs(5)).unwrap(), held());
+        assert_eq!(connection.sent_frames().sets, 0);
+        assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
+    }
+
+    /// A gate whose value, when let go, cancels another owner of `connection`:
+    /// a call into the connection, which must not meet the connection's locks.
+    fn cancelling_gate(connection: &Connection) -> crate::connection::SendGate {
+        let other = connection.create_operation().unwrap();
+        let value = OnDrop(move || other.cancel());
+        Box::new(move || {
+            let _ = &value;
+            true
+        })
+    }
+
+    // A request taken off the queue by a close lets go of its gate outside
+    // the connection's locks, and completes once.
+    #[test]
+    fn a_gate_a_close_takes_is_let_go_outside_the_locks() {
+        let (port, _push) = pushing_unit(Duration::ZERO);
+        let (connection, _batches) = connect(port);
+        let connection = Arc::new(connection);
+        let release = block_worker(&connection);
+        let waiting = submit_gated_on(
+            &connection,
+            Request::SetNumeric(param(5), 3),
+            cancelling_gate(&connection),
+        );
+        let closing = {
+            let connection = Arc::clone(&connection);
+            thread::spawn(move || connection.close(TEARDOWN))
+        };
+        assert!(matches!(
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Outcome::Failure {
+                evidence: crate::request::Evidence::NotSent,
+                ..
+            }
+        ));
+        assert!(
+            waiting.recv_timeout(Duration::from_millis(100)).is_err(),
+            "once"
+        );
+        release.send(()).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !closing.is_finished() {
+            assert!(std::time::Instant::now() < until, "the close finishes");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // A request that expires while a result is held lets go of its gate on
+    // its completing thread, outside the locks, and completes once.
+    #[test]
+    fn a_gate_an_expiry_takes_is_let_go_outside_the_locks() {
+        let (port, push) = pushing_unit(Duration::from_millis(200));
+        let (connection, batches) = connect_short(port);
+        let _token = activate(&connection, &[p(1)]);
+        let operation = connection.create_operation().unwrap();
+        let _held = submit_held(&connection, &operation, 5);
+        thread::sleep(Duration::from_millis(20));
+        push.send(notify_param(1, 1)).unwrap();
+        let _first = next(&batches);
+        thread::sleep(Duration::from_millis(400));
+        let waiting = submit_gated_on(
+            &connection,
+            Request::SetNumeric(param(6), 3),
+            cancelling_gate(&connection),
+        );
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            unsent_with(RequestCause::SendTimeout)
+        );
+        assert!(
+            waiting.recv_timeout(Duration::from_millis(100)).is_err(),
+            "once"
+        );
     }
 
     #[test]
