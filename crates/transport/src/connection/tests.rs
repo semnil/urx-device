@@ -4444,9 +4444,10 @@ mod notifications {
         assert_eq!(connection.close(TEARDOWN), CloseOutcome::Closed);
     }
 
-    // A notification timed before a write's first byte is shown before that
-    // byte is decided: the write submitted while it is between its receipt
-    // time and its observer waits, and its gate then holds it.
+    // A notification taken out of the reader's buffer — received — before a
+    // write's first byte is shown before that byte is decided: the write
+    // submitted while it is between its receipt and its observer waits, and
+    // its gate then holds it.
     #[test]
     fn a_notification_timed_before_a_writes_first_byte_holds_that_write() {
         let (port, push) = pushing_unit(Duration::ZERO);

@@ -242,8 +242,8 @@ struct Shared {
     /// byte, with the end gate held, until signalled.
     #[cfg(test)]
     first_byte_gate: Mutex<Option<Receiver<()>>>,
-    /// Holds the next notification between its receipt time and its receipt
-    /// observer, with the end gate held, until signalled.
+    /// Holds the next frame taken out of the buffer, with the end gate held,
+    /// before it is routed, when a receipt observer watches, until signalled.
     #[cfg(test)]
     receipt_gate: Mutex<Option<Receiver<()>>>,
 }
@@ -1713,6 +1713,7 @@ fn route(
     received: &Received,
     accepting: bool,
     at_receipt: Option<&ReceiptObserver>,
+    received_under: Option<MutexGuard<'_, Option<RequestCause>>>,
 ) -> Routed {
     let Some(payload) = Inbound::new(received.message.clone()).notification() else {
         return Routed::NotNotification;
@@ -1720,21 +1721,10 @@ fn route(
     let Some(queue) = shared.notifications.as_ref().filter(|_| accepting) else {
         return Routed::Dropped;
     };
-    // With an observer, a notification is received — timed, then shown — under the end gate a
-    // write's first byte starts under, so a send gate sees it if, and only if, it was received
-    // before that byte (`Connection::submit_gated`).
-    let gate = at_receipt.map(|_| shared.link_end());
-    let received_at_ms = match gate {
-        Some(_) => now_ms(),
-        None => received.received_at_ms,
-    };
-    #[cfg(test)]
-    if gate.is_some() {
-        let hook = lock(&shared.receipt_gate).take();
-        if let Some(hook) = hook {
-            let _ = hook.recv();
-        }
-    }
+    // With an observer, the notification is shown under the end gate it was received under, so a
+    // send gate sees it if, and only if, it was received before that write's first byte
+    // (`Connection::submit_gated`).
+    let gate = at_receipt.map(|_| received_under.unwrap_or_else(|| shared.link_end()));
     let recipients = {
         let state = shared.lock();
         match &payload {
@@ -1754,7 +1744,7 @@ fn route(
     }
     let record = NotificationRecord {
         recipients,
-        received_at_ms,
+        received_at_ms: received.received_at_ms,
         payload,
     };
     if let Some(observe) = at_receipt {
@@ -1860,28 +1850,52 @@ fn read_until_stopped(
         return;
     }
     while !stop.load(Ordering::SeqCst) {
-        begin_op(&shared, Side::Reader);
-        let read = reader.read_frame(&mut sock);
-        let met = match &read {
-            Err(ReadError::Io(kind)) => Some(*kind),
-            _ => None,
+        // A frame is received when it is taken out of the buffer complete: with a receipt
+        // observer, under the end gate a write's first byte starts under, so the reader and the
+        // writer order a receipt and a first byte alike (`Connection::submit_gated`). The wait for
+        // input stays outside it.
+        let mut gate = at_receipt.map(|_| shared.link_end());
+        let read = match reader.take_frame() {
+            Ok(None) => {
+                drop(gate.take());
+                begin_op(&shared, Side::Reader);
+                let filled = reader.fill(&mut sock);
+                let met = match &filled {
+                    Err(ReadError::Io(kind)) => Some(*kind),
+                    _ => None,
+                };
+                end_op(&shared, Side::Reader, met);
+                match filled {
+                    Ok(_) => continue,
+                    Err(error) => Err(error),
+                }
+            }
+            taken => taken,
         };
-        end_op(&shared, Side::Reader, met);
         match read {
             Ok(Some(frame)) => {
+                let received_at_ms = now_ms();
+                #[cfg(test)]
+                if gate.is_some() {
+                    let hook = lock(&shared.receipt_gate).take();
+                    if let Some(hook) = hook {
+                        let _ = hook.recv();
+                    }
+                }
                 if let Some(json) = frame.json {
                     if lost_notification(&json) {
+                        drop(gate.take());
                         note_loss(&shared, LinkLoss::UnitLost);
                         record(RequestCause::ConnectionLost);
                     }
                     let mut received = Received {
                         message: json,
                         len: frame.len,
-                        received_at_ms: now_ms(),
+                        received_at_ms,
                         cutoff: 0,
                     };
                     // Recipients and budget are decided here, at receipt.
-                    match route(&shared, &received, queueing, at_receipt) {
+                    match route(&shared, &received, queueing, at_receipt, gate.take()) {
                         Routed::NotNotification => {}
                         Routed::Queued | Routed::Dropped => continue,
                         // Only while queueing: once not, `route` drops every notification.
@@ -1907,6 +1921,7 @@ fn read_until_stopped(
             }
             Ok(None) => {}
             Err(error) => {
+                drop(gate.take());
                 if !stop.load(Ordering::SeqCst) {
                     let cause = match error {
                         ReadError::Oversized { .. } => RequestCause::InvalidResponse,
