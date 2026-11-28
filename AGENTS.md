@@ -8,7 +8,7 @@ Shared device knowledge for the YAMAHA URX22 / URX44 / URX44V: model capabilitie
 
 - `packages/control` — `@urx/device-control`. `src/catalog/` holds definitions and codecs; `src/operations/` holds operations over a transport the caller supplies. The catalog never imports operations
 - `crates/transport` — `urx-device-transport`: discovery, connections, request/reply matching, notifications and subscriptions
-- `scripts/` — repository tooling (`version.mjs`)
+- `scripts/` — repository tooling: `version.mjs` and `workflow-block.test-util.mjs` (takes a workflow step's `run:` block out of the YAML, so `dependabot-auto-merge.test.mjs` runs the block itself)
 - `.github/required-checks.json` — the status checks the `main` ruleset requires, the only copy outside GitHub's settings
 
 ## Development
@@ -65,6 +65,7 @@ Observing the protocol from outside — sending a request and recording what com
 
 - The `main` ruleset requires the contexts listed in `.github/required-checks.json`. A workflow change keeps every pull-request workflow triggering unfiltered, keeps each gate an `if: always()` job that reads `needs.*.result`, and updates that file and the ruleset together
 - Every job, and every step that fetches from outside GitHub, carries a `timeout-minutes`; third-party actions are pinned to a 40-character SHA with a version comment; nothing in CI writes to a pull request's branch
+- A Dependabot pull request in which every updated dependency is a patch or a minor update, a minor update of a cargo crate below 1.0 excepted, merges on its own once the required checks pass; a major update, and any pull request that is not one verified Dependabot commit at the head, stays open for a person. `.github/workflows/dependabot-auto-merge.yml` decides it in the job that reports `auto-merge`, a required context, and its header says why each condition is there; `pnpm test dependabot-auto-merge` runs that decision against each kind of update. The merge is attributed to `GITHUB_TOKEN`, so `ci.yml` does not run on its merge commit, and the branch it leaves behind is deleted by hand
 
 ## Conventions
 

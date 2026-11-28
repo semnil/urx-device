@@ -51,7 +51,7 @@ jobs:
       - run: cargo test --workspace --locked
         timeout-minutes: 10
 
-  # The one context the main ruleset requires (.github/required-checks.json).
+  # One of the contexts the main ruleset requires (.github/required-checks.json).
   # `if: always()` keeps it from being skipped when a job it needs fails: a
   # skipped required check reports success.
   ci-required:
